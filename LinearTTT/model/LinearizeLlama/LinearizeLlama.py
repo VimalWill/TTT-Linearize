@@ -50,6 +50,19 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 logger = logging.get_logger(__name__)
 
+# flex_attention only reaches its fused Triton kernel when the call is compiled.
+# Called bare it falls back to `math_attention`, which materialises the whole
+# [B, H, Q, KV] score matrix -- 8 GiB at 8192 tokens / 32 heads -- and applies
+# the mask afterwards, so the window buys nothing.
+_flex_attention_compiled = None
+
+
+def _compiled_flex_attention():
+    global _flex_attention_compiled
+    if _flex_attention_compiled is None:
+        _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+    return _flex_attention_compiled
+
 
 def sliding_window_attention(
     q: torch.Tensor,
@@ -68,7 +81,7 @@ def sliding_window_attention(
     # Non-square (decode with rolling KV buffer): all KV tokens are already
     # causally valid and within the window (trimmed before calling), so no mask needed.
     if Q_len != KV_len:
-        return flex_attention(q, k, v, scale=scale)
+        return _compiled_flex_attention()(q, k, v, scale=scale)
 
     if causal:
         def mask_mod(b, h, q_idx, kv_idx):
@@ -87,7 +100,7 @@ def sliding_window_attention(
         if block_mask_cache is not None:
             block_mask_cache[cache_key] = block_mask
 
-    output = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    output = _compiled_flex_attention()(q, k, v, block_mask=block_mask, scale=scale)
     return output
 
 class LigerGatedLinearAttention(nn.Module):
