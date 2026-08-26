@@ -28,5 +28,8 @@ train:
   lr: 0.001
   epochs: 1
   max_grad_norm: 1.0
+  # ~209 gradient steps for 200 books @ 8192, so keep these small
+  eval_steps: 25
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
   # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
   output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}

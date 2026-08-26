@@ -245,7 +245,10 @@ class DefaultTrainer():
                     self.best_val_metric = val_metric
                     self.best_val_metric_step = self.grad_step
 
-                    save_path = self.save_path + '/iter' + '_' + str(step)
+                    # overwrite one directory instead of accumulating an
+                    # iter_<step> dir per improvement: each is ~16GB and only
+                    # ~0.6% of it differs from the base checkpoint
+                    save_path = self.save_path + '/best_ckpt'
                     self.best_val_checkpoint_path = save_path
                     model.save_pretrained(save_path)
                     self.tokenizer.save_pretrained(save_path)
