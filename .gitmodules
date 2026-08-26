@@ -1,0 +1,3 @@
+[submodule "third_party/LaCT"]
+	path = third_party/LaCT
+	url = https://github.com/a1600012888/LaCT.git
