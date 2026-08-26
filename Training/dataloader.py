@@ -1,6 +1,7 @@
 import os
 import shutil
 import random
+import itertools
 from tqdm import tqdm
 from functools import partial
 import torch
@@ -38,7 +39,12 @@ def encode_response(response: str, tokenizer) -> list[int]:
     return tokens
 
 def load_data(config):
-    cache_dir =  "/root/.cache" 
+    # Use HF_DATASETS_CACHE env var first, then XDG_CACHE_HOME, then user home directory
+    cache_dir = os.environ.get('HF_DATASETS_CACHE') or os.path.join(
+        os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')), 
+        'huggingface', 
+        'datasets'
+    )
     input_len = config.model.max_length
     concat_data = True
 
@@ -53,31 +59,88 @@ def load_data(config):
     tokenizer.padding_side = 'left'  # for decoder-only generation
         # Get initial data
     ignore_kwargs = ['concat_data', 'chunk_size', 'pose_kwargs']
-    dataset_config = {
-        "name": "default", 
-        "path": "yahma/alpaca-cleaned",
-        "chunk_size": input_len,
-        "concat_data": concat_data,
-        "cache_dir": cache_dir,
-    }
-    dataset = load_dataset(
-        **{k: v for k, v in dataset_config.items() if k not in ignore_kwargs}
-    )
-    dataset = dataset['train']
-    train_set = convert_to_hf_dataset([dataset[ix] for ix in range(200, len(dataset))], cache_dir)
-    val_set   = convert_to_hf_dataset([dataset[ix] for ix in range(200)], cache_dir)
-    test_set  = convert_to_hf_dataset([dataset[ix] for ix in range(200)], cache_dir)
+    data_path = config.data.path
+    data_name = config.data.get("name", "alpaca_cleand")
+    # select formatter based on dataset
+    if any(t in data_name.lower() for t in ("pg19", "books", "longtext")):
+        # Long-form continuous text: no prompt template, every token supervised.
+        # ConcatDataset packing is the right thing here (unlike LongBench, where
+        # only the answer carries a label and packing discards the context).
+        formatter = partial(template_and_tokenize_lm, tokenizer=tokenizer)
+        n_train_docs = int(config.data.get("num_train_docs", 200))
+        n_val_docs = int(config.data.get("num_val_docs", 20))
+        max_doc_tokens = config.data.get("max_doc_tokens", None)
+        if max_doc_tokens is not None:
+            formatter = partial(formatter, max_doc_tokens=int(max_doc_tokens))
+
+        def _take(split, n):
+            # stream so we do not pull the full corpus (pg19 is ~11GB / 28k books);
+            # materialise the slice because from_generator may re-run the generator
+            it = load_dataset(data_path, split=split, streaming=True)
+            return convert_to_hf_dataset(list(itertools.islice(it, n)), cache_dir)
+
+        train_set = _take("train", n_train_docs)
+        val_set = _take("validation", n_val_docs)
+        test_set = _take("test", n_val_docs)
+        cols = list(train_set.features)
+    elif "longbench" in data_name.lower():
+        formatter = partial(template_and_tokenize_longbench, tokenizer=tokenizer)
+        # Load each task's JSONL directly (THUDM/LongBench uses a loading script not supported)
+        lb_tasks = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "narrativeqa"]
+        from huggingface_hub import hf_hub_download
+        import json, zipfile, tempfile, pathlib
+        all_samples = []
+        zip_path = hf_hub_download(
+            repo_id="zai-org/LongBench",
+            filename="data.zip",
+            repo_type="dataset",
+        )
+        extract_dir = pathlib.Path(zip_path).parent / "longbench_data"
+        if not extract_dir.exists():
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+        for task in lb_tasks:
+            # try both data/{task}.jsonl and {task}.jsonl inside zip
+            for candidate in [
+                extract_dir / "data" / f"{task}.jsonl",
+                extract_dir / f"{task}.jsonl",
+            ]:
+                if candidate.exists():
+                    with open(candidate) as f:
+                        for line in f:
+                            all_samples.append(json.loads(line))
+                    break
+        import random as _random
+        _random.seed(42)
+        _random.shuffle(all_samples)
+        n_val = min(200, len(all_samples) // 10)
+        train_samples = all_samples[n_val:]
+        val_samples   = all_samples[:n_val]
+        train_set = convert_to_hf_dataset(train_samples, cache_dir)
+        val_set   = convert_to_hf_dataset(val_samples, cache_dir)
+        test_set  = val_set
+        cols = list(train_set.features)
+    else:
+        formatter = partial(template_and_tokenize, tokenizer=tokenizer)
+        dataset = load_dataset(
+            **{k: v for k, v in {"path": data_path, "cache_dir": cache_dir}.items()}
+        )
+        dataset = dataset['train']
+        train_set = convert_to_hf_dataset([dataset[ix] for ix in range(200, len(dataset))], cache_dir)
+        val_set   = convert_to_hf_dataset([dataset[ix] for ix in range(200)], cache_dir)
+        test_set  = convert_to_hf_dataset([dataset[ix] for ix in range(200)], cache_dir)
+        cols = list(dataset.features)
 
     # Convert to dicts of {input_ids, attention_mask, labels}
     train_set = train_set.map(
-        partial(template_and_tokenize, tokenizer=tokenizer, include_label=True), 
-        remove_columns=list(dataset.features),) 
+        partial(formatter, include_label=True),
+        remove_columns=cols)
     val_set = val_set.map(
-        partial(template_and_tokenize, tokenizer=tokenizer, include_label=True),
-        remove_columns=list(dataset.features),) 
-    test_set  = test_set.map(
-        partial(template_and_tokenize, tokenizer=tokenizer, include_label=False),
-        remove_columns=list(dataset.features),) 
+        partial(formatter, include_label=True),
+        remove_columns=cols)
+    test_set = test_set.map(
+        partial(formatter, include_label=False),
+        remove_columns=cols)
 
     # Chunk together train and val sets
     if concat_data:
@@ -149,6 +212,59 @@ def template_and_tokenize(sample, tokenizer, include_label: bool = True):
     }
     return sample
 
+def template_and_tokenize_lm(sample, tokenizer, include_label: bool = True,
+                             max_doc_tokens: int = None):
+    """
+    Plain language modelling over continuous text (PG19 and friends).
+
+    No prompt template and no masking: every token is a target, so ConcatDataset
+    packs whole documents into fully supervised chunks and its all--100 filter
+    never drops anything.
+    """
+    text = sample.get("text", "")
+    input_ids = tokenizer.encode(text, add_special_tokens=False)
+    if max_doc_tokens is not None:
+        input_ids = input_ids[:max_doc_tokens]
+    if tokenizer.bos_token_id is not None:
+        input_ids = [tokenizer.bos_token_id] + input_ids
+    input_ids = input_ids + [tokenizer.eos_token_id]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": list(input_ids),
+    }
+
+
+def template_and_tokenize_longbench(sample, tokenizer, include_label: bool = True):
+    """
+    Format LongBench samples: {input, context, answers} → single sequence
+    """
+    context = sample.get("context", "")
+    question = sample.get("input", "")
+    answer = sample["answers"][0] if isinstance(sample.get("answers"), list) else sample.get("answers", "")
+
+    prompt = (
+        f"Read the following passage and answer the question.\n\n"
+        f"Passage:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer:"
+    )
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    if include_label:
+        answer_ids = tokenizer.encode(f" {answer}{tokenizer.eos_token}", add_special_tokens=False)
+        input_ids = prompt_ids + answer_ids
+        labels = [-100] * len(prompt_ids) + answer_ids
+    else:
+        input_ids = prompt_ids
+        labels = tokenizer.encode(f" {answer}{tokenizer.eos_token}", add_special_tokens=False)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": labels,
+    }
+
+
 def get_lm_loader(dataset: Dataset, tokenizer: AutoTokenizer,
                   split: str, max_length: int = None, **loader_kwargs: any):
     """
@@ -181,9 +297,9 @@ def download_metric():
     scrolls_metric_path = hf_hub_download(
         repo_id="tau/scrolls", filename="metrics/scrolls.py", repo_type="dataset"
     )
-    updated_scrolls_metric_path = (
-        os.path.dirname(scrolls_metric_path) + 
-        os.path.basename(scrolls_metric_path).replace(".", "_") + ".py"
+    updated_scrolls_metric_path = os.path.join(
+        os.path.dirname(scrolls_metric_path),
+        os.path.basename(scrolls_metric_path).replace(".", "_") + ".py",
     )
     shutil.copy(scrolls_metric_path, updated_scrolls_metric_path)
     return updated_scrolls_metric_path

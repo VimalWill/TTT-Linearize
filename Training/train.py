@@ -7,8 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import fla
-import liger
-import lolcats
+import LinearTTT
 import torch.utils
 import torch.utils.data
 import torch.utils.data.dataloader
@@ -16,46 +15,74 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoCon
 from transformers import TrainingArguments
 from peft import LoraConfig, TaskType, PeftModel, get_peft_model
 
-from training.trainer import DefaultTrainer, FinetuneTrainer
-from training.utils import get_optimizer_and_scheduler, count_model_params
-from training.dataloader import load_data
+from Training.trainer import DefaultTrainer, FinetuneTrainer
+from Training.utils import get_optimizer_and_scheduler, count_model_params
+from Training.dataloader import load_data
+
+
+# Parameters belonging to the test-time-training branch. These have no
+# counterpart in the pretrained checkpoint, so unlike the Liger recipe they must
+# actually be trained -- LoRA on q/k/v alone leaves them at their random init.
+TTT_PARAM_KEYS = (
+    '.w0', '.w1', '.w2',
+    'lr_proj', 'ttt_scale_proj', 'ttt_norm',
+    'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj',
+)
+
+# yml `model:` keys consumed by the harness rather than by the model config
+_HARNESS_ONLY = {'name', 'pretrained_model_name_or_path', 'device_map',
+                 'add_eos_token', 'max_length'}
+
+
+def build_model_config(config):
+    """Load the checkpoint's own shape, then apply the yml `model:` overrides.
+
+    Constructing LigerGLAConfig() bare gives Llama-2 defaults (vocab 32000,
+    32 kv heads, rope_theta 10000), which silently mismatch a Llama-3 checkpoint.
+    """
+    from LinearTTT.model.LinearizeLlama import LigerGLAConfig
+    model_config = LigerGLAConfig.from_pretrained(
+        config.model.pretrained_model_name_or_path
+    )
+    for k, v in config.model.items():
+        if k in _HARNESS_ONLY:
+            continue
+        # Configs/liger.yml spells it `attn_varient`
+        setattr(model_config, 'attn_variant' if k == 'attn_varient' else k, v)
+    # the packing width is what the layer actually sees
+    model_config.max_position_embeddings = max(
+        model_config.max_position_embeddings, int(config.model.max_length)
+    )
+    return model_config
+
+
+def set_trainable_params(model, config):
+    """Decide the trainable set. Must run *after* get_peft_model, which marks
+    every non-adapter parameter frozen."""
+    train_ttt = config.model.get('attn_varient', None) == 'ttt' or \
+        config.model.get('attn_variant', None) == 'ttt'
+    for name, param in model.named_parameters():
+        param.requires_grad = bool(
+            'lora_' in name
+            or (train_ttt and any(k in name for k in TTT_PARAM_KEYS))
+        )
+    return model
 
 
 def train(config):
 
-    trainer = FinetuneTrainer
-    if config.model.name == "liger_gla":
-        from liger.models.liger_gla import LigerGLAConfig
-        liger_model_config = LigerGLAConfig()
-    elif config.model.name == "liger_gsa":
-        from liger.models.liger_gsa import LigerGSAConfig
-        liger_model_config = LigerGSAConfig()
-    elif config.model.name == "liger_qwen25_gla":
-        from liger.models.liger_qwen2_gla import LigerQwen2GLAConfig
-        liger_model_config = LigerQwen2GLAConfig()
-    elif config.model.name == "liger_qwen3_gla":
-        from liger.models.liger_qwen3_gla import LigerQwen3GLAConfig
-        liger_model_config = LigerQwen3GLAConfig()
-    elif config.model.name == "liger_qwen3_moe_gla":
-        from liger.models.liger_qwen3_moe_gla import LigerQwen3MoeGLAConfig
-        liger_model_config = LigerQwen3MoeGLAConfig()
-    elif config.model.name == "lolcats_at":
-        # first stage: attention transfer
-        from lolcats.models.lolcats import LolcatsConfig
-        liger_model_config = LolcatsConfig()
-        trainer = DefaultTrainer
-    elif config.model.name == "lolcats_ar":
-        # second stage
-        from lolcats.models.lolcats import LolcatsConfig
-        liger_model_config = LolcatsConfig()
-    else:
-        raise NotImplementedError(config.model.name)
-    
-    model_config = liger_model_config
+    # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
+    #        'ttt_ar' = autoregressive finetune on the LM loss
+    stage = config.model.name
+    trainer = DefaultTrainer if stage.endswith('_at') else FinetuneTrainer
+    if stage not in ('liger_gla', 'ttt_at', 'ttt_ar'):
+        raise NotImplementedError(stage)
+
+    model_config = build_model_config(config)
     model = AutoModelForCausalLM.from_pretrained(
-        config.model.pretrained_model_name_or_path, 
-        config=model_config, 
-        device_map="cuda"
+        config.model.pretrained_model_name_or_path,
+        config=model_config,
+        device_map=config.model.get('device_map', 'auto'),
     ).to(torch.bfloat16)
 
 
@@ -68,39 +95,23 @@ def train(config):
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"  # Allow batched inference
 
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        if "train_qk" in config.train and config.train.train_qk:
-            if "self_attn.q_proj" in name:
-                param.requires_grad = True
-            elif "self_attn.k_proj" in name:
-                param.requires_grad = True
-        if "train_v" in config.train and config.train.train_v and "self_attn.v_proj" in name:
-            param.requires_grad = True
-        if "train_o" in config.train and config.train.train_o and "self_attn.o_proj" in name:
-            param.requires_grad = True
-
-    # LoRA finetune
+    # LoRA finetune. Attention transfer trains only the TTT branch: the
+    # pretrained projections have to stay exactly as the teacher sees them, or
+    # the regression target moves with the student.
     target_modules = []
-    if  "train_qk" in config.train and config.train.train_qk and config.train.train_qk_lora:
-        target_modules.append("self_attn.q_proj")
-        target_modules.append("self_attn.k_proj")
-    if  "train_v" in config.train and config.train.train_v and config.train.train_v_lora:
-        target_modules.append("self_attn.v_proj")
-    if  "train_o" in config.train and config.train.train_o and config.train.train_o_lora:
-        target_modules.append("self_attn.o_proj")
-    # lolcats attention transfer
-    if config.model.name == "lolcats_at":
-        for name, param in model.named_parameters():
-            if "feature_map" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-    
+    if stage != 'ttt_at':
+        if "train_qk" in config.train and config.train.train_qk and config.train.train_qk_lora:
+            target_modules.append("self_attn.q_proj")
+            target_modules.append("self_attn.k_proj")
+        if "train_v" in config.train and config.train.train_v and config.train.train_v_lora:
+            target_modules.append("self_attn.v_proj")
+        if "train_o" in config.train and config.train.train_o and config.train.train_o_lora:
+            target_modules.append("self_attn.o_proj")
     if len(target_modules) != 0:
         lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=target_modules)
         model = get_peft_model(model, peft_config=lora_config)
+
+    set_trainable_params(model, config)
 
     # print trainable params count
     trainable_params = count_model_params(model, requires_grad=True)

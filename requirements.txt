@@ -1,0 +1,22 @@
+# Core
+triton==3.3.0
+transformers==4.45.0
+datasets
+peft
+evaluate
+omegaconf
+einops
+huggingface_hub
+tqdm
+
+# Evaluation / benchmarking
+lm_eval
+pandas
+matplotlib
+
+# Glide attention kernels (chunk_gla / fused_recurrent_gla)
+flash-linear-attention
+
+# PyTorch is intentionally not pinned here since the right wheel depends on
+# your CUDA version. Install separately, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121

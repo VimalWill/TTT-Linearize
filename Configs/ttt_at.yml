@@ -1,0 +1,31 @@
+# Stage 1 -- attention transfer.
+# Per-layer regression of the hybrid output onto full softmax attention computed
+# from the same q/k/v. No LM loss, no LoRA: the pretrained projections are the
+# teacher and must not move. This exists because the TTT fast weights have no
+# counterpart in the checkpoint, so they cannot be warm-started the way Liger
+# warm-starts a GLA gate from pretrained K.
+data:
+  name: "pg19"
+  path: "emozilla/pg19"
+  num_train_docs: 200
+  num_val_docs: 20
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_at'
+  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_use_momentum: True
+  ttt_use_muon: False
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.001
+  epochs: 1
+  max_grad_norm: 1.0
+  output_dir: 'checkpoints'

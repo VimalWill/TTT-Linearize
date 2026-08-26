@@ -1,13 +1,25 @@
 data:
-  name: "alpaca_cleand"
-  path: "yahma/alpaca-cleaned"
+  # long-form continuous text for the linearization run.
+  # deepmind/pg19 is script-based and no longer loadable; emozilla/pg19 is the
+  # same corpus as parquet with train/validation/test splits.
+  name: "pg19"
+  path: "emozilla/pg19"
+  # ConcatDataset packs every token into memory as Python lists -- raise these
+  # only alongside the memory arithmetic (~200 books is ~20M tokens).
+  num_train_docs: 200
+  num_val_docs: 20
+  # max_doc_tokens: 65536   # cap per-book contribution if a few books dominate
+  # alternatives:
+  #   name: "alpaca_cleand" / path: "yahma/alpaca-cleaned"   (short instruction data)
+  #   name: "longbench"     / path: "zai-org/LongBench"      (eval only -- contaminates)
   batch_size: 8
   micro_batch_size: 1
   val_set_size: 200
 model:
   name: 'liger_gla'
-  pretrained_model_name_or_path: '/your/Liger/checkpoints/liger_gla_base'  
-  max_length: 1024
+  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'  
+  max_length: 8192   # also the ConcatDataset packing width
+  attn_varient: "liger"
   # tokenizer
   add_eos_token: False 
   

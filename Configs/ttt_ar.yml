@@ -1,0 +1,31 @@
+# Stage 2 -- autoregressive finetune on the LM loss.
+# Resumes from the stage-1 checkpoint: LoRA on q/k/v plus the TTT branch.
+data:
+  name: "pg19"
+  path: "emozilla/pg19"
+  num_train_docs: 200
+  num_val_docs: 20
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_ar'
+  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_use_momentum: True
+  ttt_use_muon: False
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0001
+  epochs: 2
+  max_grad_norm: 1.0
+  output_dir: 'checkpoints'
+  train_qk: True
+  train_qk_lora: True
+  train_v: True
+  train_v_lora: True

@@ -105,9 +105,21 @@ class DefaultTrainer():
                 
         if self.load_best_model_at_end:  # Return best checkpoint
             try:
-                model.from_pretrained(self.best_val_checkpoint_path)
-                print(f'-> Loading best checkpoint from {self.best_val_checkpoint_path}')
-            except FileNotFoundError as e:
+                import os
+                ckpt_path = os.path.abspath(self.best_val_checkpoint_path)
+                if isinstance(model, PeftModel):
+                    from peft import set_peft_model_state_dict
+                    import torch
+                    for fname in ["adapter_model.safetensors", "adapter_model.bin"]:
+                        fpath = os.path.join(ckpt_path, fname)
+                        if os.path.exists(fpath):
+                            weights = torch.load(fpath, map_location="cpu")
+                            set_peft_model_state_dict(model, weights)
+                            break
+                else:
+                    model.from_pretrained(ckpt_path)
+                print(f'-> Loading best checkpoint from {ckpt_path}')
+            except Exception as e:
                 print(e)
                 print('-> Returning most recent model instead')
         return model            
@@ -133,14 +145,21 @@ class DefaultTrainer():
         # model.to(self.device)
         for ix, data in enumerate(pbar):
             loss, train_metrics = self.compute_loss(model, data, return_outputs=True)
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f'\n-> NaN/Inf loss at step {ix}, skipping batch')
+                self.optimizer.zero_grad()
+                self.step += 1
+                continue
             loss /= accum_iter
             if not self.compute_loss_backprop:
                 # loss.backward() did not occur in compute_loss
                 try:
-                    with torch.autograd.set_detect_anomaly(True):
-                        loss.backward()
+                    loss.backward()
                 except Exception as e:
-                    breakpoint()
+                    print(f'\n-> Backward error at step {ix}: {e}, skipping')
+                    self.optimizer.zero_grad()
+                    self.step += 1
+                    continue
             if (self.step + 1) % accum_iter == 0:  # and self.step != 0:
                 self.optimizer.step()
                 if not self.scheduler_step_after_epoch and self.scheduler is not None:

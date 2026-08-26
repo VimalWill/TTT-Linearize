@@ -34,6 +34,17 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        # --- test-time training (LaCT) branch ---
+        num_ttt_heads=None,       # None -> num_attention_heads (no k/v duplication under GQA)
+        ttt_inter_multi=1.0,      # SwiGLU fast-weight hidden expansion
+        lact_chunk_size=512,      # tokens per fast-weight update
+        window_size=512,          # sliding-window attention span; must be >= lact_chunk_size
+        ttt_base_lr=1e-2,         # base inner-loop learning rate
+        ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
+        ttt_use_momentum=True,
+        ttt_prenorm=False,        # use the prenorm variant of the TTT operator
+        fw_init_gain=0.5,         # scale of the initial fast weights
+        ttt_scale_init_bias=0.1,  # opens the output gate slightly at init
         **kwargs,
     ):
         super().__init__(
@@ -61,3 +72,13 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
             head_dim=head_dim,
             **kwargs,
         )
+        self.num_ttt_heads = num_ttt_heads if num_ttt_heads is not None else self.num_attention_heads
+        self.ttt_inter_multi = ttt_inter_multi
+        self.lact_chunk_size = lact_chunk_size
+        self.window_size = window_size
+        self.ttt_base_lr = ttt_base_lr
+        self.ttt_use_muon = ttt_use_muon
+        self.ttt_use_momentum = ttt_use_momentum
+        self.ttt_prenorm = ttt_prenorm
+        self.fw_init_gain = fw_init_gain
+        self.ttt_scale_init_bias = ttt_scale_init_bias

@@ -4,7 +4,7 @@ import torch.optim
 
 def get_optimizer_and_scheduler(model, config):
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.train.lr, fused=True)
+    optimizer = torch.optim.AdamW(params, lr=config.train.lr, fused=torch.cuda.is_available())
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer=optimizer, 
         mode='min',
