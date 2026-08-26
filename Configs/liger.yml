@@ -17,7 +17,7 @@ data:
   val_set_size: 200
 model:
   name: 'liger_gla'
-  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'  
+  pretrained_model_name_or_path: 'meta-llama/Llama-3.1-8B'  
   max_length: 8192   # also the ConcatDataset packing width
   attn_varient: "liger"
   # tokenizer
@@ -29,7 +29,8 @@ train:
   lr: 0.001
   epochs: 2
   max_grad_norm: 1.0
-  output_dir: 'checkpoints'
+  # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
   train_qk: True
   train_qk_lora: True
   train_v: True

@@ -76,7 +76,10 @@ def load_data(config):
         def _take(split, n):
             # stream so we do not pull the full corpus (pg19 is ~11GB / 28k books);
             # materialise the slice because from_generator may re-run the generator
-            it = load_dataset(data_path, split=split, streaming=True)
+            # shuffle the stream: taking the first N rows is deterministic and
+            # badly biased (pg19 row 0 is the ~800k-token King James Bible)
+            it = load_dataset(data_path, split=split, streaming=True).shuffle(
+                seed=42, buffer_size=1000)
             return convert_to_hf_dataset(list(itertools.islice(it, n)), cache_dir)
 
         train_set = _take("train", n_train_docs)

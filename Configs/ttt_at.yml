@@ -14,7 +14,7 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_at'
-  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'
+  pretrained_model_name_or_path: 'meta-llama/Llama-3.1-8B'
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
@@ -28,4 +28,5 @@ train:
   lr: 0.001
   epochs: 1
   max_grad_norm: 1.0
-  output_dir: 'checkpoints'
+  # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}

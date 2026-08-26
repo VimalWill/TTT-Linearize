@@ -10,7 +10,8 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  pretrained_model_name_or_path: 'meta-llama/Meta-Llama-3-8B'
+  # stage 1's output: run.py writes to checkpoints/<cfg-basename>/best
+  pretrained_model_name_or_path: 'checkpoints/ttt_at/best'
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
@@ -24,7 +25,8 @@ train:
   lr: 0.0001
   epochs: 2
   max_grad_norm: 1.0
-  output_dir: 'checkpoints'
+  # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
   train_qk: True
   train_qk_lora: True
   train_v: True
