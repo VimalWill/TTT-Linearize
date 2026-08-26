@@ -113,6 +113,15 @@ def train(config):
 
     set_trainable_params(model, config)
 
+    # Without this every one of the 32 layers keeps its activations for backward.
+    # At 8192 tokens that alone is ~40GB, on top of 16GB of weights and the
+    # retained (student, teacher) pairs. Costs ~30% compute, saves ~10x memory.
+    if config.train.get('gradient_checkpointing', True):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={'use_reentrant': False}
+        )
+        print('Gradient checkpointing: enabled')
+
     # print trainable params count
     trainable_params = count_model_params(model, requires_grad=True)
     total_params = count_model_params(model, requires_grad=False)

@@ -28,5 +28,6 @@ train:
   lr: 0.001
   epochs: 1
   max_grad_norm: 1.0
+  gradient_checkpointing: True
   # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
   output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
