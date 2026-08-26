@@ -141,6 +141,11 @@ class DefaultTrainer():
             print('')
             print('-> Initial eval')
             self.compute_eval_metrics(model, step=self.grad_step)
+            # compute_eval_metrics sets model.eval() and does not restore it.
+            # Without this the whole training loop runs in eval mode, which
+            # disables the `self.gradient_checkpointing and self.training`
+            # branch in LigerGLAModel.forward.
+            model.train()
         
         # model.to(self.device)
         for ix, data in enumerate(pbar):
