@@ -329,6 +329,11 @@ class LinearTTTAttention(nn.Module):
             self.w2.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
             self.ttt_qk_scale.fill_(1.0)
             self.ttt_qk_offset.zero_()
+            # ttt_norm is the only RMSNorm in this model with no counterpart in
+            # the Llama checkpoint, and LlamaPreTrainedModel._init_weights only
+            # handles Linear/Embedding. Under from_pretrained's meta-device path
+            # it would otherwise be materialised from uninitialised memory.
+            self.ttt_norm.weight.fill_(1.0)
         # Start the TTT branch nearly closed so the frozen host's residual
         # stream survives step 0, but not fully closed: silu(0) == 0 would cut
         # the gradient to lr_proj and the fast weights entirely.
