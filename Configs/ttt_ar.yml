@@ -11,7 +11,7 @@ data:
 model:
   name: 'ttt_ar'
   # stage 1's output: run.py writes to checkpoints/<cfg-basename>/best
-  pretrained_model_name_or_path: 'checkpoints/ttt_at/best'
+  pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at/best
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
