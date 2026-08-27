@@ -102,6 +102,9 @@ def main():
                     help='held-out sequences to average over')
     ap.add_argument('--iters', type=int, nargs='+', default=[1, 2, 4, 8, 16, 32, 64])
     ap.add_argument('--out', default='ttt_inner_iters')
+    ap.add_argument('--verify', action='store_true',
+                    help='check that the N=1 replay reproduces the real operator: '
+                         'runs one sequence through both and compares the logits')
     args = ap.parse_args()
 
     config = OmegaConf.load(args.cfg)
@@ -127,6 +130,23 @@ def main():
     print(f'{len(seqs)} held-out sequences x {args.seq_len} tokens\n')
 
     original = lz.block_causal_lact_swiglu
+
+    if args.verify:
+        # The replay is only trustworthy if N=1 reproduces the shipped operator.
+        with torch.no_grad():
+            ref = model(input_ids=seqs[0], use_cache=False).logits.float()
+            lz.block_causal_lact_swiglu = multi_step(1, [])
+            try:
+                mine = model(input_ids=seqs[0], use_cache=False).logits.float()
+            finally:
+                lz.block_causal_lact_swiglu = original
+        d = (ref - mine).abs()
+        rel = (d.max() / ref.abs().max()).item()
+        agree = (ref.argmax(-1) == mine.argmax(-1)).float().mean().item()
+        print(f'VERIFY  max|diff| {d.max():.4e}  relative {rel:.4e}  '
+              f'argmax agreement {agree:.4%}')
+        print('        (nonzero diff is expected: replay is fp32, operator is bf16)\n')
+
     results = []
     print(f'{"iters":>6} {"inner loss":>12}')
     for n in args.iters:
