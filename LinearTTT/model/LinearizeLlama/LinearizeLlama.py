@@ -642,7 +642,9 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2]
+                # LlamaDecoderLayer repacks the tuple by flag: the cache is at
+                # index 2 only when attentions are also returned.
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
