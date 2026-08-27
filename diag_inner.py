@@ -114,10 +114,13 @@ def main():
     ap.add_argument('--layers', type=int, nargs='+', default=[0, 8, 16, 24, 31])
     ap.add_argument('--out', default='ttt_learning_curve',
                     help='writes <out>.csv and <out>.png')
-    ap.add_argument('--control', action='store_true',
-                    help='shuffle chunks across the sequence, destroying long-range '
-                         'structure. Alignment should NOT rise; if it does, the curve '
-                         'is the state warming up, not learning the document.')
+    ap.add_argument('--control', choices=['shuffle', 'mixed', 'random'], default=None,
+                    help="shuffle: reorder chunks of one document (tests order only -- "
+                         "weak, since document identity survives). mixed: each chunk "
+                         "from a DIFFERENT document (tests document identity). random: "
+                         "uniform random token ids (strongest null). If alignment still "
+                         "rises under mixed/random, the curve is initialisation warm-up, "
+                         "not learning.")
     args = ap.parse_args()
 
     config = OmegaConf.load(args.cfg)
@@ -135,24 +138,42 @@ def main():
     # books for one sequence, which is how we got rate-limited (429).
     from datasets import load_dataset
     tok = AutoTokenizer.from_pretrained(args.base)
-    stream = load_dataset(config.data.path, split='validation', streaming=True)
-    toks = []
-    for doc in stream:
-        toks += tok.encode(doc['text'], add_special_tokens=False)
-        if len(toks) >= args.seq_len:
-            break
-    ids = torch.tensor(toks[:args.seq_len]).unsqueeze(0).cuda()
-    print(f'held-out PG19 validation text: {ids.shape[1]} tokens')
+    cs = model_config.lact_chunk_size
+    n_chunks = args.seq_len // cs
+    g = torch.Generator().manual_seed(0)
 
-    if args.control:
-        # Shuffle whole chunks. Local structure within a chunk survives, but the
-        # document no longer coheres across chunks, so there is nothing for the
-        # fast weight to carry forward.
-        cs = model_config.lact_chunk_size
-        n = ids.shape[1] // cs
-        perm = torch.randperm(n, generator=torch.Generator().manual_seed(0))
-        ids = torch.cat([ids[:, p * cs:(p + 1) * cs] for p in perm], dim=1)
-        print('CONTROL: chunks shuffled -- alignment should stay flat')
+    if args.control == 'random':
+        ids = torch.randint(0, model_config.vocab_size, (1, args.seq_len),
+                            generator=g).cuda()
+        print('CONTROL random: uniform token ids -- nothing to learn')
+    elif args.control == 'mixed':
+        # One chunk from each of n_chunks DIFFERENT documents. Every chunk is real
+        # prose, but no two share a document, so there is no consistent thing for
+        # the fast weight to accumulate.
+        stream = load_dataset(config.data.path, split='validation', streaming=True)
+        pieces = []
+        for doc in stream:
+            t = tok.encode(doc['text'], add_special_tokens=False)
+            if len(t) >= cs:
+                pieces.append(t[:cs])
+            if len(pieces) == n_chunks:
+                break
+        ids = torch.tensor([x for p in pieces for x in p]).unsqueeze(0).cuda()
+        print(f'CONTROL mixed: {len(pieces)} chunks from {len(pieces)} different documents')
+    else:
+        stream = load_dataset(config.data.path, split='validation', streaming=True)
+        toks = []
+        for doc in stream:
+            toks += tok.encode(doc['text'], add_special_tokens=False)
+            if len(toks) >= args.seq_len:
+                break
+        ids = torch.tensor(toks[:args.seq_len]).unsqueeze(0).cuda()
+        if args.control == 'shuffle':
+            perm = torch.randperm(n_chunks, generator=g)
+            ids = torch.cat([ids[:, p * cs:(p + 1) * cs] for p in perm], dim=1)
+            print('CONTROL shuffle: chunk order destroyed, document identity kept')
+        else:
+            print(f'held-out PG19 validation text: {ids.shape[1]} tokens')
 
     records = []
     original = lz.block_causal_lact_swiglu
@@ -177,7 +198,7 @@ def main():
         first, last = records[li][0][1], records[li][-1][1]
         print(f'  first {first:+.4f} -> last {last:+.4f}   delta {last - first:+.4f}\n')
 
-    tag = '_control' if args.control else ''
+    tag = f'_{args.control}' if args.control else ''
     csv_path = f'{args.out}{tag}.csv'
     with open(csv_path, 'w') as f:
         f.write('layer,chunk,align,lr,dw1_rel\n')
@@ -210,7 +231,8 @@ def main():
     sm = plt.cm.ScalarMappable(cmap=cmap,
                                norm=plt.Normalize(0, len(records) - 1))
     fig.colorbar(sm, ax=axes, label='layer', fraction=0.02)
-    fig.suptitle('TTT inner-loop learning' + (' (CONTROL: chunks shuffled)' if args.control else ''))
+    fig.suptitle('TTT inner-loop learning'
+                 + (f'  (CONTROL: {args.control})' if args.control else ''))
     png = f'{args.out}{tag}.png'
     fig.savefig(png, dpi=140, bbox_inches='tight')
     print(f'wrote {png}')
