@@ -61,6 +61,8 @@ def main():
     ap.add_argument('--ckpt', required=True, help='stage-1 checkpoint dir')
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--batches', type=int, default=20)
+    ap.add_argument('--windows', type=int, nargs='+', default=None,
+                    help='sweep base-model CE over these window sizes instead of A/B/C')
     args = ap.parse_args()
 
     config = OmegaConf.load(args.cfg)
@@ -69,11 +71,15 @@ def main():
     vocab = 128256
     print(f'\nuniform-random baseline: ln({vocab}) = {math.log(vocab):.3f}\n')
 
-    runs = [
-        ('A base + window 8192 (~full attn)', args.base, 8192, 512),
-        ('B base + window 512', args.base, 512, 512),
-        ('C stage-1 checkpoint + window 512', args.ckpt, 512, 512),
-    ]
+    if args.windows:
+        runs = [(f'base + window {w}', args.base, w, min(512, w))
+                for w in args.windows]
+    else:
+        runs = [
+            ('A base + window 8192 (~full attn)', args.base, 8192, 512),
+            ('B base + window 512', args.base, 512, 512),
+            ('C stage-1 checkpoint + window 512', args.ckpt, 512, 512),
+        ]
     for label, path, window, chunk in runs:
         ce = ce_of(path, config, window, chunk, loader, args.batches)
         print(f'{label:36s} CE = {ce:7.3f}   ppl = {math.exp(min(ce, 20)):.3g}')
