@@ -317,27 +317,47 @@ class DefaultTrainer():
         return step_eval_metrics
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        inputs = {k: v.to(model.device) for k, v in inputs.items() if k != 'labels'}
-        outputs = model(**inputs, output_attentions=True)
-        
-        outputs = outputs.attentions # tuple [num_decoder_layers, 2, B, H, L, L]
-        loss_mse = 0
-        self.mse_factor = 1000
+        """Attention transfer, with an LM term.
+
+        Per-layer MSE alone is not a well-posed objective here: the teacher is
+        computed from the student's own hidden states, so the target moves with
+        the student. Both can converge somewhere far off the pretrained manifold
+        while agreeing perfectly -- measured once as MSE down 941x while
+        cross-entropy went from 6.4 (untrained) to 15.7 (worse than uniform).
+        The cross-entropy term anchors it.
+        """
+        input_keys = {'input_ids', 'attention_mask'}
+        data = {k: v.to(model.device) for k, v in inputs.items() if k in input_keys}
+        outputs = model(**data, output_attentions=True)
+
+        self.mse_factor = self.config.train.get('mse_factor', 1000)
+        self.lm_weight = self.config.train.get('lm_loss_weight', 1.0)
         self.criterion_mse = nn.MSELoss(reduction='mean')
+
+        loss_mse = 0
         n_layers = 0  # Number of layers to distill
-
-        for layer_idx, attns in enumerate(outputs):
+        for layer_idx, attns in enumerate(outputs.attentions):
             if attns is not None:
-                loss_mse += self.criterion_mse(attns[0], attns[1])
+                loss_mse += self.criterion_mse(attns[0].float(), attns[1].float())
                 n_layers += 1
-
         if n_layers > 0:
             loss_mse = loss_mse / n_layers * self.mse_factor
-        loss = loss_mse
-        outputs = {'loss_mse': loss_mse.item() if self.mse_factor > 0 else 0, 
+
+        loss_ce = torch.tensor(0.0, device=model.device)
+        if self.lm_weight > 0 and 'labels' in inputs:
+            logits = outputs.get('logits')[..., :-1, :].contiguous()
+            targets = inputs['labels'][..., 1:].contiguous().to(logits.device)
+            loss_ce = self.criterion(
+                logits.view(-1, logits.shape[-1]).float(), targets.view(-1)
+            )
+
+        loss = loss_mse + self.lm_weight * loss_ce
+        metrics = {'loss_mse': loss_mse.item() if n_layers > 0 else 0.0,
+                   'loss_ce': loss_ce.item(),
+                   'ppl': torch.exp(loss_ce).item(),
                    'mse_factor': self.mse_factor}
-        
-        return (loss, outputs) if return_outputs else loss
+
+        return (loss, metrics) if return_outputs else loss
 
     def init_checkpointing(self, config) -> None:
         self.save_path = config.train.output_dir

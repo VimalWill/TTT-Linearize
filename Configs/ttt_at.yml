@@ -28,6 +28,10 @@ train:
   lr: 0.001
   epochs: 1
   max_grad_norm: 1.0
+  # MSE alone lets the student and its own teacher drift together;
+  # the LM term anchors stage 1 to the pretrained manifold.
+  mse_factor: 1000
+  lm_loss_weight: 1.0
   gradient_checkpointing: True
   # ~209 gradient steps for 200 books @ 8192, so keep these small
   eval_steps: 25
