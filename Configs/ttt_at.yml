@@ -32,6 +32,7 @@ train:
   # the LM term anchors stage 1 to the pretrained manifold.
   mse_factor: 1000
   lm_loss_weight: 1.0
+  metric_for_best_model: 'eval/loss_ce'
   gradient_checkpointing: True
   # ~209 gradient steps for 200 books @ 8192, so keep these small
   eval_steps: 25

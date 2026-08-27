@@ -159,7 +159,9 @@ def train(config):
             load_best_model_at_end=True if config.data.val_set_size > 0 else False,
             # default trainer args
             greater_is_better = False,
-            metric_for_best_model = 'eval/loss',
+            # stage 1's composite loss is MSE-dominated early, so selecting on
+            # it picks checkpoints with bad perplexity; select on CE instead
+            metric_for_best_model = config.train.get('metric_for_best_model', 'eval/loss'),
             # wandb
             report_to="none" # wandb off "wandb"
         )
