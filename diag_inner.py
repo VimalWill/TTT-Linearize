@@ -116,8 +116,6 @@ def main():
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--seq-len', type=int, default=8192)
     ap.add_argument('--out', default='ttt_loss_per_token')
-    ap.add_argument('--smooth', type=int, default=128,
-                    help='moving-average window in tokens (1 = raw)')
     ap.add_argument('--control', choices=['shuffle', 'mixed', 'random'], default=None,
                     help="mixed: every chunk from a DIFFERENT document. random: uniform "
                          "token ids. shuffle: reorder chunks of one document (weak -- "
@@ -180,19 +178,22 @@ def main():
         lz.block_causal_lact_swiglu = original
 
     loss = torch.stack(records)                       # [layers, tokens]
-    print(f'\n{loss.shape[0]} layers x {loss.shape[1]} tokens, '
-          f'chunk_size={cs} ({n_chunks - 1} inner updates)\n')
-    print(f'{"layer":>5} {"first chunk":>12} {"last chunk":>11} {"delta":>9}')
-    for li in range(loss.shape[0]):
-        a, b = loss[li, :cs].mean().item(), loss[li, -cs:].mean().item()
-        print(f'{li:>5} {a:>12.4f} {b:>11.4f} {b - a:>+9.4f}')
+    n_iter = loss.shape[1] // cs
+    # one point per inner-loop iteration: mean over layers and over the tokens
+    # in that chunk. Iteration i is read out with weights fit on chunks < i.
+    per_iter = loss[:, :n_iter * cs].view(loss.shape[0], n_iter, cs).mean(dim=(0, 2))
+
+    print(f'\n{loss.shape[0]} layers, chunk_size={cs}, {n_iter} inner-loop iterations\n')
+    print(f'{"iteration":>10} {"loss":>10}')
+    for i, l in enumerate(per_iter.tolist()):
+        print(f'{i:>10} {l:>10.4f}')
+    print(f'\n  {per_iter[0]:.4f} -> {per_iter[-1]:.4f}   delta {per_iter[-1] - per_iter[0]:+.4f}')
 
     tag = f'_{args.control}' if args.control else ''
     with open(f'{args.out}{tag}.csv', 'w') as f:
-        f.write('layer,token,loss\n')
-        for li in range(loss.shape[0]):
-            for t in range(loss.shape[1]):
-                f.write(f'{li},{t},{loss[li, t]:.6f}\n')
+        f.write('iteration,loss\n')
+        for i, l in enumerate(per_iter.tolist()):
+            f.write(f'{i},{l:.6f}\n')
     print(f'\nwrote {args.out}{tag}.csv')
 
     try:
@@ -202,22 +203,12 @@ def main():
     except ImportError:
         return
 
-    mean = loss.mean(dim=0)                       # average over all layers
-    if args.smooth > 1:
-        k = torch.ones(1, 1, args.smooth) / args.smooth
-        smoothed = F.conv1d(mean.view(1, 1, -1), k,
-                            padding=args.smooth // 2).view(-1)[:mean.numel()]
-    else:
-        smoothed = mean
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    if args.smooth > 1:
-        ax.plot(mean, color='0.8', lw=0.5, zorder=1)
-    ax.plot(smoothed, color='#1f4e79', lw=1.6, zorder=2)
-    ax.set_xlabel('token position in sequence')
-    ax.set_ylabel('TTT loss')
-    ax.set_title('TTT loss during the forward pass, averaged over layers'
-                 + (f'  (control: {args.control})' if args.control else ''))
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(range(n_iter), per_iter, color='#1f4e79', lw=1.8, marker='o', ms=4)
+    ax.set_xlabel('Inner-Loop Iteration')
+    ax.set_ylabel('Inner-Loop Loss')
+    if args.control:
+        ax.set_title(f'control: {args.control}')
     ax.grid(alpha=0.25)
     fig.savefig(f'{args.out}{tag}.png', dpi=140, bbox_inches='tight')
     print(f'wrote {args.out}{tag}.png')
