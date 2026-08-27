@@ -10,7 +10,7 @@ held-out generalization *within a single sequence* -- exactly the claim "test-ti
 training" makes.
 
 Reports, per layer and per chunk:
-  align   cosine(f(W_{i-1}; k_i), v_i)   rising => the state is learning
+  loss    1 - cos(f(W_{i-1}; k_i), v_i)   falling => the state is learning
   lr      mean per-token inner learning rate the model chose for this chunk
   |dw|/|w|  relative size of the fast-weight update
 
@@ -72,7 +72,8 @@ def instrumented(records):
 
             # ---- measurement: W_{i-1} was fit on chunks < i, so this is held out
             pred = torch.bmm(w1, hidden)                       # [B, dv, l]
-            align = F.cosine_similarity(pred, vi, dim=1).mean().item()
+            # the inner rule ascends <f(W;k), v>, so report it as a decreasing loss
+            loss = (1.0 - F.cosine_similarity(pred, vi, dim=1).mean()).item()
 
             dhidden = torch.bmm(w1.transpose(1, 2), vi)
             dhidden_before_mul = dhidden * F.silu(gate_before_act)
@@ -88,7 +89,7 @@ def instrumented(records):
                 dw0 = dw0 + m0 * mi; dw1 = dw1 + m1 * mi; dw2 = dw2 + m2 * mi
                 m0, m1, m2 = dw0, dw1, dw2
 
-            rows.append((n, align,
+            rows.append((n, loss,
                          torch.cat([lr0i, lr1i, lr2i]).mean().item(),
                          (dw1.norm() / w1.norm()).item()))
 
@@ -186,25 +187,25 @@ def main():
 
     print(f'\nchunk_size={model_config.lact_chunk_size} seq_len={args.seq_len} '
           f'-> {len(records[0])} inner updates per sequence')
-    print('align = cos(f(W_fit_on_chunks<i ; k_i), v_i) -- held out within the sequence\n')
+    print('loss = 1 - cos(f(W_fit_on_chunks<i ; k_i), v_i) -- held out within the sequence\n')
 
     for li in args.layers:
         if li >= len(records):
             continue
         print(f'--- layer {li} ---')
-        print(f'{"chunk":>6} {"align":>9} {"lr":>10} {"|dw1|/|w1|":>11}')
-        for n, align, lr, dw in records[li]:
-            print(f'{n:>6} {align:>9.4f} {lr:>10.5f} {dw:>11.4f}')
+        print(f'{"chunk":>6} {"loss":>9} {"lr":>10} {"|dw1|/|w1|":>11}')
+        for n, loss, lr, dw in records[li]:
+            print(f'{n:>6} {loss:>9.4f} {lr:>10.5f} {dw:>11.4f}')
         first, last = records[li][0][1], records[li][-1][1]
         print(f'  first {first:+.4f} -> last {last:+.4f}   delta {last - first:+.4f}\n')
 
     tag = f'_{args.control}' if args.control else ''
     csv_path = f'{args.out}{tag}.csv'
     with open(csv_path, 'w') as f:
-        f.write('layer,chunk,align,lr,dw1_rel\n')
+        f.write('layer,chunk,loss,lr,dw1_rel\n')
         for li, rows in enumerate(records):
-            for n, align, lr, dw in rows:
-                f.write(f'{li},{n},{align:.6f},{lr:.6f},{dw:.6f}\n')
+            for n, loss, lr, dw in rows:
+                f.write(f'{li},{n},{loss:.6f},{lr:.6f},{dw:.6f}\n')
     print(f'wrote {csv_path}  ({len(records)} layers x {len(records[0])} chunks)')
 
     try:
@@ -224,8 +225,8 @@ def main():
             ax.plot(xs, [r[j] for r in rows], color=c, lw=1, alpha=0.75)
     for ax, title, ylab in zip(
             axes,
-            ('within-sequence generalization', 'inner learning rate', 'update magnitude'),
-            (r'cos$(f(W_{<i};k_i),\,v_i)$', 'mean lr', r'$\|dw_1\|/\|w_1\|$')):
+            ('TTT loss (held out within sequence)', 'inner learning rate', 'update magnitude'),
+            (r'$1-\cos(f(W_{<i};k_i),\,v_i)$', 'mean lr', r'$\|dw_1\|/\|w_1\|$')):
         ax.set_title(title); ax.set_xlabel('inner-loop chunk'); ax.set_ylabel(ylab)
         ax.grid(alpha=0.25)
     sm = plt.cm.ScalarMappable(cmap=cmap,
