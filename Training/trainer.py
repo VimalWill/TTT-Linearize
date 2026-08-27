@@ -25,6 +25,24 @@ from transformers import Trainer, TrainingArguments
 
 from peft import PeftModel
 
+def save_checkpoint(model, tokenizer, save_path):
+    """Save a checkpoint, including TTT parameters under PEFT.
+
+    PeftModel.save_pretrained writes only adapter weights. The TTT parameters
+    (w0/w1/w2, lr_proj, ttt_scale_proj, ...) are plain base-model tensors that
+    training also updates, so they would be silently dropped -- measured once as
+    an 18.9MB stage-2 checkpoint containing nothing but LoRA.
+    """
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    if isinstance(model, PeftModel):
+        ttt = {n: p.detach().cpu() for n, p in model.named_parameters()
+               if p.requires_grad and 'lora_' not in n}
+        if ttt:
+            torch.save(ttt, os.path.join(save_path, 'ttt_params.pt'))
+            print(f'-> Saved {len(ttt)} TTT tensors alongside the adapters')
+
+
 class DefaultTrainer():
     # code is modified from: https://github.com/HazyResearch/lolcats/blob/main/src/trainer/default_lm.py
     def __init__(self, model, train_loader, eval_loader, args, optimizers, tokenizer, config):
@@ -255,16 +273,14 @@ class DefaultTrainer():
                     # ~0.6% of it differs from the base checkpoint
                     save_path = self.save_path + '/best_ckpt'
                     self.best_val_checkpoint_path = save_path
-                    model.save_pretrained(save_path)
-                    self.tokenizer.save_pretrained(save_path)
+                    save_checkpoint(model, self.tokenizer, save_path)
                     print(f'\n-> Saved best model checkpoint to: {save_path}!')
 
             if self.grad_step % self.save_steps == 0 and step > 0:
 
                 save_path = self.save_path + '/' + self.type + '_' + str(step)
                 self.best_val_checkpoint_path = save_path
-                model.save_pretrained(save_path)
-                self.tokenizer.save_pretrained(save_path)
+                save_checkpoint(model, self.tokenizer, save_path)
                 print(f'\n-> Saved model checkpoint to: {save_path}!')
             
             if self.scheduler_step_after_epoch and self.scheduler is not None:

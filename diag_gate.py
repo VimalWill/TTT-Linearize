@@ -24,13 +24,29 @@ import LinearTTT  # noqa: F401
 from Training.train import build_model_config
 
 
-def measure(path, config, tok, ids):
+def load_model(path, model_config, adapter=None):
+    """Full checkpoint, optionally with PEFT adapters and saved TTT params on top."""
+    import os
+    model = AutoModelForCausalLM.from_pretrained(
+        path, config=model_config, device_map={'': 0}
+    ).to(torch.bfloat16)
+    if adapter:
+        from peft import PeftModel
+        ttt = os.path.join(adapter, 'ttt_params.pt')
+        if os.path.exists(ttt):
+            model.load_state_dict(torch.load(ttt, map_location='cpu'), strict=False)
+            print('  overlaid saved TTT params')
+        else:
+            print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
+        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+    return model.eval()
+
+
+def measure(path, config, tok, ids, adapter=None):
     cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     cfg.model.pretrained_model_name_or_path = path
     model_config = build_model_config(cfg)
-    model = AutoModelForCausalLM.from_pretrained(
-        path, config=model_config, device_map={'': 0}
-    ).to(torch.bfloat16).eval()
+    model = load_model(path, model_config, adapter)
 
     cap = {}
 
@@ -76,6 +92,8 @@ def main():
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--seq-len', type=int, default=8192)
+    ap.add_argument('--adapter', default=None,
+                    help='PEFT adapter dir to overlay on --ckpt (stage-2 output)')
     args = ap.parse_args()
 
     config = OmegaConf.load(args.cfg)
@@ -86,8 +104,11 @@ def main():
     ids = tok(text, return_tensors='pt').input_ids[:, :args.seq_len].cuda()
 
     print('\ngate at init = silu(0.1) = 0.0525\n')
-    for label, path in (('BEFORE (fresh init)', args.base), ('AFTER (stage 1)', args.ckpt)):
-        rows = measure(path, config, tok, ids)
+    runs = [('BEFORE (fresh init)', args.base, None), ('AFTER (stage 1)', args.ckpt, None)]
+    if args.adapter:
+        runs.append(('AFTER (stage 2 adapters)', args.ckpt, args.adapter))
+    for label, path, adapter in runs:
+        rows = measure(path, config, tok, ids, adapter)
         gates = [r[1] for r in rows]
         ttt_share = [r[2] for r in rows]
         print(f'--- {label} ---')

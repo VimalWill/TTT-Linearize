@@ -179,8 +179,8 @@ def train(config):
     print("Train start")
     best_model = trainer.train()
     save_path = trainer.save_path + '/best'
-    best_model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+    from Training.trainer import save_checkpoint
+    save_checkpoint(best_model, tokenizer, save_path)
     print(f'\n-> Saved best model checkpoint to: {save_path}!')
 
     print("Train over")
