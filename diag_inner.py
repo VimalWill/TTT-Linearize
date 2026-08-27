@@ -116,7 +116,7 @@ def main():
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--seq-len', type=int, default=8192)
     ap.add_argument('--out', default='ttt_loss_per_token')
-    ap.add_argument('--smooth', type=int, default=1,
+    ap.add_argument('--smooth', type=int, default=128,
                     help='moving-average window in tokens (1 = raw)')
     ap.add_argument('--control', choices=['shuffle', 'mixed', 'random'], default=None,
                     help="mixed: every chunk from a DIFFERENT document. random: uniform "
@@ -202,25 +202,23 @@ def main():
     except ImportError:
         return
 
-    y = loss
+    mean = loss.mean(dim=0)                       # average over all layers
     if args.smooth > 1:
         k = torch.ones(1, 1, args.smooth) / args.smooth
-        y = F.conv1d(loss.unsqueeze(1), k, padding=args.smooth // 2).squeeze(1)
+        smoothed = F.conv1d(mean.view(1, 1, -1), k,
+                            padding=args.smooth // 2).view(-1)[:mean.numel()]
+    else:
+        smoothed = mean
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    cmap = plt.get_cmap('viridis')
-    xs = range(y.shape[1])
-    for li in range(y.shape[0]):
-        ax.plot(xs, y[li], color=cmap(li / max(y.shape[0] - 1, 1)), lw=0.8, alpha=0.8)
-    for b in range(cs, loss.shape[1], cs):
-        ax.axvline(b, color='0.85', lw=0.5, zorder=0)
+    if args.smooth > 1:
+        ax.plot(mean, color='0.8', lw=0.5, zorder=1)
+    ax.plot(smoothed, color='#1f4e79', lw=1.6, zorder=2)
     ax.set_xlabel('token position in sequence')
-    ax.set_ylabel(r'$1-\cos(f(W;k_t),\,v_t)$')
-    ax.set_title('TTT loss per token during the forward pass'
-                 + (f'  (CONTROL: {args.control})' if args.control else ''))
+    ax.set_ylabel('TTT loss')
+    ax.set_title('TTT loss during the forward pass, averaged over layers'
+                 + (f'  (control: {args.control})' if args.control else ''))
     ax.grid(alpha=0.25)
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, y.shape[0] - 1))
-    fig.colorbar(sm, ax=ax, label='layer')
     fig.savefig(f'{args.out}{tag}.png', dpi=140, bbox_inches='tight')
     print(f'wrote {args.out}{tag}.png')
 
