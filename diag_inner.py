@@ -26,7 +26,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import LinearTTT  # noqa: F401
 from LinearTTT.model.LinearizeLlama import LinearizeLlama as lz
-from Training.dataloader import load_data
 from Training.train import build_model_config
 
 
@@ -129,10 +128,21 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.ckpt, config=model_config, device_map={'': 0}
     ).to(torch.bfloat16).eval()
+
     # Real held-out prose. A repeated sentence would be learned trivially and
     # would produce a beautiful curve that means nothing.
-    batch = next(iter(load_data(config)['validation']))
-    ids = batch['input_ids'][:1, :args.seq_len].cuda()
+    # Stream only the validation split -- load_data() would pull all 200 training
+    # books for one sequence, which is how we got rate-limited (429).
+    from datasets import load_dataset
+    tok = AutoTokenizer.from_pretrained(args.base)
+    stream = load_dataset(config.data.path, split='validation', streaming=True)
+    toks = []
+    for doc in stream:
+        toks += tok.encode(doc['text'], add_special_tokens=False)
+        if len(toks) >= args.seq_len:
+            break
+    ids = torch.tensor(toks[:args.seq_len]).unsqueeze(0).cuda()
+    print(f'held-out PG19 validation text: {ids.shape[1]} tokens')
 
     if args.control:
         # Shuffle whole chunks. Local structure within a chunk survives, but the
