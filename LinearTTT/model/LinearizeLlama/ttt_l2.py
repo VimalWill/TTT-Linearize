@@ -55,8 +55,18 @@ def swiglu_l2_grads(w0, w1, w2, ki, vi, lr0i, lr1i, lr2i):
     # The extra term relative to the dot-product bias: what the memory
     # currently retrieves for these keys. err is the descent direction of
     # 1/2||pred - v||^2 wrt pred, negated.
-    pred = torch.bmm(w1, hidden)                             # [b, dv, l]
-    err = vi - pred                                          # [b, dv, l]
+    #
+    # In fp32, deliberately. This is the only subtraction in either operator,
+    # and stage 1 drives pred -> v by construction, so err is a difference of
+    # two nearly-equal numbers precisely when training is working. In bf16
+    # (8 mantissa bits) its relative error grows without bound as the model
+    # improves -- the residual turns to noise and the run diverges. One fp32
+    # bmm per chunk is a rounding error against the operator's 18 units.
+    acc = torch.promote_types(torch.float32,
+                              torch.promote_types(w1.dtype, vi.dtype))
+    with torch.autocast(device_type=vi.device.type, enabled=False):
+        pred = torch.bmm(w1.to(acc), hidden.to(acc))         # [b, dv, l]
+        err = vi.to(acc) - pred                              # [b, dv, l]
 
     # from here on: upstream's backward pass with `vi` replaced by `err`
     dhidden = torch.bmm(w1.transpose(1, 2), err)             # [b, dh, l]

@@ -43,5 +43,7 @@ train:
   # ~209 gradient steps for 200 books @ 8192, so keep these small
   eval_steps: 25
   save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
-  # separate dir so this run cannot clobber the dot-product best_ckpt
-  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_l2
+  # run.py already appends the config's filename stem, so this stays the bare
+  # root -- the run lands in $TTT_CKPT_DIR/ttt_at_l2 and cannot clobber
+  # ttt_at's best_ckpt.
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}

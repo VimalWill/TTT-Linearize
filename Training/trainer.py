@@ -246,6 +246,11 @@ class DefaultTrainer():
         """
         with torch.no_grad():
             self.eval_metrics = self.compute_eval_metrics(model, step=step, **kwargs)
+            if self.metric_for_best_model not in self.eval_metrics:
+                raise KeyError(
+                    f'metric_for_best_model={self.metric_for_best_model!r} not in '
+                    f'eval metrics {sorted(self.eval_metrics)}'
+                )
             val_metric = self.eval_metrics[self.metric_for_best_model]
 
             # Save results
@@ -307,15 +312,15 @@ class DefaultTrainer():
                 loss, eval_metrics = self.compute_loss(model, data, return_outputs=True)
                 if not self.compute_loss_backprop:
                     loss = loss.item()  # otherwise already float
-                if ix == 0:
-                    step_eval_metrics[self.metric_for_best_model] = [loss]
-                    for k, v in eval_metrics.items():
-                        step_eval_metrics[f'eval/{k}'] = [v]
-                else:
-                    step_eval_metrics[self.metric_for_best_model].append(loss)
-                    for k, v in eval_metrics.items():
-                        step_eval_metrics[f'eval/{k}'].append(v)
-                        
+                # The total loss goes under its own key. It used to be filed
+                # under `metric_for_best_model`, which for stage 1 is
+                # 'eval/loss_ce' -- the same key compute_loss returns the pure
+                # CE under. The two then interleaved in one list, so the
+                # reported 'eval/loss_ce' was an average of alternating CE and
+                # (1000*MSE + CE) values, and checkpoints were selected on it.
+                for k, v in [('loss_total', loss), *eval_metrics.items()]:
+                    step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
+                
                 step_loss += loss
                 desc = f"Evaluating at step {step} | loss: {step_loss / (ix + 1):.3f}"
                 if self.optimizer is not None:
@@ -327,6 +332,11 @@ class DefaultTrainer():
             # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
+            # ppl is averaged per batch above (mean of exp), which upper-bounds
+            # exp(mean CE); report the consistent one alongside it.
+            if 'eval/loss_ce' in step_eval_metrics:
+                step_eval_metrics['eval/ppl_from_mean_ce'] = float(
+                    torch.exp(torch.tensor(step_eval_metrics['eval/loss_ce'])))
             print(f'Eval step {step}:', step_eval_metrics)
             del loss
             torch.cuda.empty_cache()
