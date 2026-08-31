@@ -40,7 +40,6 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         lact_chunk_size=512,      # tokens per fast-weight update
         window_size=512,          # sliding-window attention span; must be >= lact_chunk_size
         ttt_base_lr=1e-2,         # base inner-loop learning rate
-        ttt_inner_loss='dot',     # inner objective: 'dot' (LaCT Eq. 7) or 'l2' regression
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -78,7 +77,6 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.lact_chunk_size = lact_chunk_size
         self.window_size = window_size
         self.ttt_base_lr = ttt_base_lr
-        self.ttt_inner_loss = ttt_inner_loss
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm

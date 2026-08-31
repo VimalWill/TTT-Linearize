@@ -36,10 +36,6 @@ _spec.loader.exec_module(_mod)
 block_causal_lact_swiglu = _mod.block_causal_lact_swiglu
 prenorm_block_causal_lact_swiglu = _mod.prenorm_block_causal_lact_swiglu
 l2_norm = _mod.l2_norm
-# re-exported for ttt_l2.py, which reuses the update rule's pieces but swaps the
-# inner objective; keeping them sourced from upstream avoids a second copy.
-silu_backprop = _mod.silu_backprop
-zeropower_via_newtonschulz5 = _mod.zeropower_via_newtonschulz5
 
 
 def inv_softplus(x):
@@ -53,7 +49,5 @@ __all__ = [
     'block_causal_lact_swiglu',
     'prenorm_block_causal_lact_swiglu',
     'l2_norm',
-    'silu_backprop',
-    'zeropower_via_newtonschulz5',
     'inv_softplus',
 ]
