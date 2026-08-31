@@ -332,6 +332,15 @@ class DefaultTrainer():
             # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
+            # Stage 2 (`ttt_ar`) selects on 'eval/loss', and `FinetuneTrainer`
+            # returns no metric by that name -- it relied on the total loss
+            # being filed under `metric_for_best_model` here. Preserve that,
+            # but only when the metric is not a real one compute_loss returns,
+            # so stage 1's 'eval/loss_ce' stays the pure CE.
+            if (self.metric_for_best_model is not None
+                    and self.metric_for_best_model not in step_eval_metrics):
+                step_eval_metrics[self.metric_for_best_model] = \
+                    step_eval_metrics['eval/loss_total']
             # ppl is averaged per batch above (mean of exp), which upper-bounds
             # exp(mean CE); report the consistent one alongside it.
             if 'eval/loss_ce' in step_eval_metrics:
