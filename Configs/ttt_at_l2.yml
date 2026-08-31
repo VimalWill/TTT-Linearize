@@ -1,0 +1,47 @@
+# Stage 1 -- attention transfer, with the l2-regression inner objective.
+# Identical to ttt_at.yml except for `ttt_inner_loss: 'l2'`, so the two runs are
+# a controlled A/B on the attentional bias alone.
+# Per-layer regression of the hybrid output onto full softmax attention computed
+# from the same q/k/v. No LM loss, no LoRA: the pretrained projections are the
+# teacher and must not move. This exists because the TTT fast weights have no
+# counterpart in the checkpoint, so they cannot be warm-started the way Liger
+# warm-starts a GLA gate from pretrained K.
+data:
+  name: "pg19"
+  path: "emozilla/pg19"
+  num_train_docs: 200
+  num_val_docs: 20
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_at'
+  pretrained_model_name_or_path: 'meta-llama/Llama-3.1-8B'
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  # 'dot' = LaCT Eq. 7, L = -f(k)^T v (Hebbian, writes unconditionally).
+  # 'l2'  = L = 1/2||f(k) - v||^2, gradient carries the residual (v - f(k)), so
+  #         a key that already reads out correctly produces no update.
+  ttt_inner_loss: 'l2'
+  ttt_use_momentum: True
+  ttt_use_muon: False
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.001
+  epochs: 1
+  max_grad_norm: 1.0
+  # MSE alone lets the student and its own teacher drift together;
+  # the LM term anchors stage 1 to the pretrained manifold.
+  mse_factor: 1000
+  lm_loss_weight: 1.0
+  metric_for_best_model: 'eval/loss_ce'
+  gradient_checkpointing: True
+  # ~209 gradient steps for 200 books @ 8192, so keep these small
+  eval_steps: 25
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  # separate dir so this run cannot clobber the dot-product best_ckpt
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_l2

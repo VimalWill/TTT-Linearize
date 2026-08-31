@@ -26,70 +26,85 @@ def silu_backprop(dy, x):
     return dy * sigma * (1 + x * (1 - sigma))
 
 
-def multi_step(n_steps, losses):
-    """block_causal_lact_swiglu with n_steps inner updates per chunk."""
+def multi_step(n_steps, losses, bf16=False):
+    """block_causal_lact_swiglu with n_steps inner updates per chunk.
+
+    bf16=True reproduces the shipped operator's precision exactly: it runs under
+    the same autocast, with fp32 fast weights and bf16 matmuls. Use it to check
+    whether a mismatch against the real operator is precision or a logic bug.
+    """
     def op(w0, w1, w2, q, k, v, lr0, lr1, lr2,
            chunk_size=2048, use_muon=False, momentum=None):
-        w0, w1, w2 = w0.float(), w1.float(), w2.float()
-        n0 = w0.norm(dim=2, keepdim=True)
-        n1 = w1.norm(dim=2, keepdim=True)
-        n2 = w2.norm(dim=2, keepdim=True)
-        if momentum is not None:
-            m0 = torch.zeros_like(w0); m1 = torch.zeros_like(w1); m2 = torch.zeros_like(w2)
-
-        vT = v.transpose(1, 2).float()
-        qT = q.transpose(1, 2).float()
-        out = torch.zeros_like(vT)
-        held_out, e_index, seq_len = [], 0, k.shape[1]
-
-        for i in range(0, seq_len - chunk_size, chunk_size):
-            s_index, e_index = i, i + chunk_size
-            ki = k[:, s_index:e_index, :].float()
-            vi = vT[:, :, s_index:e_index]
-            qi = qT[:, :, s_index:e_index]
-            lr1i = lr1[:, s_index:e_index, :].float()
-            lr2i = lr2[:, s_index:e_index, :].float()
-            lr0i = lr0[:, s_index:e_index, :].float()
-            kT = ki.transpose(1, 2)
-
-            out[:, :, s_index:e_index] = torch.bmm(
-                w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
-
-            # held out: W here was fit only on chunks < i
-            pred = torch.bmm(w1, F.silu(torch.bmm(w0, kT)) * torch.bmm(w2, kT))
-            held_out.append(
-                (1.0 - F.cosine_similarity(pred, vi, dim=1).mean()).item())
-
-            for _ in range(n_steps):
-                gate_before_act = torch.bmm(w0, kT)
-                hidden_before_mul = torch.bmm(w2, kT)
-                hidden = F.silu(gate_before_act) * hidden_before_mul
-
-                dhidden = torch.bmm(w1.transpose(1, 2), vi)
-                dhidden_before_mul = dhidden * F.silu(gate_before_act)
-                dgate_before_act = silu_backprop(
-                    dhidden * hidden_before_mul, gate_before_act)
-
-                dw1 = torch.bmm(vi, hidden.transpose(1, 2) * lr1i)
-                dw0 = torch.bmm(dgate_before_act, ki * lr0i)
-                dw2 = torch.bmm(dhidden_before_mul, ki * lr2i)
-
-                if momentum is not None:
-                    mi = momentum[:, s_index:e_index, :].float().mean(dim=1, keepdim=True)
-                    dw0 = dw0 + m0 * mi; dw1 = dw1 + m1 * mi; dw2 = dw2 + m2 * mi
-                    m0, m1, m2 = dw0, dw1, dw2
-
-                w0 = w0 + dw0; w1 = w1 + dw1; w2 = w2 + dw2
-                w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * n0
-                w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * n1
-                w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * n2
-
-        qi = qT[:, :, e_index:seq_len]
-        out[:, :, e_index:seq_len] = torch.bmm(
-            w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
-        losses.append(sum(held_out) / len(held_out))
-        return out.transpose(1, 2).to(v.dtype)
+        if bf16:
+            with torch.autocast(device_type='cuda', enabled=True,
+                                dtype=torch.bfloat16):
+                return _run(n_steps, losses, w0.float(), w1.float(), w2.float(),
+                            q, k, v, lr0, lr1, lr2, chunk_size, momentum)
+        return _run(n_steps, losses, w0.float(), w1.float(), w2.float(),
+                    q.float(), k.float(), v.float(),
+                    lr0.float(), lr1.float(), lr2.float(), chunk_size, momentum)
     return op
+
+
+def _run(n_steps, losses, w0, w1, w2, q, k, v, lr0, lr1, lr2, chunk_size, momentum):
+    n0 = w0.norm(dim=2, keepdim=True)
+    n1 = w1.norm(dim=2, keepdim=True)
+    n2 = w2.norm(dim=2, keepdim=True)
+    if momentum is not None:
+        m0 = torch.zeros_like(w0); m1 = torch.zeros_like(w1); m2 = torch.zeros_like(w2)
+
+    vT = v.transpose(1, 2)
+    qT = q.transpose(1, 2)
+    out = torch.zeros_like(vT)
+    held_out, e_index, seq_len = [], 0, k.shape[1]
+
+    for i in range(0, seq_len - chunk_size, chunk_size):
+        s_index, e_index = i, i + chunk_size
+        ki = k[:, s_index:e_index, :]
+        vi = vT[:, :, s_index:e_index]
+        qi = qT[:, :, s_index:e_index]
+        lr1i = lr1[:, s_index:e_index, :]
+        lr2i = lr2[:, s_index:e_index, :]
+        lr0i = lr0[:, s_index:e_index, :]
+        kT = ki.transpose(1, 2)
+
+        out[:, :, s_index:e_index] = torch.bmm(
+            w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
+
+        # held out: W here was fit only on chunks < i
+        pred = torch.bmm(w1, F.silu(torch.bmm(w0, kT)) * torch.bmm(w2, kT))
+        held_out.append(
+            (1.0 - F.cosine_similarity(pred, vi, dim=1).mean()).item())
+
+        for _ in range(n_steps):
+            gate_before_act = torch.bmm(w0, kT)
+            hidden_before_mul = torch.bmm(w2, kT)
+            hidden = F.silu(gate_before_act) * hidden_before_mul
+
+            dhidden = torch.bmm(w1.transpose(1, 2), vi)
+            dhidden_before_mul = dhidden * F.silu(gate_before_act)
+            dgate_before_act = silu_backprop(
+                dhidden * hidden_before_mul, gate_before_act)
+
+            dw1 = torch.bmm(vi, hidden.transpose(1, 2) * lr1i)
+            dw0 = torch.bmm(dgate_before_act, ki * lr0i)
+            dw2 = torch.bmm(dhidden_before_mul, ki * lr2i)
+
+            if momentum is not None:
+                mi = momentum[:, s_index:e_index, :].mean(dim=1, keepdim=True)
+                dw0 = dw0 + m0 * mi; dw1 = dw1 + m1 * mi; dw2 = dw2 + m2 * mi
+                m0, m1, m2 = dw0, dw1, dw2
+
+            w0 = w0 + dw0; w1 = w1 + dw1; w2 = w2 + dw2
+            w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * n0
+            w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * n1
+            w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * n2
+
+    qi = qT[:, :, e_index:seq_len]
+    out[:, :, e_index:seq_len] = torch.bmm(
+        w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
+    losses.append(sum(held_out) / len(held_out))
+    return out.transpose(1, 2).to(v.dtype)
 
 
 def main():
@@ -135,17 +150,19 @@ def main():
         # The replay is only trustworthy if N=1 reproduces the shipped operator.
         with torch.no_grad():
             ref = model(input_ids=seqs[0], use_cache=False).logits.float()
-            lz.block_causal_lact_swiglu = multi_step(1, [])
-            try:
-                mine = model(input_ids=seqs[0], use_cache=False).logits.float()
-            finally:
-                lz.block_causal_lact_swiglu = original
-        d = (ref - mine).abs()
-        rel = (d.max() / ref.abs().max()).item()
-        agree = (ref.argmax(-1) == mine.argmax(-1)).float().mean().item()
-        print(f'VERIFY  max|diff| {d.max():.4e}  relative {rel:.4e}  '
-              f'argmax agreement {agree:.4%}')
-        print('        (nonzero diff is expected: replay is fp32, operator is bf16)\n')
+            for label, use_bf16 in (('fp32 replay', False), ('bf16 replay', True)):
+                lz.block_causal_lact_swiglu = multi_step(1, [], bf16=use_bf16)
+                try:
+                    mine = model(input_ids=seqs[0], use_cache=False).logits.float()
+                finally:
+                    lz.block_causal_lact_swiglu = original
+                d = (ref - mine).abs()
+                rel = (d.max() / ref.abs().max()).item()
+                agree = (ref.argmax(-1) == mine.argmax(-1)).float().mean().item()
+                print(f'VERIFY {label}:  max|diff| {d.max():.4e}  '
+                      f'relative {rel:.4e}  argmax agreement {agree:.4%}')
+        print('  bf16 replay matching closely => the mismatch is precision, not logic.')
+        print('  bf16 replay still off       => a real bug in the replay.\n')
 
     results = []
     print(f'{"iters":>6} {"inner loss":>12}')

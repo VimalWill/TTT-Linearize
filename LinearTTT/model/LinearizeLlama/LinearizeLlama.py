@@ -36,6 +36,7 @@ from .ttt_ops import (
     l2_norm,
     inv_softplus,
 )
+from .ttt_l2 import block_causal_lact_swiglu_l2
 
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -298,6 +299,20 @@ class LinearTTTAttention(nn.Module):
         self.ttt_use_momentum = getattr(config, 'ttt_use_momentum', True)
         self.ttt_prenorm = getattr(config, 'ttt_prenorm', False)
 
+        # 'dot': the upstream Hebbian bias, L = -f(k)^T v (LaCT Eq. 7).
+        # 'l2' : regression bias, L = 1/2||f(k) - v||^2, whose gradient carries
+        #        the residual, so a key that already reads out correctly is left
+        #        alone. See ttt_l2.py.
+        self.ttt_inner_loss = getattr(config, 'ttt_inner_loss', 'dot')
+        if self.ttt_inner_loss not in ('dot', 'l2'):
+            raise ValueError(
+                f"ttt_inner_loss must be 'dot' or 'l2', got {self.ttt_inner_loss!r}"
+            )
+        if self.ttt_inner_loss == 'l2' and self.ttt_prenorm:
+            raise NotImplementedError(
+                "ttt_inner_loss='l2' has no prenorm variant; set ttt_prenorm=False."
+            )
+
         d_in = d_out = self.ttt_head_dim
         d_h = int(self.ttt_head_dim * getattr(config, 'ttt_inter_multi', 1.0))
         gain = getattr(config, 'fw_init_gain', 0.5)
@@ -459,7 +474,12 @@ class LinearTTTAttention(nn.Module):
         w1 = self.w1.repeat(bsz, 1, 1).float()
         w2 = self.w2.repeat(bsz, 1, 1).float()
 
-        ttt_op = prenorm_block_causal_lact_swiglu if self.ttt_prenorm else block_causal_lact_swiglu
+        if self.ttt_inner_loss == 'l2':
+            ttt_op = block_causal_lact_swiglu_l2
+        elif self.ttt_prenorm:
+            ttt_op = prenorm_block_causal_lact_swiglu
+        else:
+            ttt_op = block_causal_lact_swiglu
         ttt_out = ttt_op(
             w0, w1, w2,
             ttt_q, ttt_k, ttt_v,
