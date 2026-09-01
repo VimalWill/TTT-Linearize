@@ -4,10 +4,17 @@
 #   ttt_inner_loss: 'l2'  -- Atlas Eq. 9 regression bias, carries the residual
 #   retention gate        -- Atlas Eq. 32, replaces LaCT Eq. 8's renorm, so the
 #                            regression target is reachable at all
-#   fw_init_gain: 2.0     -- at 0.5 the readout sits ~1000x below ||v||, and
-#                            dw ~ gain^2 is then too small to bootstrap against
-#                            the decay; the memory just fades out
+#   fw_init_gain          -- the readout scale must land near ||v||: too low and
+#                            dw ~ gain^2 cannot bootstrap against the decay (the
+#                            memory fades out), too high and the update grows W
+#                            superlinearly and the retention gate cannot hold it
 # Treat this as a different memory design, not a single-variable ablation.
+#
+# fw_init_gain is CALIBRATED, not guessed. Measured on real PG19 features via
+#   diag_inner.py --cfg <this> --ckpt meta-llama/Llama-3.1-8B
+# gain 2.0 gave |f(k)|/|v| = 0.47 at chunk 0, doubled by chunk 1 and diverged to
+# NaN at chunk 2. Target |f|/|v| ~ 0.05-0.2 at chunk 0 AND roughly flat across
+# chunks; watch the max column too, since the worst head diverges first.
 # Per-layer regression of the hybrid output onto full softmax attention computed
 # from the same q/k/v. No LM loss, no LoRA: the pretrained projections are the
 # teacher and must not move. This exists because the TTT fast weights have no
@@ -30,7 +37,9 @@ model:
   window_size: 512        # must be >= lact_chunk_size
   ttt_inner_loss: 'l2'
   ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
-  fw_init_gain: 2.0              # calibrate per "watch this" note below
+  fw_init_gain: 1.0              # measured: gain 2.0 gave |f|/|v|=0.47 at
+                                 # chunk 0 on real PG19 features and diverged
+                                 # by chunk 2; target band is 0.05-0.2
   ttt_use_momentum: True
   ttt_use_muon: False
   add_eos_token: False

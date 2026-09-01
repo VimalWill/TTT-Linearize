@@ -22,7 +22,7 @@ model:
   window_size: 512        # must be >= lact_chunk_size
   ttt_inner_loss: 'l2'
   ttt_retention_init_bias: 4.0
-  fw_init_gain: 2.0
+  fw_init_gain: 1.0
   ttt_use_momentum: True
   ttt_use_muon: False
   add_eos_token: False

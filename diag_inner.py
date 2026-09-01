@@ -44,7 +44,10 @@ def token_loss(w0, w1, w2, ki, vi, inner_loss):
     """Per-token inner-loop loss, and ||f(k)||/||v||. -> ([l], [l])"""
     kT = ki.transpose(1, 2)
     pred = torch.bmm(w1, F.silu(torch.bmm(w0, kT)) * torch.bmm(w2, kT))
-    mag = (pred.norm(dim=1) / (vi.norm(dim=1) + 1e-8)).mean(dim=0)
+    ratio = pred.norm(dim=1) / (vi.norm(dim=1) + 1e-8)      # [b*h, l]
+    # mean AND max over heads: the mean hides heads whose readout is already
+    # far above ||v||, which are the ones that blow up first.
+    mag = torch.stack([ratio.mean(dim=0), ratio.amax(dim=0)])
     if inner_loss == 'l2':
         loss = (((pred - vi) ** 2).sum(dim=1)
                 / ((vi ** 2).sum(dim=1) + 1e-8)).mean(dim=0)
@@ -130,7 +133,7 @@ def instrumented(records, mags, inner_loss='dot'):
         per_token.append(l_.cpu()); per_mag.append(m_.cpu())
 
         records.append(torch.cat(per_token))
-        mags.append(torch.cat(per_mag))
+        mags.append(torch.cat(per_mag, dim=1))
         return out.transpose(1, 2).to(v.dtype)
     return op
 
@@ -215,11 +218,15 @@ def main():
     per_iter = loss[:, :n_iter * cs].view(loss.shape[0], n_iter, cs).mean(dim=(0, 2))
 
     print(f'\n{loss.shape[0]} layers, chunk_size={cs}, {n_iter} inner-loop iterations\n')
-    mag = torch.stack(mags)
-    mag_iter = mag[:, :n_iter * cs].view(mag.shape[0], n_iter, cs).mean(dim=(0, 2))
-    print(f'{"iteration":>10} {"loss":>10} {"|f(k)|/|v|":>12}')
-    for i, (l, m) in enumerate(zip(per_iter.tolist(), mag_iter.tolist())):
-        print(f'{i:>10} {l:>10.4f} {m:>12.4f}')
+    mag = torch.stack(mags)                    # [layers, 2, tokens]
+    mag_iter = mag[:, :, :n_iter * cs].view(
+        mag.shape[0], 2, n_iter, cs).mean(dim=3)
+    mean_iter = mag_iter[:, 0].mean(dim=0)     # mean over layers
+    max_iter = mag_iter[:, 1].amax(dim=0)      # worst head, worst layer
+    print(f'{"iteration":>10} {"loss":>10} {"|f|/|v| mean":>14} {"|f|/|v| max":>13}')
+    for i, (l, mu, mx) in enumerate(zip(per_iter.tolist(),
+                                        mean_iter.tolist(), max_iter.tolist())):
+        print(f'{i:>10} {l:>10.4f} {mu:>14.4f} {mx:>13.4f}')
     print(f'\n  {per_iter[0]:.4f} -> {per_iter[-1]:.4f}   delta {per_iter[-1] - per_iter[0]:+.4f}')
 
     tag = f'_{args.control}' if args.control else ''
