@@ -29,5 +29,12 @@ train:
   epochs: 1
   max_grad_norm: 1.0
   gradient_checkpointing: True
+  # matches Configs/ttt_at_l2_smoke.yml so the two are directly comparable:
+  # same context, docs, step count, eval cadence and selection metric.
+  # NOTE the outer lr differs -- 1e-3 here (tuned for dot) vs 2e-4 for l2
+  # (1e-3 diverged there). For a controlled read, run this one at 2e-4 too.
+  eval_steps: 5
+  save_steps: 100000
+  metric_for_best_model: 'eval/loss_ce'
   # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
   output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
