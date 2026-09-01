@@ -74,18 +74,21 @@ def swiglu_l2_grads(w0, w1, w2, ki, vi, lr0i, lr1i, lr2i):
     # two nearly-equal numbers precisely when the memory is working. In bf16
     # (8 mantissa bits) its relative error grows without bound as that happens.
     # One fp32 bmm per chunk is a rounding error against the operator's 18 units.
+    # Only the subtraction needs the extra precision; err is then cast back to
+    # vi's dtype and used exactly where upstream uses vi, so the rest of the
+    # pass keeps upstream's single-dtype structure rather than threading a
+    # second dtype through the bmms.
     acc = torch.promote_types(torch.float32,
                               torch.promote_types(w1.dtype, vi.dtype))
     with torch.autocast(device_type=vi.device.type, enabled=False):
         pred = torch.bmm(w1.to(acc), hidden.to(acc))         # [b, dv, l]
-        err = vi.to(acc) - pred                              # [b, dv, l]
+        err = (vi.to(acc) - pred).to(vi.dtype)               # [b, dv, l]
 
     # upstream's backward pass, seeded with the residual instead of v
-    dhidden = torch.bmm(w1.transpose(1, 2), err.to(w1.dtype))
+    dhidden = torch.bmm(w1.transpose(1, 2), err)
     dhidden_before_mul = dhidden * gate
     dgate_before_act = silu_backprop(dhidden * hidden_before_mul, gate_before_act)
 
-    err = err.to(vi.dtype)
     dw1 = torch.bmm(err, (hidden.transpose(1, 2) * lr1i).type_as(err))
     dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
     dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))

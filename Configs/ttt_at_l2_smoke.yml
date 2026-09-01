@@ -1,0 +1,37 @@
+# Smoke test -- same code path as ttt_at_l2.yml, small enough to fail fast.
+# Exercises the l2 objective + retention gate on 4 docs before the real run.
+# Per-layer regression of the hybrid output onto full softmax attention computed
+# from the same q/k/v. No LM loss, no LoRA: the pretrained projections are the
+# teacher and must not move. This exists because the TTT fast weights have no
+# counterpart in the checkpoint, so they cannot be warm-started the way Liger
+# warm-starts a GLA gate from pretrained K.
+data:
+  name: "pg19"
+  path: "emozilla/pg19"
+  num_train_docs: 4
+  num_val_docs: 2
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_at'
+  pretrained_model_name_or_path: 'meta-llama/Llama-3.1-8B'
+  max_length: 2048
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_inner_loss: 'l2'
+  ttt_retention_init_bias: 4.0
+  fw_init_gain: 2.0
+  ttt_use_momentum: True
+  ttt_use_muon: False
+  add_eos_token: False
+  device_map: {"": 0}
+train:
+  optim: 'adamw_torch'
+  lr: 0.0002
+  epochs: 1
+  max_grad_norm: 1.0
+  gradient_checkpointing: True
+  # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
