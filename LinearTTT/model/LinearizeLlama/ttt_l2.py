@@ -164,9 +164,20 @@ def block_causal_lact_swiglu_l2(
             dw2_momentum = dw2
 
         if use_muon:
-            dw0 = zeropower_via_newtonschulz5(dw0)
-            dw1 = zeropower_via_newtonschulz5(dw1)
-            dw2 = zeropower_via_newtonschulz5(dw2)
+            # Atlas Eq. 32 applies eta_t OUTSIDE Newton-Schulz for a reason:
+            # NS returns the nearest semi-orthogonal matrix, so it discards the
+            # magnitude of its input -- including the per-token lr already folded
+            # into dw. Upstream can ignore this because Eq. 8 rescales W right
+            # afterwards (hence its "conclusion: 1.0 is good" note on the muon
+            # lr), but with the retention gate an unscaled orthogonal update is
+            # O(1) against ||W|| and blows up immediately. Reapply the lr as the
+            # chunk-mean per head, which is the eta_t of Eq. 32.
+            eta0 = lr0i.mean(dim=1, keepdim=True)
+            eta1 = lr1i.mean(dim=1, keepdim=True)
+            eta2 = lr2i.mean(dim=1, keepdim=True)
+            dw0 = zeropower_via_newtonschulz5(dw0).type_as(dw0) * eta0
+            dw1 = zeropower_via_newtonschulz5(dw1).type_as(dw1) * eta1
+            dw2 = zeropower_via_newtonschulz5(dw2).type_as(dw2) * eta2
 
         # Atlas Eq. 32: multiplicative decay of the old memory, in place of
         # LaCT Eq. 8's projection back onto the initial row norms.

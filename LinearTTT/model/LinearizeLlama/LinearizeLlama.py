@@ -392,6 +392,15 @@ class LinearTTTAttention(nn.Module):
         q, k, v = (
             rearrange(x, 'b n (h d) -> (b h) n d', h=self.num_ttt_heads) for x in (q, k, v)
         )
+        if self.ttt_inner_loss == 'l2':
+            # The dot bias only needs v's direction, so upstream leaves its
+            # magnitude alone. A regression bias is fitting ||v|| itself, and
+            # measured on PG19 the raw ||v|| varies ~30x across heads (mean
+            # |f|/|v| 0.057 vs max 1.8), so a single inner lr cannot serve them
+            # all. Unit-norm targets put every head on the same scale; the
+            # output magnitude is set downstream by ttt_norm + ttt_scale_proj
+            # regardless.
+            v = l2_norm(v)
         return l2_norm(q), l2_norm(k), v
 
     def forward(

@@ -32,6 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import LinearTTT  # noqa: F401
 from LinearTTT.model.LinearizeLlama import LinearizeLlama as lz
+from LinearTTT.model.LinearizeLlama.ttt_ops import zeropower_via_newtonschulz5
 from Training.train import build_model_config
 
 
@@ -112,6 +113,15 @@ def instrumented(records, mags, inner_loss='dot'):
                 mi = momentum[:, s_index:e_index, :].float().mean(dim=1, keepdim=True)
                 dw0 = dw0 + m0 * mi; dw1 = dw1 + m1 * mi; dw2 = dw2 + m2 * mi
                 m0, m1, m2 = dw0, dw1, dw2
+
+            if use_muon:
+                # NS discards its input's magnitude, so the per-token lr folded
+                # into dw has to be reapplied as Atlas Eq. 32's eta_t. Mirrors
+                # ttt_l2.py; without it the replay reports dynamics the real
+                # operator does not have.
+                dw0 = zeropower_via_newtonschulz5(dw0).float() * lr0i.mean(dim=1, keepdim=True)
+                dw1 = zeropower_via_newtonschulz5(dw1).float() * lr1i.mean(dim=1, keepdim=True)
+                dw2 = zeropower_via_newtonschulz5(dw2).float() * lr2i.mean(dim=1, keepdim=True)
 
             if retention is not None:
                 # Atlas Eq. 32, in place of LaCT Eq. 8

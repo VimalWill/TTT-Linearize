@@ -27,11 +27,11 @@ model:
   # because it could not matter. With the retention gate the magnitude persists:
   # measured ||dw||/||W|| ~ 3.8 per chunk at 1e-2, which took |f|/|v| from 0.08
   # to 9.1 in one step. Want ||dw||/||W|| <~ 0.05.
-  ttt_base_lr: 0.0001
+  ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
   fw_init_gain: 1.0
   ttt_use_momentum: True
-  ttt_use_muon: False
+  ttt_use_muon: True
   add_eos_token: False
   device_map: {"": 0}
 train:
