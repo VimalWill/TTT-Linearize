@@ -21,6 +21,13 @@ model:
   lact_chunk_size: 512
   window_size: 512        # must be >= lact_chunk_size
   ttt_inner_loss: 'l2'
+  # 1e-2 (the dot default) is ~75x too large here. Under LaCT the Eq. 8 renorm
+  # rescales W back to ||W_0|| after every chunk, so only the update's DIRECTION
+  # survived and base_lr was effectively a free parameter -- it was never tuned
+  # because it could not matter. With the retention gate the magnitude persists:
+  # measured ||dw||/||W|| ~ 3.8 per chunk at 1e-2, which took |f|/|v| from 0.08
+  # to 9.1 in one step. Want ||dw||/||W|| <~ 0.05.
+  ttt_base_lr: 0.0001
   ttt_retention_init_bias: 4.0
   fw_init_gain: 1.0
   ttt_use_momentum: True
