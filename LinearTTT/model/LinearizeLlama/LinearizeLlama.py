@@ -36,6 +36,7 @@ from .ttt_ops import (
     l2_norm,
     inv_softplus,
 )
+from .ttt_l2 import block_causal_lact_swiglu_l2
 
 if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -298,6 +299,20 @@ class LinearTTTAttention(nn.Module):
         self.ttt_use_momentum = getattr(config, 'ttt_use_momentum', True)
         self.ttt_prenorm = getattr(config, 'ttt_prenorm', False)
 
+        # 'dot' = LaCT Eq. 7 Hebbian bias, magnitude pinned by Eq. 8's renorm.
+        # 'l2'  = Atlas Eq. 9 regression bias, magnitude bounded by Eq. 32's
+        #         learned retention gate instead. See ttt_l2.py -- crossing the
+        #         two (l2 + renorm) makes the regression target unreachable.
+        self.ttt_inner_loss = getattr(config, 'ttt_inner_loss', 'dot')
+        if self.ttt_inner_loss not in ('dot', 'l2'):
+            raise ValueError(
+                f"ttt_inner_loss must be 'dot' or 'l2', got {self.ttt_inner_loss!r}"
+            )
+        if self.ttt_inner_loss == 'l2' and self.ttt_prenorm:
+            raise NotImplementedError(
+                "ttt_inner_loss='l2' has no prenorm variant; set ttt_prenorm=False."
+            )
+
         d_in = d_out = self.ttt_head_dim
         d_h = int(self.ttt_head_dim * getattr(config, 'ttt_inter_multi', 1.0))
         gain = getattr(config, 'fw_init_gain', 0.5)
@@ -312,6 +327,15 @@ class LinearTTTAttention(nn.Module):
 
         if self.ttt_use_momentum:
             self.momentum_proj = nn.Sequential(
+                nn.Linear(self.hidden_size, self.num_ttt_heads),
+                nn.Sigmoid(),
+            )
+
+        # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
+        # Eq. 8's renormalisation, which this would double up on.
+        self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
+        if self.ttt_inner_loss == 'l2':
+            self.retention_proj = nn.Sequential(
                 nn.Linear(self.hidden_size, self.num_ttt_heads),
                 nn.Sigmoid(),
             )
@@ -352,6 +376,13 @@ class LinearTTTAttention(nn.Module):
         # the gradient to lr_proj and the fast weights entirely.
         nn.init.zeros_(self.ttt_scale_proj.weight)
         nn.init.constant_(self.ttt_scale_proj.bias, self.ttt_scale_init_bias)
+        # Start retention near 1 so the memory is not wiped between chunks:
+        # alpha^16 at 8192/512 is 0.75 for sigmoid(4.0) but 1.5e-5 for
+        # sigmoid(0.0), which would erase the state before it can be read.
+        if hasattr(self, 'retention_proj'):
+            nn.init.zeros_(self.retention_proj[0].weight)
+            nn.init.constant_(self.retention_proj[0].bias,
+                              self.ttt_retention_init_bias)
 
     def _ttt_features(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """[b, n, inner_dim] -> [b * num_ttt_heads, n, ttt_head_dim]."""
@@ -459,7 +490,17 @@ class LinearTTTAttention(nn.Module):
         w1 = self.w1.repeat(bsz, 1, 1).float()
         w2 = self.w2.repeat(bsz, 1, 1).float()
 
-        ttt_op = prenorm_block_causal_lact_swiglu if self.ttt_prenorm else block_causal_lact_swiglu
+        ttt_kwargs = {}
+        if self.ttt_inner_loss == 'l2':
+            ttt_op = block_causal_lact_swiglu_l2
+            ttt_kwargs['retention'] = rearrange(
+                self.retention_proj(hidden_states).float(),
+                'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
+            )
+        elif self.ttt_prenorm:
+            ttt_op = prenorm_block_causal_lact_swiglu
+        else:
+            ttt_op = block_causal_lact_swiglu
         ttt_out = ttt_op(
             w0, w1, w2,
             ttt_q, ttt_k, ttt_v,
@@ -467,6 +508,7 @@ class LinearTTTAttention(nn.Module):
             chunk_size=self.lact_chunk_size,
             use_muon=self.ttt_use_muon,
             momentum=momentum,
+            **ttt_kwargs,
         )
 
         ttt_out = self.ttt_norm(ttt_out)

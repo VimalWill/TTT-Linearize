@@ -1,8 +1,17 @@
 """TTT loss per token during the forward pass.
 
-The LaCT inner loop ascends <f(W;k), v> -- a dot-product objective, not squared
-reconstruction error (there is no residual term in the operator). So the loss is
-reported as 1 - cos(f(W;k_t), v_t): lower is better, 0 is perfect alignment.
+Under `ttt_inner_loss='dot'` (LaCT) the inner loop ascends <f(W;k), v> -- a
+dot-product objective, not squared reconstruction error (there is no residual
+term in the operator), and the magnitude is pinned by the Eq. 8 renorm. So the
+loss is reported as 1 - cos(f(W;k_t), v_t): lower is better, 0 is perfect
+alignment.
+
+Under `ttt_inner_loss='l2'` (Atlas) it descends 1/2||f(W;k) - v||^2 with a
+retention gate in place of the renorm, so the magnitude is meaningful and the
+objective itself is reported, scale-normalised as
+||f(W;k_t) - v_t||^2/||v_t||^2. It also prints ||f(k)||/||v||, since an l2 run
+that cannot close the magnitude gap is the failure mode this pairing exists to
+fix. The two losses are not comparable across settings; compare within one.
 
 The operator is apply-then-update, so token t is read out with fast weights fit
 only on chunks strictly before its own. Every point is therefore held out -- the
@@ -31,21 +40,27 @@ def silu_backprop(dy, x):
     return dy * sigma * (1 + x * (1 - sigma))
 
 
-def token_loss(w0, w1, w2, ki, vi):
-    """1 - cos(f(W;k_t), v_t) for every token in the chunk. -> [l]"""
+def token_loss(w0, w1, w2, ki, vi, inner_loss):
+    """Per-token inner-loop loss, and ||f(k)||/||v||. -> ([l], [l])"""
     kT = ki.transpose(1, 2)
     pred = torch.bmm(w1, F.silu(torch.bmm(w0, kT)) * torch.bmm(w2, kT))
-    return (1.0 - F.cosine_similarity(pred, vi, dim=1)).mean(dim=0)
+    mag = (pred.norm(dim=1) / (vi.norm(dim=1) + 1e-8)).mean(dim=0)
+    if inner_loss == 'l2':
+        loss = (((pred - vi) ** 2).sum(dim=1)
+                / ((vi ** 2).sum(dim=1) + 1e-8)).mean(dim=0)
+    else:
+        loss = (1.0 - F.cosine_similarity(pred, vi, dim=1)).mean(dim=0)
+    return loss, mag
 
 
-def instrumented(records):
+def instrumented(records, mags, inner_loss='dot'):
     """Replay of block_causal_lact_swiglu recording per-token loss.
 
     Mirrors third_party/LaCT/lact_llm/lact_model/ttt_operation.py; the only
     addition is the measurement.
     """
     def op(w0, w1, w2, q, k, v, lr0, lr1, lr2,
-           chunk_size=2048, use_muon=False, momentum=None):
+           chunk_size=2048, use_muon=False, momentum=None, retention=None):
         w0, w1, w2 = w0.float(), w1.float(), w2.float()
         n0 = w0.norm(dim=2, keepdim=True)
         n1 = w1.norm(dim=2, keepdim=True)
@@ -56,7 +71,7 @@ def instrumented(records):
         vT = v.transpose(1, 2).float()
         qT = q.transpose(1, 2).float()
         out = torch.zeros_like(vT)
-        per_token, e_index, seq_len = [], 0, k.shape[1]
+        per_token, per_mag, e_index, seq_len = [], [], 0, k.shape[1]
 
         for i in range(0, seq_len - chunk_size, chunk_size):
             s_index, e_index = i, i + chunk_size
@@ -71,18 +86,22 @@ def instrumented(records):
                 w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
 
             # W here was fit on chunks < i, so every token below is held out
-            per_token.append(token_loss(w0, w1, w2, ki, vi).cpu())
+            l_, m_ = token_loss(w0, w1, w2, ki, vi, inner_loss)
+            per_token.append(l_.cpu()); per_mag.append(m_.cpu())
 
             kT = ki.transpose(1, 2)
             gate_before_act = torch.bmm(w0, kT)
             hidden_before_mul = torch.bmm(w2, kT)
             hidden = F.silu(gate_before_act) * hidden_before_mul
 
-            dhidden = torch.bmm(w1.transpose(1, 2), vi)
+            # the l2 bias seeds the backward pass with the residual, not v
+            err = vi - torch.bmm(w1, hidden) if inner_loss == 'l2' else vi
+
+            dhidden = torch.bmm(w1.transpose(1, 2), err)
             dhidden_before_mul = dhidden * F.silu(gate_before_act)
             dgate_before_act = silu_backprop(dhidden * hidden_before_mul, gate_before_act)
 
-            dw1 = torch.bmm(vi, hidden.transpose(1, 2) * lr1i)
+            dw1 = torch.bmm(err, hidden.transpose(1, 2) * lr1i)
             dw0 = torch.bmm(dgate_before_act, ki * lr0i)
             dw2 = torch.bmm(dhidden_before_mul, ki * lr2i)
 
@@ -91,10 +110,15 @@ def instrumented(records):
                 dw0 = dw0 + m0 * mi; dw1 = dw1 + m1 * mi; dw2 = dw2 + m2 * mi
                 m0, m1, m2 = dw0, dw1, dw2
 
-            w0 = w0 + dw0; w1 = w1 + dw1; w2 = w2 + dw2
-            w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * n0
-            w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * n1
-            w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * n2
+            if retention is not None:
+                # Atlas Eq. 32, in place of LaCT Eq. 8
+                a_i = retention[:, s_index:e_index, :].float().mean(dim=1, keepdim=True)
+                w0 = w0 * a_i + dw0; w1 = w1 * a_i + dw1; w2 = w2 * a_i + dw2
+            else:
+                w0 = w0 + dw0; w1 = w1 + dw1; w2 = w2 + dw2
+                w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * n0
+                w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * n1
+                w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * n2
 
         # tail chunk: read out with the final weights, still never fit on
         ki = k[:, e_index:seq_len, :].float()
@@ -102,9 +126,11 @@ def instrumented(records):
         qi = qT[:, :, e_index:seq_len]
         out[:, :, e_index:seq_len] = torch.bmm(
             w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi))
-        per_token.append(token_loss(w0, w1, w2, ki, vi).cpu())
+        l_, m_ = token_loss(w0, w1, w2, ki, vi, inner_loss)
+        per_token.append(l_.cpu()); per_mag.append(m_.cpu())
 
         records.append(torch.cat(per_token))
+        mags.append(torch.cat(per_mag))
         return out.transpose(1, 2).to(v.dtype)
     return op
 
@@ -168,14 +194,19 @@ def main():
         else:
             print(f'held-out PG19 validation text: {ids.shape[1]} tokens')
 
-    records = []
-    original = lz.block_causal_lact_swiglu
-    lz.block_causal_lact_swiglu = instrumented(records)
+    records, mags = [], []
+    inner_loss = getattr(model_config, 'ttt_inner_loss', 'dot')
+    op_name = ('block_causal_lact_swiglu_l2' if inner_loss == 'l2'
+               else 'block_causal_lact_swiglu')
+    print(f'inner objective: {inner_loss} '
+          f'({"||f(k)-v||^2/||v||^2" if inner_loss == "l2" else "1 - cos(f(k), v)"})')
+    original = getattr(lz, op_name)
+    setattr(lz, op_name, instrumented(records, mags, inner_loss))
     try:
         with torch.no_grad():
             model(input_ids=ids, use_cache=False)
     finally:
-        lz.block_causal_lact_swiglu = original
+        setattr(lz, op_name, original)
 
     loss = torch.stack(records)                       # [layers, tokens]
     n_iter = loss.shape[1] // cs
@@ -184,9 +215,11 @@ def main():
     per_iter = loss[:, :n_iter * cs].view(loss.shape[0], n_iter, cs).mean(dim=(0, 2))
 
     print(f'\n{loss.shape[0]} layers, chunk_size={cs}, {n_iter} inner-loop iterations\n')
-    print(f'{"iteration":>10} {"loss":>10}')
-    for i, l in enumerate(per_iter.tolist()):
-        print(f'{i:>10} {l:>10.4f}')
+    mag = torch.stack(mags)
+    mag_iter = mag[:, :n_iter * cs].view(mag.shape[0], n_iter, cs).mean(dim=(0, 2))
+    print(f'{"iteration":>10} {"loss":>10} {"|f(k)|/|v|":>12}')
+    for i, (l, m) in enumerate(zip(per_iter.tolist(), mag_iter.tolist())):
+        print(f'{i:>10} {l:>10.4f} {m:>12.4f}')
     print(f'\n  {per_iter[0]:.4f} -> {per_iter[-1]:.4f}   delta {per_iter[-1] - per_iter[0]:+.4f}')
 
     tag = f'_{args.control}' if args.control else ''

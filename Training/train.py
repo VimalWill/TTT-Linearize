@@ -26,7 +26,7 @@ from Training.dataloader import load_data
 TTT_PARAM_KEYS = (
     '.w0', '.w1', '.w2',
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
-    'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj',
+    'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj', 'retention_proj',
 )
 
 # yml `model:` keys consumed by the harness rather than by the model config
