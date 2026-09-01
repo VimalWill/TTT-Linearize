@@ -428,6 +428,11 @@ class FinetuneTrainer(DefaultTrainer):
         
         targets = targets.cpu()
         outputs = outputs.cpu()
-        outputs = {'ppl': torch.exp(loss).item(), 'seq_len': targets.shape[-1] + 1}
+        # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the
+        # 'ppl' below is a mean of per-batch exp(CE), which Jensen-inflates above
+        # exp(mean CE) -- and exp(mean CE) is what diag_ce.py reports, i.e. what
+        # the recorded dot-path numbers (31, 18.1) are on.
+        outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
+                   'seq_len': targets.shape[-1] + 1}
         return (loss, outputs) if return_outputs else loss
     
