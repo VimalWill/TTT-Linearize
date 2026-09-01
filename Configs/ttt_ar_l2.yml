@@ -20,8 +20,12 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  # stage 1's output: run.py writes to checkpoints/<cfg-basename>/best
-  pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_l2/best
+  # stage 1's output. `best_ckpt` is written on every eval improvement
+  # (trainer.py), while `best` is only written after the training loop finishes
+  # (train.py) -- so `best` is absent if stage 1 was interrupted. They hold the
+  # same weights, since `best` is `best_ckpt` reloaded and re-saved, so point at
+  # `best_ckpt`: it exists either way.
+  pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_l2/best_ckpt
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
