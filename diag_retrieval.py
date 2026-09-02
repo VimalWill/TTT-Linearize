@@ -219,13 +219,19 @@ def score(model, ids, answers, batch):
 
 
 def gate_by_layer(model, mods, ids, batch):
-    """Mean silu(ttt_scale_proj(h)) per layer -- is the branch even open?"""
+    """Mean |silu(ttt_scale_proj(h))| per layer -- is the branch even open?
+
+    ABSOLUTE value, deliberately. These gates train negative, and silu is
+    negative on (-inf, 0), so a signed mean cancels to ~0 and every layer looks
+    shut regardless of how hard the branch is driving. Magnitude is what says
+    whether the branch is on.
+    """
     acc = [0.0] * len(mods)
     hooks = []
 
     def mk(i):
         def fn(_m, _inp, out):
-            acc[i] += F.silu(out.detach().float()).mean().item()
+            acc[i] += F.silu(out.detach().float()).abs().mean().item()
         return fn
 
     for i, m in enumerate(mods):
