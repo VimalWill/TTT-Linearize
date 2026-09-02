@@ -93,11 +93,22 @@ def sliding_window_attention(
         def mask_mod(b, h, q_idx, kv_idx):
             return torch.abs(q_idx - kv_idx) <= window_size
 
-    cache_key = (B, H, Q_len, window_size, causal, device)
+    cache_key = (Q_len, window_size, causal, device)
     if block_mask_cache is not None and cache_key in block_mask_cache:
         block_mask = block_mask_cache[cache_key]
     else:
-        block_mask = create_block_mask(mask_mod, B, H, Q_len, Q_len, device=device)
+        # B=H=None, and _compile: mask_mod ignores b and h, so the mask is
+        # broadcast as [1, 1, Q, Q] instead of [B, H, Q, Q]. Passing B and H
+        # made create_block_mask materialise the dense per-head mask and sum it
+        # -- 32 * 32768^2 * 8 bytes = 256 GiB at 32k context, which OOMs a 96 GB
+        # GH200 before the model runs. _compile avoids materialising the dense
+        # mask at all. Verified the two masks are identical.
+        try:
+            block_mask = create_block_mask(
+                mask_mod, None, None, Q_len, Q_len, device=device, _compile=True)
+        except TypeError:  # older torch without _compile
+            block_mask = create_block_mask(
+                mask_mod, None, None, Q_len, Q_len, device=device)
         if block_mask_cache is not None:
             block_mask_cache[cache_key] = block_mask
 
