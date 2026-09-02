@@ -372,9 +372,7 @@ def main():
                 'score_ar stacks them, so they must be equal length'
             )
         names = list(masks[0].keys())
-        far = [n for n in names if n != 'other'][-1]
-        print(f'{len(seqs)} sequences of {seqs[0].shape[0]} tokens; '
-              f'slices {names}, far slice = {far}')
+        print(f'{len(seqs)} sequences of {seqs[0].shape[0]} tokens; slices {names}')
 
         def run():
             ce, cnt = score_ar(model, seqs, masks, args.batch)
@@ -384,8 +382,25 @@ def main():
         print('\nbaseline, no ablation')
         for n in names:
             tag = ' (in-window, control)' if n.startswith('ar_0_') else ''
-            print(f'  {n:>14}  CE {base[n]:7.4f}  ppl {math.exp(base[n]):9.2f}  '
+            if n == 'ar_same_chunk':
+                tag = ' (TTT-blind by construction)'
+            if not counts[n]:
+                print(f'  {n:>16}  {"EMPTY -- no such tokens at this length":>40}')
+                continue
+            print(f'  {n:>16}  CE {base[n]:7.4f}  ppl {math.exp(base[n]):9.2f}  '
                   f'{counts[n]:>9,} tokens{tag}')
+        # Drop empty slices: an unpopulated bucket makes every delta nan and
+        # nan-poisons the anchor score and the whole ranking. ar_8192+ is empty
+        # at an 8192 context, which is exactly when --seq-len was not applied.
+        empty = [n for n in names if not counts[n]]
+        if empty:
+            print(f'  dropping empty slices: {empty}')
+            names = [n for n in names if counts[n]]
+        cross = [n for n in names if n not in ('other', 'ar_same_chunk')]
+        if not cross:
+            raise SystemExit('no populated cross-chunk AR slice -- nothing to measure')
+        far = cross[-1]
+        print(f'  far slice = {far}')
     else:
         tok = AutoTokenizer.from_pretrained(args.base)
         pool, lk, lv = build_pool(tok, seed=args.seed)
