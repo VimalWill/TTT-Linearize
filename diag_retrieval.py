@@ -250,6 +250,15 @@ def main():
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--task', choices=['ar-slice', 'kv'], default='ar-slice')
     ap.add_argument('--seqs', type=int, default=8, help='ar-slice: validation sequences')
+    ap.add_argument('--data-path', default=None,
+                    help='ar-slice: override data.path, e.g. a Pile mirror such as '
+                         'monology/pile-uncopyrighted, to match the corpus Based '
+                         'Table 1 reports AR-slice perplexity on. The dataset must '
+                         'expose a validation split.')
+    ap.add_argument('--data-name', default=None,
+                    help="ar-slice: override data.name. Must contain 'pg19', 'books' "
+                         "or 'longtext' to select the long-form formatter in "
+                         'Training/dataloader.py; use longtext for a Pile mirror.')
     ap.add_argument('--edges', type=int, nargs='+', default=[512, 2048],
                     help='ar-slice: distance bucket edges; a final open bucket is added')
     ap.add_argument('--seq-len', type=int, default=4096, help='kv only')
@@ -278,6 +287,16 @@ def main():
 
     # ------------------------------------------------ assemble the task
     if args.task == 'ar-slice':
+        if args.data_path or args.data_name:
+            config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+            if args.data_path:
+                config.data.path = args.data_path
+            if args.data_name:
+                config.data.name = args.data_name
+            print(f'corpus override: {config.data.path} ({config.data.name})')
+        else:
+            print(f'corpus: {config.data.path} -- NOTE this is the training corpus; '
+                  'pass --data-path for a number comparable to published AR-slice')
         loader = load_data(config)['validation']
         seqs, masks = [], []
         edges = list(args.edges) + [math.inf]
