@@ -32,11 +32,28 @@ def load_model(path, model_config, adapter=None):
         path, config=model_config, device_map={'': 0}
     ).to(torch.bfloat16)
     if adapter:
+        import re
         from peft import PeftModel
         ttt = os.path.join(adapter, 'ttt_params.pt')
         if os.path.exists(ttt):
-            model.load_state_dict(torch.load(ttt, map_location='cpu'), strict=False)
-            print('  overlaid saved TTT params')
+            sd = torch.load(ttt, map_location='cpu')
+            # ttt_params.pt is saved from a PeftModel, so its keys carry peft's
+            # wrapper prefix ('base_model.model.model.layers.N...'), while this
+            # model is still unwrapped and expects 'model.layers.N...'. Loading
+            # the dict as-is matches NOTHING, and strict=False hides that: the
+            # stage-2 memory is silently replaced by stage 1's. Measured once as
+            # row D reading 3.097 when the training eval said 2.603.
+            sd = {re.sub(r'^base_model\.model\.', '', k): v for k, v in sd.items()}
+            unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
+            matched = len(sd) - len(unexpected)
+            if matched == 0:
+                raise RuntimeError(
+                    f'{ttt} has {len(sd)} tensors but none match this model. '
+                    f'First saved key: {next(iter(sd))}'
+                )
+            print(f'  overlaid {matched}/{len(sd)} saved TTT tensors')
+            if unexpected:
+                print(f'  WARNING: {len(unexpected)} unmatched, e.g. {unexpected[0]}')
         else:
             print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()

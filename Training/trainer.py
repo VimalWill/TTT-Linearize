@@ -134,6 +134,23 @@ class DefaultTrainer():
                             weights = torch.load(fpath, map_location="cpu")
                             set_peft_model_state_dict(model, weights)
                             break
+                    # The adapters are only half the checkpoint: the TTT
+                    # parameters are plain base-model tensors that training also
+                    # updates, saved separately by save_checkpoint. Without this
+                    # the returned model carries the LAST step's memory with the
+                    # BEST step's adapters. Keys were saved from this same
+                    # PeftModel, so they match directly.
+                    ttt = os.path.join(ckpt_path, 'ttt_params.pt')
+                    if os.path.exists(ttt):
+                        sd = torch.load(ttt, map_location='cpu')
+                        unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
+                        matched = len(sd) - len(unexpected)
+                        if matched == 0:
+                            raise RuntimeError(
+                                f'{ttt} has {len(sd)} tensors but none matched; '
+                                f'first key {next(iter(sd))}'
+                            )
+                        print(f'-> Restored {matched}/{len(sd)} TTT tensors')
                 else:
                     model.from_pretrained(ckpt_path)
                 print(f'-> Loading best checkpoint from {ckpt_path}')
