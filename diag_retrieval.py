@@ -267,7 +267,12 @@ def main():
                          'Training/dataloader.py; use longtext for a Pile mirror.')
     ap.add_argument('--edges', type=int, nargs='+', default=[512, 2048],
                     help='ar-slice: distance bucket edges; a final open bucket is added')
-    ap.add_argument('--seq-len', type=int, default=4096, help='kv only')
+    ap.add_argument('--seq-len', type=int, default=None,
+                    help='context length. ar-slice: overrides data.max_length, so '
+                         'the sweep can run beyond the 8192 it was trained at -- '
+                         'nothing in this model sees a position past window_size, '
+                         'so there is no RoPE extrapolation to worry about. '
+                         'kv: prompt length (default 4096).')
     ap.add_argument('--distances', type=int, nargs='+', default=[128, 1024, 3072],
                     help='kv only')
     ap.add_argument('--samples', type=int, default=16, help='kv only')
@@ -293,8 +298,11 @@ def main():
 
     # ------------------------------------------------ assemble the task
     if args.task == 'ar-slice':
-        if args.data_path or args.data_name:
+        if args.data_path or args.data_name or args.seq_len:
             config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+            if args.seq_len:
+                config.model.max_length = args.seq_len
+                print(f'context override: {args.seq_len} tokens')
             if args.data_path:
                 config.data.path = args.data_path
             if args.data_name:
@@ -346,7 +354,7 @@ def main():
         data = {}
         for d in args.distances:
             ids, ans, realised = build_batch(
-                tok, pool, lk, lv, args.seq_len, d, args.samples, args.seed)
+                tok, pool, lk, lv, args.seq_len or 4096, d, args.samples, args.seed)
             data[d] = (ids, ans, realised)
             tag = 'inside window (control)' if realised <= window else 'beyond window'
             print(f'  distance {d:>5} -> {realised:>5} tokens  [{tag}]')
