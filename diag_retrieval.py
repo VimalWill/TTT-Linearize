@@ -112,7 +112,7 @@ def build_batch(tok, pool, lk, lv, seq_len, distance, n_samples, seed):
 
 # ------------------------------------------------------- associative recall
 
-def ar_masks(ids, edges, window):
+def ar_masks(ids, edges, window, chunk=None):
     """Split a sequence into AR-hit slices by distance, plus a non-AR control.
 
     A token at position t is an associative-recall hit if the bigram
@@ -136,10 +136,31 @@ def ar_masks(ids, edges, window):
 
     masks = {}
     hit = dist > 0
+
+    # Chunk-crossing split. Apply-then-update means a query in chunk i reads
+    # weights fitted on chunks 0..i-1, so a source in the query's OWN chunk is
+    # invisible to the TTT branch by construction. That makes same-chunk hits a
+    # structural control: any TTT ablation effect there cannot be retrieval, it
+    # is the branch acting as a learned transform of q through the state.
+    #
+    # Raw distance does not separate these -- a hit at distance < 512 is
+    # same-chunk or previous-chunk depending on the query's offset within its
+    # chunk, so the 0-512 bucket is a mixture of both, roughly half each.
+    if chunk:
+        pos = torch.arange(T)
+        src = pos - dist
+        same = hit & ((pos // chunk) == (src.clamp(min=0) // chunk))
+        masks['ar_same_chunk'] = same
+        cross = hit & ~same
+        pfx = 'ar_x'
+    else:
+        cross = hit
+        pfx = 'ar_'
+
     lo = 0
     for hi in edges:
-        name = f'ar_{lo}_{hi}' if hi != math.inf else f'ar_{lo}+'
-        masks[name] = hit & (dist > lo) & (dist <= hi)
+        name = f'{pfx}{lo}_{hi}' if hi != math.inf else f'{pfx}{lo}+'
+        masks[name] = cross & (dist > lo) & (dist <= hi)
         lo = hi
     masks['other'] = ~hit
     masks['other'][0] = False
@@ -290,6 +311,12 @@ def main():
     ap.add_argument('--batch', type=int, default=2)
     ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='ttt')
     ap.add_argument('--layers', type=int, nargs='+', default=None)
+    ap.add_argument('--group', type=int, nargs='+', default=None,
+                    help='ablate these layers TOGETHER as one condition instead of '
+                         'sweeping them one at a time. Single-layer ablation leaves '
+                         'a depth-composed relay intact -- 32 stacked 512-token '
+                         'windows reach ~16k -- so breaking the chain needs a '
+                         'contiguous block, e.g. --group $(seq -s\' \' 8 15).')
     ap.add_argument('--out', default='retrieval_anchor')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
@@ -333,7 +360,8 @@ def main():
                     break
                 ids = row.cpu()
                 seqs.append(ids)
-                masks.append(ar_masks(ids, edges, window)[0])
+                masks.append(ar_masks(ids, edges, window,
+                                                  model_config.lact_chunk_size)[0])
             if len(seqs) >= args.seqs:
                 break
         if not seqs:
@@ -398,6 +426,16 @@ def main():
             ce, _ = run()
         print(f'  -{br:<4} ' + '  '.join(
             f'{n} {ce[n]:6.3f} ({ce[n] - base[n]:+6.3f})' for n in names))
+
+    # ------------------------------------------------ grouped ablation
+    if args.group:
+        print(f'\ngrouped ablation, layers {args.group} together')
+        for br in branches:
+            with ablate([mods[i] for i in args.group], br):
+                ce, _ = run()
+            print(f'  -{br:<4} ' + '  '.join(
+                f'{n} {ce[n]:6.3f} ({ce[n] - base[n]:+6.3f})' for n in names))
+        return
 
     # ------------------------------------------------ per-layer sweep
     results = {}
