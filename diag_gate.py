@@ -22,24 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import LinearTTT  # noqa: F401
 from Training.train import build_model_config
-
-
-def load_model(path, model_config, adapter=None):
-    """Full checkpoint, optionally with PEFT adapters and saved TTT params on top."""
-    import os
-    model = AutoModelForCausalLM.from_pretrained(
-        path, config=model_config, device_map={'': 0}
-    ).to(torch.bfloat16)
-    if adapter:
-        from peft import PeftModel
-        ttt = os.path.join(adapter, 'ttt_params.pt')
-        if os.path.exists(ttt):
-            model.load_state_dict(torch.load(ttt, map_location='cpu'), strict=False)
-            print('  overlaid saved TTT params')
-        else:
-            print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
-        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
-    return model.eval()
+from diag_common import load_model
 
 
 def measure(path, config, tok, ids, adapter=None):

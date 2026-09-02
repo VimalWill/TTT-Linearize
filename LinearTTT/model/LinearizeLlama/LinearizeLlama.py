@@ -352,6 +352,14 @@ class LinearTTTAttention(nn.Module):
 
         self._block_mask_cache = {}
 
+        # Branch ablation, for the retrieval-anchoring diagnostic. The two
+        # branches are summed inside forward, so a module hook cannot separate
+        # them; zeroing the fast weights instead would also perturb the inner
+        # loop and so would not be a clean ablation. Set via
+        # diag_retrieval.ablate(); always False in training.
+        self._ablate_ttt = False
+        self._ablate_attn = False
+
     def reset_ttt_parameters(self):
         """Initialise the parameters that have no counterpart in the checkpoint.
 
@@ -529,6 +537,10 @@ class LinearTTTAttention(nn.Module):
         ttt_out = rearrange(ttt_out, '(b h) n d -> b n (h d)', b=bsz, h=self.num_ttt_heads)
 
         # ---------------- merge ----------------
+        if self._ablate_attn:
+            attn_out = torch.zeros_like(attn_out)
+        if self._ablate_ttt:
+            ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
 
         # Attention transfer (LoLCATS stage 1): alongside the hybrid output,
