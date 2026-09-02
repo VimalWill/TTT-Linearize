@@ -313,8 +313,35 @@ class LinearTTTAttention(nn.Module):
                 "ttt_inner_loss='l2' has no prenorm variant; set ttt_prenorm=False."
             )
 
+        # State per layer is 3 * num_ttt_heads * d_h * d_in, i.e. exactly
+        # proportional to ttt_inter_multi, while d_in/d_out stay at ttt_head_dim
+        # -- so this is the knob for allocating state ACROSS layers without
+        # touching the feature map. num_ttt_heads would also scale state
+        # (LaCT Eq. 14, 3*d^2/nh) but changes ttt_head_dim with it, and so
+        # changes the l2_norm geometry the memory operates in.
+        #
+        # Accepts a scalar (uniform, the default) or a per-layer list, for
+        # allocating capacity by measured retrieval demand -- see
+        # diag_retrieval.py for the anchor score that would drive it.
+        inter = getattr(config, 'ttt_inter_multi', 1.0)
+        if isinstance(inter, (list, tuple)):
+            if layer_idx is None:
+                raise ValueError('per-layer ttt_inter_multi needs a layer_idx')
+            if len(inter) != config.num_hidden_layers:
+                raise ValueError(
+                    f'ttt_inter_multi has {len(inter)} entries but the model has '
+                    f'{config.num_hidden_layers} layers'
+                )
+            inter = inter[layer_idx]
+        self.ttt_inter_multi = float(inter)
+
         d_in = d_out = self.ttt_head_dim
-        d_h = int(self.ttt_head_dim * getattr(config, 'ttt_inter_multi', 1.0))
+        d_h = int(self.ttt_head_dim * self.ttt_inter_multi)
+        if d_h < 1:
+            raise ValueError(
+                f'ttt_inter_multi={self.ttt_inter_multi} gives d_h={d_h} at '
+                f'ttt_head_dim={self.ttt_head_dim}'
+            )
         gain = getattr(config, 'fw_init_gain', 0.5)
        
         self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
