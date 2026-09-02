@@ -154,11 +154,22 @@ def score_ar(model, seqs, masks, batch):
     cnt = {n: 0 for n in names}
     for i in range(0, len(seqs), batch):
         chunk = torch.stack(seqs[i:i + batch]).cuda()
-        logits = model(input_ids=chunk, use_cache=False).logits.float()
-        # loss on predicting token t comes from logits at t-1
-        lp = F.log_softmax(logits[:, :-1, :], dim=-1)
+        logits = model(input_ids=chunk, use_cache=False).logits
+        # loss on predicting token t comes from logits at t-1.
+        # Chunked over positions: at 32k the full [b, T, 128256] in fp32 plus its
+        # log_softmax is ~42 GB before the model's own 16 GB, which does not fit.
+        # This caps the fp32 working set at STEP * vocab.
+        STEP = 2048
         tgt = chunk[:, 1:]
-        nll = -lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)     # [b, T-1]
+        parts = []
+        for a in range(0, tgt.shape[1], STEP):
+            b_ = min(a + STEP, tgt.shape[1])
+            lg = logits[:, a:b_, :].float()
+            lp = F.log_softmax(lg, dim=-1)
+            parts.append(-lp.gather(-1, tgt[:, a:b_].unsqueeze(-1)).squeeze(-1))
+            del lg, lp
+        nll = torch.cat(parts, dim=1)                            # [b, T-1]
+        del logits, parts
         for j in range(chunk.shape[0]):
             m = masks[i + j]
             for n in names:
