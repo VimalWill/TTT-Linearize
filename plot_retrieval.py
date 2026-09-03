@@ -89,7 +89,10 @@ def main():
     ax.annotate('G&A layers in the\nsoftmax model', xy=(16.5, ax.get_ylim()[0]),
                 xytext=(19, -12), fontsize=8, color='0.35',
                 arrowprops=dict(arrowstyle='-', color='0.6', lw=.8))
-    ax.set_ylabel('Δ accuracy (points)')
+    # symlog: L0/L1 are 8x the rest, so a linear axis squashes L2-31 flat --
+    # the same dynamic-range problem the two-line layout had, just relocated.
+    ax.set_yscale('symlog', linthresh=3 * sd)
+    ax.set_ylabel('Δ accuracy (points, symlog)')
     ax.set_xlabel('layer (TTT branch ablated)')
     ax.legend(fontsize=8, loc='lower right', framealpha=.9)
     ax.set_title('segment length = retrieval-specific damage', fontsize=9, loc='left')
@@ -101,16 +104,21 @@ def main():
             label='y = x  (damage is pure knowledge)')
     ax.axhspan(-3 * sd, 3 * sd, color='0.93', zorder=0)
     ax.axvspan(-3 * sd, 3 * sd, color='0.93', zorder=0)
-    ax.scatter([dc[i] for i in L], [dl[i] for i in L], s=30,
-               c=['#B03030' if i in (0, 1) else '#3B6E8F' for i in L], zorder=3)
+    # layer index as colour, so this one panel carries the decomposition, the
+    # significance box, AND depth -- no second panel needed for position.
+    sc = ax.scatter([dc[i] for i in L], [dl[i] for i in L], s=42, c=L,
+                    cmap='viridis', edgecolor='0.25', linewidth=.4, zorder=3)
+    cb = plt.colorbar(sc, ax=ax, pad=.015)
+    cb.set_label('layer index', fontsize=8)
     for i in L:
         if abs(rs[i]) > 2 * sd or i in (0, 1):
             ax.annotate(f'L{i}', (dc[i], dl[i]), textcoords='offset points',
-                        xytext=(5, -3), fontsize=8)
+                        xytext=(7, -2), fontsize=8)
     ax.set_xlabel('Δ cloze — knowledge only (points)')
     ax.set_ylabel('Δ letter — knowledge\n+ retrieval (points)')
     ax.legend(fontsize=8, loc='upper left')
-    ax.set_title('below the diagonal = retrieval-specific', fontsize=9, loc='left')
+    ax.set_title('below the diagonal = retrieval-specific; colour = depth',
+                 fontsize=9, loc='left')
 
     # ---- cross-probe agreement ----
     if args.ar:
