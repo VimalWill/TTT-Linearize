@@ -217,18 +217,22 @@ def ttt_layers(model):
 
 @contextlib.contextmanager
 def ablate(mods, branch):
-    """branch: 'ttt' | 'attn' | None"""
-    if branch is None:
+    """branch: 'ttt' | 'attn' | 'both' | None, or a list of those."""
+    if branch is None or not mods:
         yield
         return
-    attr = '_ablate_ttt' if branch == 'ttt' else '_ablate_attn'
+    which = ['ttt', 'attn'] if branch == 'both' else (
+        [branch] if isinstance(branch, str) else list(branch))
+    attrs = ['_ablate_ttt' if b == 'ttt' else '_ablate_attn' for b in which]
     for m in mods:
-        setattr(m, attr, True)
+        for a in attrs:
+            setattr(m, a, True)
     try:
         yield
     finally:
         for m in mods:
-            setattr(m, attr, False)
+            for a in attrs:
+                setattr(m, a, False)
 
 
 @torch.no_grad()
@@ -311,6 +315,12 @@ def main():
     ap.add_argument('--batch', type=int, default=2)
     ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='ttt')
     ap.add_argument('--layers', type=int, nargs='+', default=None)
+    ap.add_argument('--joint', action='store_true',
+                    help='per layer, run the 2x2 of {baseline, -ttt, -attn, -both} '
+                         'and report the interaction term. Marginal single-branch '
+                         'ablations do not add up when the branches interact, and '
+                         'they measurably do -- at L25-27 removing SWA GAINS 0.12 '
+                         'nats at >=8192 while removing TTT costs 0.11.')
     ap.add_argument('--group', type=int, nargs='+', default=None,
                     help='ablate these layers TOGETHER as one condition instead of '
                          'sweeping them one at a time. Single-layer ablation leaves '
@@ -450,6 +460,43 @@ def main():
                 ce, _ = run()
             print(f'  -{br:<4} ' + '  '.join(
                 f'{n} {ce[n]:6.3f} ({ce[n] - base[n]:+6.3f})' for n in names))
+        return
+
+    # ------------------------------------------------ joint 2x2 per layer
+    if args.joint:
+        print(f'\nper-layer 2x2 interaction at {far}')
+        print('  interaction = d(-both) - d(-ttt) - d(-attn)')
+        print('  < 0 redundant (each substitutes) | > 0 complementary (both needed)')
+        print(f'\n{"layer":>5}{"d(-ttt)":>10}{"d(-attn)":>10}{"d(-both)":>10}'
+              f'{"interact":>11}  verdict')
+        jrows = []
+        for li in targets:
+            d = {}
+            for tag, br in (('ttt', 'ttt'), ('attn', 'attn'), ('both', 'both')):
+                with ablate([mods[li]], br):
+                    ce, _ = run()
+                d[tag] = ce[far] - base[far]
+            inter = d['both'] - d['ttt'] - d['attn']
+            scale = max(abs(d['ttt']), abs(d['attn']), 1e-9)
+            if inter < -0.15 * scale:
+                v = 'redundant'
+            elif inter > 0.15 * scale:
+                v = 'complementary'
+            else:
+                v = 'independent'
+            print(f'{li:>5}{d["ttt"]:>+10.4f}{d["attn"]:>+10.4f}{d["both"]:>+10.4f}'
+                  f'{inter:>+11.4f}  {v}')
+            jrows.append((li, d, inter, v))
+        with open(f'{args.out}_joint.csv', 'w') as f:
+            f.write('layer,d_ttt,d_attn,d_both,interaction,verdict\n')
+            for li, d, inter, v in jrows:
+                f.write(f'{li},{d["ttt"]:.5f},{d["attn"]:.5f},{d["both"]:.5f},'
+                        f'{inter:.5f},{v}\n')
+        red = [li for li, _, _, v in jrows if v == 'redundant']
+        comp = [li for li, _, _, v in jrows if v == 'complementary']
+        print(f'\n  redundant (safe to collapse):     {red}')
+        print(f'  complementary (keep both paths):  {comp}')
+        print(f'\nwrote {args.out}_joint.csv')
         return
 
     # ------------------------------------------------ per-layer sweep
