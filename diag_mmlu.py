@@ -231,6 +231,10 @@ def main():
 
     with open(f'{args.out}.csv', 'w') as f:
         f.write('branch,layer,letter,cloze,retrieval\n')
+        # layer -1 is the unablated baseline; without it the file holds only
+        # absolute accuracies and the deltas cannot be recovered downstream.
+        f.write(f'baseline,-1,{b_letter:.5f},'
+                f'{"" if b_cloze is None else f"{b_cloze:.5f}"},\n')
         for br, out in rows.items():
             for li, a, c, rs in out:
                 f.write(f'{br},{li},{a:.5f},'
