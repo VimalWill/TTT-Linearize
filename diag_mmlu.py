@@ -41,6 +41,7 @@ import LinearTTT  # noqa: F401
 from Training.train import build_model_config
 from diag_common import load_model
 from diag_retrieval import ablate, ttt_layers
+from diag_capacity import arm_vector, prune
 
 LETTERS = ['A', 'B', 'C', 'D']
 
@@ -161,6 +162,11 @@ def main():
     ap.add_argument('--layers', type=int, nargs='+', default=None)
     ap.add_argument('--group', type=int, nargs='+', default=None,
                     help='ablate these layers together as one condition')
+    ap.add_argument('--prune-arm', default=None,
+                    help='apply an arm config\'s per-layer ttt_inter_multi as a '
+                         'channel prune before scoring, so MMLU is measured on the '
+                         'FUSED model rather than on a branch ablation')
+    ap.add_argument('--arm-cfg', default='Configs/ttt_at_{}.yml')
     ap.add_argument('--cloze', action='store_true',
                     help='also run the cloze control per layer (4x slower)')
     ap.add_argument('--out', default='mmlu_anchor')
@@ -182,6 +188,12 @@ def main():
     model = load_model(args.ckpt, model_config, args.adapter)
     mods = ttt_layers(model)
     branches = ['ttt', 'attn'] if args.branch == 'both' else [args.branch]
+
+    if args.prune_arm:
+        r = arm_vector(args.arm_cfg.format(args.prune_arm), len(mods))
+        ks = [prune(m, f) for m, f in zip(mods, r)]
+        print(f'pruned to arm {args.prune_arm!r}: sum r = {sum(r):.3f}, '
+              f'd_h kept {min(ks)}-{max(ks)}')
 
     b_letter = score_letter(model, items, args.batch, pad_id)
     b_cloze = score_cloze(model, items, args.batch, pad_id) if args.cloze else None
