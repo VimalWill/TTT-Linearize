@@ -168,11 +168,17 @@ def ar_masks(ids, edges, window, chunk=None):
 
 
 @torch.no_grad()
-def score_ar(model, seqs, masks, batch):
-    """Mean CE per slice over a list of sequences. -> dict name -> ce"""
+def score_ar(model, seqs, masks, batch, per_seq=False):
+    """Mean CE per slice. -> (means, counts) or (means, counts, per_sequence).
+
+    per_sequence[name] is a list of that sequence's mean CE on that slice, which
+    lets callers form PAIRED deltas across sequences and report a real standard
+    error instead of a pooled point estimate.
+    """
     names = list(masks[0].keys())
     tot = {n: 0.0 for n in names}
     cnt = {n: 0 for n in names}
+    ps = {n: [] for n in names}
     for i in range(0, len(seqs), batch):
         chunk = torch.stack(seqs[i:i + batch]).cuda()
         logits = model(input_ids=chunk, use_cache=False).logits
@@ -197,9 +203,12 @@ def score_ar(model, seqs, masks, batch):
                 sel = m[n][1:].cuda()
                 k = int(sel.sum())
                 if k:
-                    tot[n] += float(nll[j][sel].sum())
+                    v = float(nll[j][sel].sum())
+                    tot[n] += v
                     cnt[n] += k
-    return {n: (tot[n] / cnt[n] if cnt[n] else float('nan')) for n in names}, cnt
+                    ps[n].append(v / k)
+    means = {n: (tot[n] / cnt[n] if cnt[n] else float('nan')) for n in names}
+    return (means, cnt, ps) if per_seq else (means, cnt)
 
 
 # ---------------------------------------------------------------- scoring
@@ -291,7 +300,7 @@ def main():
     ap.add_argument('--adapter', default=None, help='stage-2 output dir')
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--task', choices=['ar-slice', 'kv'], default='ar-slice')
-    ap.add_argument('--seqs', type=int, default=8, help='ar-slice: validation sequences')
+    ap.add_argument('--seqs', type=int, default=32, help='ar-slice: validation sequences')
     ap.add_argument('--data-path', default=None,
                     help='ar-slice: override data.path, e.g. a Pile mirror such as '
                          'monology/pile-uncopyrighted, to match the corpus Based '

@@ -155,7 +155,7 @@ def main():
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--adapter', default=None)
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
-    ap.add_argument('--n', type=int, default=300, help='test questions')
+    ap.add_argument('--n', type=int, default=2000, help='test questions')
     ap.add_argument('--shots', type=int, default=5)
     ap.add_argument('--batch', type=int, default=4)
     ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='ttt')

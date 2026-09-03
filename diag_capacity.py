@@ -83,7 +83,7 @@ def main():
     ap.add_argument('--adapter', default=None)
     ap.add_argument('--arms', nargs='+', default=['measured', 'inverted', 'uniform'])
     ap.add_argument('--arm-cfg', default='Configs/ttt_at_{}.yml')
-    ap.add_argument('--seqs', type=int, default=4)
+    ap.add_argument('--seqs', type=int, default=32)
     ap.add_argument('--seq-len', type=int, default=32768)
     ap.add_argument('--edges', type=int, nargs='+', default=[512, 2048, 8192])
     ap.add_argument('--batch', type=int, default=1)
@@ -115,11 +115,20 @@ def main():
     pristine = [(m.w0.detach().clone(), m.w1.detach().clone(), m.w2.detach().clone())
                 for m in mods]
 
-    base, cnt = score_ar(model, seqs, masks, args.batch)
+    base, cnt, base_ps = score_ar(model, seqs, masks, args.batch, per_seq=True)
     names = [n for n in names if cnt[n]]
     far = [n for n in names if n not in ('other', 'ar_same_chunk')][-1]
-    print(f'\n{"arm":<10}{"sum r":>7}' + ''.join(f'{n:>15}' for n in names))
-    print(f'{"full":<10}{32.0:>7.2f}' + ''.join(f'{base[n]:>15.4f}' for n in names))
+
+    def se(xs):
+        if len(xs) < 2:
+            return float('nan')
+        m = sum(xs) / len(xs)
+        return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1) / len(xs)) ** .5
+
+    print(f'\n{len(seqs)} sequences, {sum(cnt.values()):,} scored tokens')
+    print(f'\n{"arm":<10}{"sum r":>7}' + ''.join(f'{n:>17}' for n in names))
+    print(f'{"full":<10}{32.0:>7.2f}'
+          + ''.join(f'{base[n]:>11.4f}+-{se(base_ps[n]):<4.3f}' for n in names))
 
     rows = {}
     for arm in args.arms:
@@ -128,10 +137,15 @@ def main():
             for m, (a, b_, c) in zip(mods, pristine):
                 m.w0.copy_(a); m.w1.copy_(b_); m.w2.copy_(c)
         ks = [prune(m, f) for m, f in zip(mods, r)]
-        ce, _ = score_ar(model, seqs, masks, args.batch)
+        ce, _, ps = score_ar(model, seqs, masks, args.batch, per_seq=True)
         rows[arm] = ce
-        print(f'{arm:<10}{sum(r):>7.2f}' + ''.join(f'{ce[n]:>15.4f}' for n in names))
-        print(f'{"":<10}{"delta":>7}' + ''.join(f'{ce[n]-base[n]:>+15.4f}' for n in names)
+        # PAIRED delta: per-sequence difference, so document-level variation
+        # cancels and the SE reflects the quantity actually being claimed.
+        pd = {n: [a - b for a, b in zip(ps[n], base_ps[n])] for n in names}
+        print(f'{arm:<10}{sum(r):>7.2f}'
+              + ''.join(f'{ce[n]:>11.4f}      ' for n in names))
+        print(f'{"":<10}{"delta":>7}'
+              + ''.join(f'{ce[n]-base[n]:>+11.4f}+-{se(pd[n]):<4.3f}' for n in names)
               + f'   d_h kept: {min(ks)}-{max(ks)}')
 
     with torch.no_grad():
