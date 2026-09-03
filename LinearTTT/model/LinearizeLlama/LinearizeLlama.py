@@ -390,6 +390,27 @@ class LinearTTTAttention(nn.Module):
 
         self._block_mask_cache = {}
 
+        # Shared-memory group, GQA-style: every layer in a group reads and
+        # writes ONE running fast-weight state, threaded through in depth order.
+        # `_ttt_store` is installed by LigerGLAModel; None means unshared.
+        self._share_gid = None
+        self._ttt_store = None
+        groups = getattr(config, 'ttt_share_groups', None) or []
+        for gid, g in enumerate(groups):
+            if layer_idx in g:
+                if self.ttt_inner_loss != 'l2':
+                    raise NotImplementedError(
+                        'ttt_share_groups needs the l2 operator: upstream\'s '
+                        'dot-product operator returns only the output, not the '
+                        'converged fast weights, so there is no state to hand to '
+                        "the next layer. Set ttt_inner_loss: 'l2'."
+                    )
+                if self.ttt_prenorm:
+                    raise NotImplementedError('ttt_share_groups with ttt_prenorm')
+                self._share_gid = gid
+                self._share_leader = (layer_idx == min(g))
+                break
+
         # Branch ablation, for the retrieval-anchoring diagnostic. The two
         # branches are summed inside forward, so a module hook cannot separate
         # them; zeroing the fast weights instead would also perturb the inner
@@ -556,6 +577,29 @@ class LinearTTTAttention(nn.Module):
             ttt_op = prenorm_block_causal_lact_swiglu
         else:
             ttt_op = block_causal_lact_swiglu
+        # Shared state. The entering value is whatever the previous member of
+        # this group produced; only the group leader starts from the parameter.
+        #
+        # Entering states are recorded per layer when grad is enabled because
+        # gradient checkpointing re-runs each layer during backward, and by then
+        # the running value has advanced to the end of the group -- a recompute
+        # would otherwise see the wrong state. Under no_grad nothing is recorded,
+        # so inference really does hold one state per group instead of per layer.
+        store = self._ttt_store
+        shared = self._share_gid is not None and store is not None
+        if shared:
+            gid = self._share_gid
+            key = (gid, self.layer_idx)
+            if key in store['enter']:
+                w0, w1, w2 = store['enter'][key]
+            elif not self._share_leader and gid in store['exit']:
+                w0, w1, w2 = store['exit'][gid]
+                if torch.is_grad_enabled():
+                    store['enter'][key] = (w0, w1, w2)
+            elif torch.is_grad_enabled():
+                store['enter'][key] = (w0, w1, w2)
+            ttt_kwargs['return_state'] = True
+
         ttt_out = ttt_op(
             w0, w1, w2,
             ttt_q, ttt_k, ttt_v,
@@ -565,6 +609,9 @@ class LinearTTTAttention(nn.Module):
             momentum=momentum,
             **ttt_kwargs,
         )
+        if shared:
+            ttt_out, nw0, nw1, nw2 = ttt_out
+            store['exit'][gid] = (nw0, nw1, nw2)
 
         ttt_out = self.ttt_norm(ttt_out)
         ttt_scale = rearrange(
@@ -643,6 +690,30 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
+        # Shared fast-weight memory. Every layer in a group is given the SAME
+        # Parameter objects as its leader -- one w0/w1/w2 for the group rather
+        # than one per layer, so gradients accumulate into a single set -- and a
+        # reference to one mutable store through which the running state is
+        # threaded in depth order. The store is used rather than the forward
+        # signature because gradient checkpointing calls the layers with
+        # positional arguments.
+        self._ttt_store = {'enter': {}, 'exit': {}}
+        for g in (getattr(config, 'ttt_share_groups', None) or []):
+            g = sorted(g)
+            lead = self.layers[g[0]].self_attn
+            for li in g[1:]:
+                a = self.layers[li].self_attn
+                if a.w0.shape != lead.w0.shape:
+                    raise ValueError(
+                        f'layers {g[0]} and {li} share a memory but have '
+                        f'different fast-weight shapes {tuple(lead.w0.shape)} vs '
+                        f'{tuple(a.w0.shape)} -- ttt_inter_multi must match '
+                        'within a share group'
+                    )
+                a.w0, a.w1, a.w2 = lead.w0, lead.w1, lead.w2
+        for layer in self.layers:
+            layer.self_attn._ttt_store = self._ttt_store
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -700,6 +771,10 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # a shared memory does not persist across forward passes
+        self._ttt_store['enter'].clear()
+        self._ttt_store['exit'].clear()
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

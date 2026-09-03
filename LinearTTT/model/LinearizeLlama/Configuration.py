@@ -45,6 +45,11 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         # These are the two coherent pairings; do not cross them.
         ttt_inner_loss='dot',
         ttt_retention_init_bias=4.0,   # sigmoid(4.0) ~ 0.982 decay per chunk
+        # Layer groups that SHARE one running fast-weight memory, GQA-style:
+        # e.g. [[2,3,...,24]] gives the whole interior a single state, read by
+        # each member's q and written by each member's k/v in depth order.
+        # One parameter set and one live state per group instead of per layer.
+        ttt_share_groups=None,
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -84,6 +89,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_base_lr = ttt_base_lr
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
+        self.ttt_share_groups = ttt_share_groups
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm

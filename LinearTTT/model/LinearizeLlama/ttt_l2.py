@@ -111,11 +111,16 @@ def block_causal_lact_swiglu_l2(
     use_muon: bool = False,
     momentum: torch.Tensor = None,    # [b, s, 1]
     retention: torch.Tensor = None,   # [b, s, 1], alpha in (0, 1)
+    return_state: bool = False,
 ):
     """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias.
 
     Same signature plus `retention`, same apply-then-update (shifted block
     causal) order, same output shape [b, l, dv].
+
+    `return_state` additionally returns the converged (w0, w1, w2), which is
+    what a memory shared across layers needs -- upstream returns only the output,
+    which is also why there is no incremental-decode path.
 
     `retention` replaces upstream's channel-wise renormalisation: instead of
     W <- L2Norm(W + dW) * ||W_0||, this does W <- alpha * W + dW. Passing
@@ -199,7 +204,8 @@ def block_causal_lact_swiglu_l2(
     gate = F.silu(torch.bmm(w0, qi), inplace=True)
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
-    return output.transpose(1, 2)
+    out = output.transpose(1, 2)
+    return (out, w0, w1, w2) if return_state else out
 
 
 __all__ = ['block_causal_lact_swiglu_l2', 'swiglu_l2_grads']
