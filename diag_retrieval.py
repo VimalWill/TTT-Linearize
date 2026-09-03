@@ -480,14 +480,20 @@ def main():
               ', '.join(f'L{li}({a:+.3f})' for li, _, _, a in ranked[:6]))
         print(f'  least anchored:          ' +
               ', '.join(f'L{li}({a:+.3f})' for li, _, _, a in ranked[-6:]))
-        openg = [r for r in ranked if r[1] > 0.05]
-        closed = [r for r in ranked if r[1] <= 0.05]
-        if openg:
-            print(f'  fusion candidates (gate open, lowest anchor): ' +
-                  ', '.join(f'L{li}' for li, _, _, _ in openg[-6:]))
-        if closed:
-            print(f'  gate <= 0.05, ablation says nothing about demand: ' +
-                  ', '.join(f'L{li}' for li, _, _, _ in closed))
+        # Rank fusion candidates by the FAR-slice delta, not by the gate.
+        # Gate magnitude does not predict importance and filtering on it is
+        # actively wrong: measured at 32k, L0 has the smallest gate in the model
+        # (0.009) and the largest ablation cost (+2.55 at 8192+), while L31 has
+        # the largest gate (0.078) and almost none (+0.016). What matters is
+        # where the contribution lands in the residual stream, not how loud it
+        # is -- an early layer's output propagates through every layer above it.
+        by_far = sorted(rows, key=lambda r: r[2][far])
+        print(f'  fusion candidates (smallest dCE at {far}): ' +
+              ', '.join(f'L{li}({d[far]:+.3f})' for li, _, d, _ in by_far[:8]))
+        print(f'  keep (largest dCE at {far}):                ' +
+              ', '.join(f'L{li}({d[far]:+.3f})' for li, _, d, _ in by_far[-4:]))
+        print('  gate is reported for information only -- it does not predict '
+              'importance (L0: gate 0.009, dCE +2.55)')
 
     with open(f'{args.out}.csv', 'w') as f:
         f.write('branch,layer,gate,' + ','.join(f'dCE_{n}' for n in names) + ',anchor\n')
