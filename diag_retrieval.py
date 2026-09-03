@@ -464,7 +464,11 @@ def main():
 
     # ------------------------------------------------ joint 2x2 per layer
     if args.joint:
-        print(f'\nper-layer 2x2 interaction at {far}')
+        # The slice's unconditional entropy: an upper bound on how bad CE can
+        # get by destroying context, used to detect saturation below.
+        ceiling = max(v for k, v in base.items()) + 2.7
+        print(f'\nper-layer 2x2 interaction at {far}   '
+              f'(baseline {base[far]:.3f}, saturation guard {0.75 * ceiling:.2f})')
         print('  interaction = d(-both) - d(-ttt) - d(-attn)')
         print('  < 0 redundant (each substitutes) | > 0 complementary (both needed)')
         print(f'\n{"layer":>5}{"d(-ttt)":>10}{"d(-attn)":>10}{"d(-both)":>10}'
@@ -478,7 +482,23 @@ def main():
                 d[tag] = ce[far] - base[far]
             inter = d['both'] - d['ttt'] - d['attn']
             scale = max(abs(d['ttt']), abs(d['attn']), 1e-9)
-            if inter < -0.15 * scale:
+            # Two guards, both learned from the first run.
+            #
+            # SATURATED: once a single-branch ablation pushes the slice near its
+            # unconditional entropy, d(-both) physically cannot reach the sum of
+            # the marginals and the interaction is forced negative regardless of
+            # whether the branches substitute for each other. Measured at L0:
+            # -ttt 5.95, -attn 6.15, -both 6.40 against a baseline of 3.39, and
+            # an interaction of -2.30 that means nothing.
+            #
+            # NOISE: the verdict was relative to the largest marginal, so layers
+            # whose marginals are all ~0.005 got labelled redundant or
+            # complementary off pure noise. Require an absolute floor too.
+            if base[far] + min(d.values()) > 0.75 * ceiling:
+                v = 'SATURATED - interaction uninterpretable'
+            elif abs(inter) < 0.004:
+                v = 'independent'
+            elif inter < -0.15 * scale:
                 v = 'redundant'
             elif inter > 0.15 * scale:
                 v = 'complementary'
