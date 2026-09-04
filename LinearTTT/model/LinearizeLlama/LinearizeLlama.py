@@ -698,7 +698,24 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         # signature because gradient checkpointing calls the layers with
         # positional arguments.
         self._ttt_store = {'enter': {}, 'exit': {}}
-        for g in (getattr(config, 'ttt_share_groups', None) or []):
+        for layer in self.layers:
+            layer.self_attn._ttt_store = self._ttt_store
+        self._tie_ttt_memories()
+
+    def _tie_ttt_memories(self):
+        """Give every member of a share group its leader's Parameter objects.
+
+        Must be re-applied after weight loading, not only at construction:
+        from_pretrained with device_map materialises parameters through
+        accelerate, which REPLACES the Parameter objects rather than copying
+        into them, so any Python-level aliasing set up in __init__ is silently
+        undone. The symptom is subtle -- layers 3..N then own private
+        fast weights that they never read (they take the threaded state
+        instead) and that therefore receive no gradient, while the group is
+        initialised only by its leader.
+        """
+        n = 0
+        for g in (getattr(self.config, 'ttt_share_groups', None) or []):
             g = sorted(g)
             lead = self.layers[g[0]].self_attn
             for li in g[1:]:
@@ -711,8 +728,15 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
                         'within a share group'
                     )
                 a.w0, a.w1, a.w2 = lead.w0, lead.w1, lead.w2
-        for layer in self.layers:
-            layer.self_attn._ttt_store = self._ttt_store
+                n += 1
+        if n:
+            print(f'-> tied {n} TTT memories into '
+                  f'{len(self.config.ttt_share_groups)} shared group(s)')
+        return n
+
+    def tie_weights(self):
+        super().tie_weights()
+        self._tie_ttt_memories()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -844,6 +868,14 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
     
 class LigerGLAForCausalLM(LlamaForCausalLM, LigerGLAPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
+
+    def tie_weights(self):
+        # from_pretrained calls tie_weights() on the TOP-LEVEL model after
+        # loading, so the shared TTT memories have to be re-tied from here --
+        # accelerate's device_map path replaces Parameter objects and undoes any
+        # aliasing done during __init__.
+        super().tie_weights()
+        self.model._tie_ttt_memories()
 
     def __init__(self, config):
         super().__init__(config)
