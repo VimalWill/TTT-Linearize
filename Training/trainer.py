@@ -32,8 +32,27 @@ def save_checkpoint(model, tokenizer, save_path):
     (w0/w1/w2, lr_proj, ttt_scale_proj, ...) are plain base-model tensors that
     training also updates, so they would be silently dropped -- measured once as
     an 18.9MB stage-2 checkpoint containing nothing but LoRA.
+
+    Shared TTT memories need the follower copies dropped by hand. safetensors
+    refuses to write tensors that alias each other, and declaring them in
+    _tied_weights_keys was not enough -- transformers' own dedup pass let them
+    through and the failure surfaced deeper, inside safe_save_file. Removing
+    them from the state dict is explicit and version-independent. Loading is
+    unaffected: the follower keys come back as missing and tie_weights()
+    re-aliases them to their leader, which is where the values live.
     """
-    model.save_pretrained(save_path)
+    sd = None
+    groups = getattr(getattr(model, 'config', None), 'ttt_share_groups', None)
+    if groups:
+        # match on suffix so this works whether or not a PeftModel wrapper has
+        # prefixed every key with base_model.model.
+        tails = tuple(f'layers.{li}.self_attn.{w}'
+                      for g in groups for li in sorted(g)[1:]
+                      for w in ('w0', 'w1', 'w2'))
+        sd = {k: v for k, v in model.state_dict().items() if not k.endswith(tails)}
+        print(f'-> dropped {len(model.state_dict()) - len(sd)} aliased '
+              f'fast-weight tensors from the checkpoint')
+    model.save_pretrained(save_path, state_dict=sd)
     tokenizer.save_pretrained(save_path)
     if isinstance(model, PeftModel):
         ttt = {n: p.detach().cpu() for n, p in model.named_parameters()
