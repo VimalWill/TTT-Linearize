@@ -386,9 +386,6 @@ class LinearTTTAttention(nn.Module):
         self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
         self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
         self.fw_init_gain = gain
-        self.reset_ttt_parameters()
-
-        self._block_mask_cache = {}
 
         # Shared-memory group, GQA-style: every layer in a group reads and
         # writes ONE running fast-weight state, threaded through in depth order.
@@ -411,6 +408,13 @@ class LinearTTTAttention(nn.Module):
                 self._share_gid = gid
                 self._share_leader = (layer_idx == min(g))
                 break
+
+        # reset_ttt_parameters reads _share_gid/_share_leader to decide whether
+        # this layer owns its fast weights, so the share group must be resolved
+        # BEFORE it runs.
+        self.reset_ttt_parameters()
+
+        self._block_mask_cache = {}
 
         # Branch ablation, for the retrieval-anchoring diagnostic. The two
         # branches are summed inside forward, so a module hook cannot separate
