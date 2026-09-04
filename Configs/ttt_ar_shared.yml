@@ -1,29 +1,27 @@
-# Stage 2 -- autoregressive finetune, shared interior memory.
+# Stage 2 -- autoregressive finetune, shared interior memories.
 #
-# The interior shares ONE fast-weight memory, GQA-style: layers 2-24 hold a
-# single parameter set and a single running state, read by each layer's own q
-# and written by each layer's own k/v in depth order. L0-L1 and L25-L31 keep
-# their own memories.
+# The interior shares memories in GROUPS OF 4: layers 2-24 collapse from 23
+# memories to 6, each group holding one parameter set and one running state
+# threaded through its members in depth order. L0-L1 and L25-L31 keep their own.
 #
-# Why these layers, from the ablation sweeps (diag_retrieval.py, diag_mmlu.py,
-# 32k PG19, token-weighted dCE of ablating each layer's memory):
-#   L0-L1     +2.10 .. +2.22 each   95% of the long-range contribution, and
-#                                   retrieval-specific on MMLU (letter -11.6 /
-#                                   -17.0 pts at 15 and 23 sigma vs cloze -3.3 /
-#                                   -7.8). Cannot be shared.
-#   L2-L24    -0.007 .. +0.007      +0.024 nats over 23 layers, flat on MMLU
-#                                   inside a +-0.75 pt floor, max joint
-#                                   interaction 0.031 nats. Redundant, hence
-#                                   shareable.
-#   L25-L31   +0.023 .. +0.035      +0.170 nats token-weighted. Kept.
+# Total memories 15 of 32.  State 94.4 MB against 201.3 MB (2.1x).
 #
-# State: 62.9 MB against 201.3 MB unshared (3.2x), from
-# 23 interior memories collapsing to 1. Sharing is l2-only -- upstream's
-# dot operator does not return its converged weights, so there is no state to
-# hand to the next layer.
+# WHY GROUPS OF 4 AND NOT ALL 23. Each layer performs seq_len/chunk = 15 updates,
+# so a group of g takes 15g sequential updates and the retention gate decays the
+# earliest writes by alpha^(15g):
+#     g = 4   alpha^60  = 0.34   every member still present when read
+#     g = 8   alpha^120 = 0.11   marginal
+#     g = 23  alpha^345 = 0.002  layers 2-20 write into nothing
+# A single 23-layer group was tried first and stage 1 sat at CE 11.3-12.5
+# against a uniform baseline of ln(128256) = 11.76 -- not compression, just 21
+# layers writing to a memory that is wiped before it is read. It also makes the
+# gradient path to the shared parameter 345 updates deep.
 #
-# This CANNOT be evaluated zero-shot: 23 independently trained memories do not
-# collapse into one by pruning, so both stages have to be retrained.
+# Sharing is l2-only: upstream's dot operator does not return its converged
+# weights, so there is no state to hand to the next layer.
+#
+# Cannot be evaluated zero-shot -- independently trained memories do not
+# collapse into one by pruning, so both stages retrain.
 data:
   name: "pg19"
   path: "emozilla/pg19"
@@ -48,7 +46,7 @@ model:
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
-  ttt_share_groups: [[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]]
+  ttt_share_groups: [[2, 3, 4, 5], [6, 7, 8, 9], [10, 11, 12, 13], [14, 15, 16, 17], [18, 19, 20, 21], [22, 23, 24]]
   fw_init_gain: 1.0
   ttt_use_momentum: True
   ttt_use_muon: True
