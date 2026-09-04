@@ -11,6 +11,7 @@ import LinearTTT
 import torch.utils
 import torch.utils.data
 import torch.utils.data.dataloader
+from omegaconf import OmegaConf
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers import TrainingArguments
 from peft import LoraConfig, TaskType, PeftModel, get_peft_model
@@ -47,6 +48,13 @@ def build_model_config(config):
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue
+        # OmegaConf hands us ListConfig/DictConfig, which PretrainedConfig
+        # cannot JSON-serialise -- printing or saving the config then dies with
+        # "Object of type ListConfig is not JSON serializable". Convert to plain
+        # containers so list-valued keys (ttt_share_groups, ttt_inter_multi)
+        # survive both __repr__ and save_pretrained.
+        if OmegaConf.is_config(v):
+            v = OmegaConf.to_object(v)
         # Configs/liger.yml spells it `attn_varient`
         setattr(model_config, 'attn_variant' if k == 'attn_varient' else k, v)
     # the packing width is what the layer actually sees
