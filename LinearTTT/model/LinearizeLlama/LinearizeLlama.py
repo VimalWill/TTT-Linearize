@@ -727,8 +727,13 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
                         f'{tuple(a.w0.shape)} -- ttt_inter_multi must match '
                         'within a share group'
                     )
+                # count only genuine re-ties: tie_weights() is called several
+                # times by from_pretrained (post_init, then after loading, on
+                # both this model and the CausalLM wrapper), and re-tying an
+                # already-aliased parameter is a no-op worth staying quiet about
+                if a.w0 is not lead.w0:
+                    n += 1
                 a.w0, a.w1, a.w2 = lead.w0, lead.w1, lead.w2
-                n += 1
         if n:
             print(f'-> tied {n} TTT memories into '
                   f'{len(self.config.ttt_share_groups)} shared group(s)')
