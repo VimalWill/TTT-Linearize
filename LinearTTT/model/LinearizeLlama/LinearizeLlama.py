@@ -427,10 +427,18 @@ class LinearTTTAttention(nn.Module):
         including the output gate, whose whole job is to start nearly closed.
         """
         d_in, d_h = self.ttt_head_dim, self.w0.shape[1]
+        # A non-leader in a share group has no fast weights of its own -- w0/w1/w2
+        # are aliases of its leader's. Re-initialising them here would overwrite
+        # the leader's values, and transformers does exactly that on load: the
+        # follower keys are absent from a shared checkpoint, so they come back as
+        # missing keys and _init_weights runs on those layers. Without this guard
+        # stage 2 would silently start from random interior memories.
+        own_fast_weights = self._share_gid is None or self._share_leader
         with torch.no_grad():
-            self.w0.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
-            self.w1.normal_(0, 1 / math.sqrt(d_h)).mul_(self.fw_init_gain)
-            self.w2.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
+            if own_fast_weights:
+                self.w0.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
+                self.w1.normal_(0, 1 / math.sqrt(d_h)).mul_(self.fw_init_gain)
+                self.w2.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
             self.ttt_qk_scale.fill_(1.0)
             self.ttt_qk_offset.zero_()
             # ttt_norm is the only RMSNorm in this model with no counterpart in
@@ -887,6 +895,18 @@ class LigerGLAForCausalLM(LlamaForCausalLM, LigerGLAPreTrainedModel, GenerationM
         self.model = LigerGLAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # safe_serialization refuses to write tensors that share storage unless
+        # they are declared here, so a shared-memory checkpoint dies at the first
+        # save with "shared tensors ... mismatching the transformers base
+        # configuration". Every non-leader member of a share group aliases its
+        # leader's w0/w1/w2, so name them.
+        extra = [f'model.layers.{li}.self_attn.{w}'
+                 for g in (getattr(config, 'ttt_share_groups', None) or [])
+                 for li in sorted(g)[1:]
+                 for w in ('w0', 'w1', 'w2')]
+        if extra:
+            self._tied_weights_keys = list(self._tied_weights_keys or []) + extra
 
         # Initialize weights and apply final processing
         self.post_init()
