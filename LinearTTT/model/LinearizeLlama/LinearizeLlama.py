@@ -394,6 +394,7 @@ class LinearTTTAttention(nn.Module):
         # writes ONE running fast-weight state, threaded through in depth order.
         # `_ttt_store` is installed by LigerGLAModel; None means unshared.
         self._share_gid = None
+        self._share_leader = True    # meaningless unless _share_gid is set
         self._ttt_store = None
         groups = getattr(config, 'ttt_share_groups', None) or []
         for gid, g in enumerate(groups):
