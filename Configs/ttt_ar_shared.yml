@@ -1,0 +1,71 @@
+# Stage 2 -- autoregressive finetune, shared interior memory.
+#
+# The interior shares ONE fast-weight memory, GQA-style: layers 2-24 hold a
+# single parameter set and a single running state, read by each layer's own q
+# and written by each layer's own k/v in depth order. L0-L1 and L25-L31 keep
+# their own memories.
+#
+# Why these layers, from the ablation sweeps (diag_retrieval.py, diag_mmlu.py,
+# 32k PG19, token-weighted dCE of ablating each layer's memory):
+#   L0-L1     +2.10 .. +2.22 each   95% of the long-range contribution, and
+#                                   retrieval-specific on MMLU (letter -11.6 /
+#                                   -17.0 pts at 15 and 23 sigma vs cloze -3.3 /
+#                                   -7.8). Cannot be shared.
+#   L2-L24    -0.007 .. +0.007      +0.024 nats over 23 layers, flat on MMLU
+#                                   inside a +-0.75 pt floor, max joint
+#                                   interaction 0.031 nats. Redundant, hence
+#                                   shareable.
+#   L25-L31   +0.023 .. +0.035      +0.170 nats token-weighted. Kept.
+#
+# State: 62.9 MB against 201.3 MB unshared (3.2x), from
+# 23 interior memories collapsing to 1. Sharing is l2-only -- upstream's
+# dot operator does not return its converged weights, so there is no state to
+# hand to the next layer.
+#
+# This CANNOT be evaluated zero-shot: 23 independently trained memories do not
+# collapse into one by pruning, so both stages have to be retrained.
+data:
+  name: "pg19"
+  path: "emozilla/pg19"
+  num_train_docs: 200
+  num_val_docs: 20
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_ar'
+  # stage 1's output. `best_ckpt` is written on every eval improvement
+  # (trainer.py), while `best` is only written after the training loop finishes
+  # (train.py) -- so `best` is absent if stage 1 was interrupted. They hold the
+  # same weights, since `best` is `best_ckpt` reloaded and re-saved, so point at
+  # `best_ckpt`: it exists either way.
+  pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_shared/best_ckpt
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  # --- must mirror Configs/ttt_at_l2.yml ---
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0
+  ttt_share_groups: [[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]]
+  fw_init_gain: 1.0
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0001
+  epochs: 2
+  max_grad_norm: 1.0
+  gradient_checkpointing: True
+  # ~209 gradient steps for 200 books @ 8192, so keep these small
+  eval_steps: 25
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
+  train_qk: True
+  train_qk_lora: True
+  train_v: True
+  train_v_lora: True
