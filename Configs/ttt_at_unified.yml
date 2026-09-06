@@ -16,6 +16,14 @@
 # retrieval it cannot reach past. With the g-th root the group retains the same
 # 0.748 as a private memory.
 #
+# ttt_base_lr MOVES WITH IT, automatically. lr is calibrated as
+# (1 - alpha) * fw_init_gain to hold ||W||_eq at ||W_0||; the root pushes the
+# per-layer alpha to 0.99930 at g = 26, so the model rescales the base lr by
+# (1 - alpha^(1/g)) / (1 - alpha) = 1/25.8, giving an effective 0.018 -> 0.00070.
+# Without that rescale the fast weights settle ~26x above the calibrated band and
+# stage 1 diverges with loss_mse and loss_ce both climbing. The yml still carries
+# the PRIVATE value 0.018 -- do not pre-divide it here.
+#
 # WHAT THIS RUN TESTS. Per-layer memories hold up past the training length and
 # the unified one did not. If decay was the cause, this should keep the shared
 # model's win at the trained length AND stop the collapse at 32k. If it still

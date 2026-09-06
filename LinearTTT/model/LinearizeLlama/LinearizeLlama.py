@@ -425,6 +425,25 @@ class LinearTTTAttention(nn.Module):
                 self._share_size = len(g)
                 break
 
+        # ttt_base_lr IS TIED TO THE RETENTION, so the root correction has to
+        # move it too. Under Muon the fast weights sit at
+        #     ||W||_eq ~ lr * sqrt(d) / (1 - alpha)
+        # (see Configs/ttt_at_l2.yml), and ttt_base_lr was calibrated to hold
+        # ||W||_eq at ||W_0||, i.e. lr ~ (1 - alpha) * fw_init_gain. Taking the
+        # g-th root pushes the per-layer alpha towards 1 -- 0.982 -> 0.99930 at
+        # g = 26 -- which shrinks (1 - alpha) by ~g and inflates the equilibrium
+        # by the same factor. Left alone, g = 26 runs the fast weights ~26x above
+        # the calibrated band and hits exactly the failure the config header
+        # warns about: the update grows W superlinearly and retention cannot
+        # hold it. Rescaling by (1 - alpha^(1/g)) / (1 - alpha) keeps the
+        # equilibrium where fw_init_gain put it.
+        if (self.ttt_retention_group_root and self._share_size > 1
+                and self.ttt_inner_loss == 'l2'):
+            a = 1.0 / (1.0 + math.exp(-self.ttt_retention_init_bias))
+            scale = (1.0 - a ** (1.0 / self._share_size)) / (1.0 - a)
+            self.base_lr_inv = inv_softplus(
+                getattr(config, 'ttt_base_lr', 1e-2) * scale)
+
         # reset_ttt_parameters reads _share_gid/_share_leader to decide whether
         # this layer owns its fast weights, so the share group must be resolved
         # BEFORE it runs.
