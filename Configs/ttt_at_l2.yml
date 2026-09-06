@@ -1,6 +1,9 @@
 # Stage 1 -- attention transfer, with a Titans/Atlas-style memory instead of
-# LaCT's. THREE coupled changes vs ttt_at.yml, not one -- they do not work
-# separately (see LinearTTT/.../ttt_l2.py):
+# LaCT's. THREE coupled changes vs the original dot-product memory, not one --
+# they do not work separately (see LinearTTT/.../ttt_l2.py). The dot config
+# (ttt_at.yml, deleted; ttt_inner_loss 'dot', no retention gate, LaCT Eq. 8's
+# renorm) reached ppl 18.1 against this design's 13.4 on matched diag_ce, at
+# twice the stage-2 budget:
 #   ttt_inner_loss: 'l2'  -- Atlas Eq. 9 regression bias, carries the residual
 #   ttt_base_lr           -- becomes a real hyperparameter only now; see below
 #   retention gate        -- Atlas Eq. 32, replaces LaCT Eq. 8's renorm, so the

@@ -392,7 +392,22 @@ class LinearTTTAttention(nn.Module):
         # `_ttt_store` is installed by LigerGLAModel; None means unshared.
         self._share_gid = None
         self._share_leader = True    # meaningless unless _share_gid is set
+        self._share_size = 1
         self._ttt_store = None
+        # Retention compounds with group size. `w0 = w0 * a_i + dw0` in ttt_l2
+        # fires once per chunk PER LAYER, and a shared state is threaded through
+        # every member of its group, so the state a group of g layers carries
+        # across `c` chunks decays by alpha^(g*c) where a private state decays by
+        # alpha^c. ttt_retention_init_bias was picked against the private
+        # exponent (see reset_ttt_parameters), so sharing silently multiplies it
+        # by g: at the default 4.0 and 8192/512 chunks, a private state retains
+        # 0.982^16 = 0.75 but a group of 4 retains 0.982^64 = 0.31 and a group of
+        # 26 retains 5e-4 -- wiped before it can serve a long-range read, which
+        # leaves the sliding window to carry retrieval it cannot reach past.
+        # Taking the g-th root restores the private model's decay envelope: g
+        # applications of alpha^(1/g) compose back to alpha.
+        self.ttt_retention_group_root = getattr(
+            config, 'ttt_retention_group_root', True)
         groups = getattr(config, 'ttt_share_groups', None) or []
         for gid, g in enumerate(groups):
             if layer_idx in g:
@@ -407,6 +422,7 @@ class LinearTTTAttention(nn.Module):
                     raise NotImplementedError('ttt_share_groups with ttt_prenorm')
                 self._share_gid = gid
                 self._share_leader = (layer_idx == min(g))
+                self._share_size = len(g)
                 break
 
         # reset_ttt_parameters reads _share_gid/_share_leader to decide whether
@@ -458,7 +474,10 @@ class LinearTTTAttention(nn.Module):
         nn.init.constant_(self.ttt_scale_proj.bias, self.ttt_scale_init_bias)
         # Start retention near 1 so the memory is not wiped between chunks:
         # alpha^16 at 8192/512 is 0.75 for sigmoid(4.0) but 1.5e-5 for
-        # sigmoid(0.0), which would erase the state before it can be read.
+        # sigmoid(0.0), which would erase the state before it can be read. That
+        # arithmetic is the PRIVATE exponent; inside a share group the state
+        # takes g decay steps per chunk, which ttt_retention_group_root undoes so
+        # this bias keeps meaning the same thing at every group size.
         if hasattr(self, 'retention_proj'):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
@@ -582,10 +601,13 @@ class LinearTTTAttention(nn.Module):
         ttt_kwargs = {}
         if self.ttt_inner_loss == 'l2':
             ttt_op = block_causal_lact_swiglu_l2
-            ttt_kwargs['retention'] = rearrange(
+            retention = rearrange(
                 self.retention_proj(hidden_states).float(),
                 'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
             )
+            if self.ttt_retention_group_root and self._share_size > 1:
+                retention = retention.pow(1.0 / self._share_size)
+            ttt_kwargs['retention'] = retention
         elif self.ttt_prenorm:
             ttt_op = prenorm_block_causal_lact_swiglu
         else:

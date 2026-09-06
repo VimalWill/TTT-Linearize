@@ -150,7 +150,7 @@ def instrumented(records, mags, inner_loss='dot'):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cfg', default='Configs/ttt_at.yml')
+    ap.add_argument('--cfg', default='Configs/ttt_at_l2.yml')
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--seq-len', type=int, default=8192)

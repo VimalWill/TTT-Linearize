@@ -56,7 +56,7 @@ def ce_of(path, config, window, chunk, loader, n_batches, adapter=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cfg', default='Configs/ttt_ar.yml')
+    ap.add_argument('--cfg', default='Configs/ttt_ar_l2.yml')
     ap.add_argument('--ckpt', required=True, help='stage-1 checkpoint dir')
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--batches', type=int, default=20)

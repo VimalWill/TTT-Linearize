@@ -50,6 +50,12 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         # each member's q and written by each member's k/v in depth order.
         # One parameter set and one live state per group instead of per layer.
         ttt_share_groups=None,
+        # Take the g-th root of the retention gate inside a group of g layers.
+        # Without it a shared state decays by alpha^(g*chunks) where a private
+        # one decays by alpha^chunks, so ttt_retention_init_bias means something
+        # different at every group size. Set False only to reproduce runs from
+        # before the correction.
+        ttt_retention_group_root=True,
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -90,6 +96,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
         self.ttt_share_groups = ttt_share_groups
+        self.ttt_retention_group_root = ttt_retention_group_root
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm
