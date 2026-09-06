@@ -463,9 +463,11 @@ def main():
 
     # ------------------------------------------------ whole-branch control
     print('\nwhole-branch ablation (all layers at once)')
+    whole = {}
     for br in branches:
         with ablate(mods, br):
             ce, _ = run()
+        whole[br] = ce
         print(f'  -{br:<4} ' + '  '.join(
             f'{n} {ce[n]:6.3f} ({ce[n] - base[n]:+6.3f})' for n in names))
 
@@ -586,6 +588,13 @@ def main():
         # a smaller delta can mean "this branch matters less" or "this model is
         # stronger and more redundant", and only the baseline separates them.
         f.write('baseline,-1,,' + ','.join(f'{base[n]:.5f}' for n in names) + ',\n')
+        # whole-branch rows as ABSOLUTE CE, not deltas. On a base checkpoint the
+        # unablated baseline is polluted by the randomly initialised memory, so
+        # 'whole_-ttt' at a full-length window IS the clean softmax-attention
+        # reference -- the row an AR table needs and the one that was previously
+        # printed to stdout and then lost.
+        for br, ce in whole.items():
+            f.write(f'whole_-{br},-2,,' + ','.join(f'{ce[n]:.5f}' for n in names) + ',\n')
         for br, rows in results.items():
             for li, g, d, a in rows:
                 f.write(f'{br},{li},{g:.5f},'
