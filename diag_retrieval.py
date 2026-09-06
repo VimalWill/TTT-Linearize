@@ -573,6 +573,11 @@ def main():
 
     with open(f'{args.out}.csv', 'w') as f:
         f.write('branch,layer,gate,' + ','.join(f'dCE_{n}' for n in names) + ',anchor\n')
+        # layer -1 is the unablated baseline. Without it the file holds only
+        # deltas, and deltas from two different models are not comparable --
+        # a smaller delta can mean "this branch matters less" or "this model is
+        # stronger and more redundant", and only the baseline separates them.
+        f.write('baseline,-1,,' + ','.join(f'{base[n]:.5f}' for n in names) + ',\n')
         for br, rows in results.items():
             for li, g, d, a in rows:
                 f.write(f'{br},{li},{g:.5f},'
