@@ -322,6 +322,12 @@ def main():
                     help='kv only')
     ap.add_argument('--samples', type=int, default=16, help='kv only')
     ap.add_argument('--batch', type=int, default=2)
+    ap.add_argument('--window', type=int, default=None,
+                    help='override window_size. Set it to the context length for a '
+                         'full-attention reference row -- then the whole-branch '
+                         '-ttt line is pure softmax attention, uncontaminated by '
+                         'the randomly initialised TTT branch that makes the '
+                         'unablated baseline useless on a base checkpoint.')
     ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='ttt')
     ap.add_argument('--layers', type=int, nargs='+', default=None)
     ap.add_argument('--joint', action='store_true',
@@ -343,6 +349,8 @@ def main():
     config = OmegaConf.load(args.cfg)
     cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     cfg.model.pretrained_model_name_or_path = args.ckpt
+    if args.window:
+        cfg.model.window_size = args.window
     model_config = build_model_config(cfg)
     window = model_config.window_size
     print(f'window_size = {window}, chunk = {model_config.lact_chunk_size}')
