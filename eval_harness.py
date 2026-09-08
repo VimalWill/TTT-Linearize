@@ -80,6 +80,17 @@ def main():
     tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
     tm = resolve(tasks)
 
+    # lm-eval sends a different sequence length for nearly every request, while
+    # sliding_window_attention compiles flex_attention with dynamic=False. Past
+    # dynamo's default cache_size_limit of 8 distinct shapes it stops recompiling
+    # and falls back to eager, where flex_attention decomposes to math_attention
+    # and materialises the whole [B, H, Q, KV] score matrix -- 34 GiB at 8192
+    # tokens and batch 4, which OOMs a 96 GB GH200. Training never hit this
+    # because it has one fixed shape. Raise the limits so every length gets its
+    # own compiled kernel and the window is actually exploited.
+    torch._dynamo.config.cache_size_limit = 256
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
