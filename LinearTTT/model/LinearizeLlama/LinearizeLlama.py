@@ -654,8 +654,12 @@ class LinearTTTAttention(nn.Module):
         ttt_q, _, _ = self._ttt_features(
             *(rearrange(x, 'b h n d -> b n (h d)') for x in (q, k, v))
         )
-        qi = ttt_q.transpose(1, 2)
         w0, w1, w2 = st['w0'], st['w1'], st['w2']
+        # The fast weights are held in fp32 (forward does self.w0...float()) while
+        # the features follow the model dtype. The operator only gets away with
+        # mixing them because it runs under autocast; decode does not, so match
+        # explicitly and do the readout in the weights' precision.
+        qi = ttt_q.transpose(1, 2).to(w0.dtype)
         gate = F.silu(torch.bmm(w0, qi))
         ttt_out = torch.bmm(w1, gate * torch.bmm(w2, qi)).transpose(1, 2)
 
