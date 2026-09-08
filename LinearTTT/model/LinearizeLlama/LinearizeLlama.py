@@ -136,6 +136,20 @@ def sliding_window_attention(
     if Q_len != KV_len:
         return _compiled_flex_attention()(q, k, v, scale=scale)
 
+    # v is checked separately because apply_rotary_pos_emb BROADCASTS. Under
+    # generate() with use_cache=True, transformers hands this layer one new
+    # token while position_embeddings still cover the whole prefix, so q and k
+    # silently expand to the prefix length and v does not -- Q_len == KV_len
+    # passes and the attention is nonsense. There is no decode path here (the
+    # operator cannot resume fast weights), so the caller must pass the full
+    # sequence every step; say so rather than computing garbage.
+    if v.shape[2] != KV_len:
+        raise RuntimeError(
+            f'v has {v.shape[2]} positions but k has {KV_len}: q/k were '
+            'broadcast by the rotary embedding while v was not. This model has '
+            'no incremental-decode path -- run generation with use_cache=False.'
+        )
+
     if _force_sdpa_window:
         return _sdpa_sliding_window(q, k, v, window_size, causal, scale)
 
@@ -445,6 +459,9 @@ class LinearTTTAttention(nn.Module):
         # Shared-memory group, GQA-style: every layer in a group reads and
         # writes ONE running fast-weight state, threaded through in depth order.
         # `_ttt_store` is installed by LigerGLAModel; None means unshared.
+        # Incremental decode cache: the frozen fast weights plus a rolling k/v
+        # window, set at the end of prefill. None means "not decoding".
+        self._decode_state = None
         self._share_gid = None
         self._share_leader = True    # meaningless unless _share_gid is set
         self._share_size = 1
@@ -576,6 +593,88 @@ class LinearTTTAttention(nn.Module):
             v = l2_norm(v)
         return l2_norm(q), l2_norm(k), v
 
+    def _decode_step(self, hidden_states, position_ids, position_embeddings,
+                     past_key_value, bsz, q_len):
+        """One generated token, reusing the state parked by prefill.
+
+        Returns the same (o, aux, past_key_value) triple as forward().
+        """
+        st = self._decode_state
+        if q_len != 1:
+            raise NotImplementedError(
+                f'decode expects one token per step, got {q_len}. Greedy and '
+                'sampling both feed one; beam search and prompt chunking do not.'
+            )
+        if st['since_update'] + 1 >= self.lact_chunk_size:
+            raise NotImplementedError(
+                f'continuation reached lact_chunk_size ({self.lact_chunk_size}) '
+                'tokens, so the fast weights would need the deferred chunk '
+                'update that decode skips. Re-run with use_cache=False, or '
+                'raise lact_chunk_size.'
+            )
+        st['since_update'] += 1
+
+        q = rearrange(self.q_proj(hidden_states), 'b n (h d) -> b h n d',
+                      h=self.num_heads)
+        k = rearrange(self.k_proj(hidden_states), 'b n (h d) -> b h n d',
+                      h=self.num_key_value_heads)
+        v = rearrange(self.v_proj(hidden_states), 'b n (h d) -> b h n d',
+                      h=self.num_key_value_heads)
+        k = repeat_kv(k, self.num_key_value_groups)
+        v = repeat_kv(v, self.num_key_value_groups)
+
+        # ---- local branch: attend over the rolling window ----
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(v, position_ids)
+        else:
+            cos, sin = position_embeddings
+        # generate() slices input_ids to the new token but can still hand down
+        # position_embeddings spanning the whole prefix. apply_rotary_pos_emb
+        # would then BROADCAST q and k up to the prefix length while v stays at
+        # one position -- silent, and the source of the original decode crash.
+        # Take the tail so the rotary phase matches the token actually being
+        # decoded.
+        if cos.shape[-2] != q_len:
+            cos, sin = cos[..., -q_len:, :], sin[..., -q_len:, :]
+        aq, ak = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Keep window_size + 1 positions: mask_mod admits q_idx - kv_idx <=
+        # window_size, so a query sees itself plus window_size of history. Every
+        # retained key is then in-window and causally valid for this single
+        # query, which is why no mask is needed here.
+        keep = self.window_size + 1
+        st['k'] = torch.cat([st['k'], ak], dim=2)[:, :, -keep:]
+        st['v'] = torch.cat([st['v'], v], dim=2)[:, :, -keep:]
+        attn_out = F.scaled_dot_product_attention(aq, st['k'], st['v'])
+        attn_out = rearrange(attn_out, 'b h n d -> b n (h d)')
+
+        # ---- global branch: read the frozen memory ----
+        # Same arithmetic as the operator's tail-chunk readout in ttt_l2:
+        # w1 @ (silu(w0 @ q) * (w2 @ q)), with q laid out as [b, dk, l].
+        ttt_q, _, _ = self._ttt_features(
+            *(rearrange(x, 'b h n d -> b n (h d)') for x in (q, k, v))
+        )
+        qi = ttt_q.transpose(1, 2)
+        w0, w1, w2 = st['w0'], st['w1'], st['w2']
+        gate = F.silu(torch.bmm(w0, qi))
+        ttt_out = torch.bmm(w1, gate * torch.bmm(w2, qi)).transpose(1, 2)
+
+        ttt_out = self.ttt_norm(ttt_out.to(hidden_states.dtype))
+        ttt_scale = rearrange(
+            F.silu(self.ttt_scale_proj(hidden_states)),
+            'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
+        )
+        ttt_out = ttt_out * ttt_scale.to(ttt_out.dtype)
+        ttt_out = rearrange(ttt_out, '(b h) n d -> b n (h d)',
+                            b=bsz, h=self.num_ttt_heads)
+
+        if self._ablate_attn:
+            attn_out = torch.zeros_like(attn_out)
+        if self._ablate_ttt:
+            ttt_out = torch.zeros_like(ttt_out)
+        o = attn_out.to(ttt_out.dtype) + ttt_out
+        return (self.o_proj(o.to(self.o_proj.weight.dtype)), None, past_key_value)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -590,15 +689,24 @@ class LinearTTTAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        if past_key_value is not None and len(past_key_value) > self.layer_idx:
-            # Incremental decoding needs the converged fast weights and a rolling
-            # window of k/v carried across steps. `block_causal_lact_swiglu`
-            # returns only the output, not the final w0/w1/w2, so state carry
-            # needs a variant of the operator that also returns them.
-            raise NotImplementedError(
-                'LinearTTTAttention has no incremental-decode path yet: the LaCT operator '
-                'does not return the final fast weights, so they cannot be cached across steps.'
-            )
+        # ---------------- incremental decode ----------------
+        # Prefill runs the full path below and parks the converged fast weights
+        # and a rolling k/v window in _decode_state; every later step reuses them
+        # instead of re-encoding the prefix, which is what makes generation O(1)
+        # per token instead of O(prefix).
+        #
+        # The fast weights are FROZEN during decode, and that is exact rather
+        # than an approximation: the operator is apply-then-update on
+        # lact_chunk_size blocks, so a continuation shorter than one chunk
+        # produces no update at all -- prefill's final weights are precisely the
+        # weights a full-sequence forward would use for those positions. Crossing
+        # a chunk boundary would need the deferred update, so that raises.
+        if cache_position is not None and int(cache_position[0]) == 0:
+            self._decode_state = None          # new sequence, drop any stale state
+        if use_cache and self._decode_state is not None:
+            return self._decode_step(hidden_states, position_ids,
+                                     position_embeddings, past_key_value,
+                                     bsz, q_len)
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -709,6 +817,16 @@ class LinearTTTAttention(nn.Module):
                 store['enter'][key] = (w0, w1, w2)
             ttt_kwargs['return_state'] = True
 
+        if use_cache:
+            if self.ttt_inner_loss != 'l2':
+                raise NotImplementedError(
+                    'incremental decode needs the l2 operator: the dot operator '
+                    'returns only the output, not the converged fast weights, so '
+                    "there is nothing to carry across steps. Set ttt_inner_loss: 'l2' "
+                    'or run generation with use_cache=False.'
+                )
+            ttt_kwargs['return_state'] = True
+
         ttt_out = ttt_op(
             w0, w1, w2,
             ttt_q, ttt_k, ttt_v,
@@ -718,9 +836,23 @@ class LinearTTTAttention(nn.Module):
             momentum=momentum,
             **ttt_kwargs,
         )
-        if shared:
+        if shared or use_cache:
             ttt_out, nw0, nw1, nw2 = ttt_out
-            store['exit'][gid] = (nw0, nw1, nw2)
+            if shared:
+                store['exit'][gid] = (nw0, nw1, nw2)
+        if use_cache:
+            # Park what decode needs: the converged fast weights, and the last
+            # window_size + 1 post-RoPE keys and values. In the shared case these
+            # are this layer's own converged weights, which is right -- a
+            # full-sequence forward one token longer would hand this layer the
+            # same state, since neither the group order nor any chunk boundary
+            # changes within a sub-chunk continuation.
+            keep = self.window_size + 1
+            self._decode_state = {
+                'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
+                'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                'since_update': q_len % self.lact_chunk_size,
+            }
 
         ttt_out = self.ttt_norm(ttt_out)
         ttt_scale = rearrange(

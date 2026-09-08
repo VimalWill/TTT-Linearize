@@ -141,6 +141,17 @@ def main():
     # numerics, memory bounded by the window rather than the sequence.
     use_sdpa_sliding_window(True)
 
+    # The generate_until tasks (swde, fda, squad_completion, nq_open, drop,
+    # triviaqa) need incremental decode: without it every generated token
+    # re-encodes the whole prefix. LinearTTTAttention._decode_step provides it --
+    # prefill parks the converged fast weights and a rolling k/v window, and each
+    # step reads the frozen memory plus the window. Exact for continuations
+    # shorter than lact_chunk_size, which is every one of these tasks; it raises
+    # rather than approximating if a continuation runs longer.
+    model.config.use_cache = True
+    if getattr(model, 'generation_config', None) is not None:
+        model.generation_config.use_cache = True
+
     with torch.no_grad(), ablate(sel, args.ablate if sel else None):
         res = lm_eval.simple_evaluate(**kwargs)
 
