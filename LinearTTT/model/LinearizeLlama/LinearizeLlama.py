@@ -84,11 +84,25 @@ def use_sdpa_sliding_window(enable: bool = True):
 
 
 def _sdpa_sliding_window(q, k, v, window_size, causal, scale, chunk=1024):
+    """Chunked softmax attention over a sliding window. [B, H, T, D] in and out.
+
+    Written out with matmul + softmax rather than F.scaled_dot_product_attention:
+    SDPA applies its own head-count and GQA validation to the (q, k, v) triple
+    and rejects slices it does not like, with an error message PyTorch itself
+    flags as unclear. Doing the three steps explicitly keeps the peak at
+    B*H*C*(C+W) with no shape rules other than the ones written here.
+    """
     B, H, T, D = q.shape
+    if k.shape[1] != H:                    # GQA: broadcast kv heads up to q heads
+        k = repeat_kv(k, H // k.shape[1])
+        v = repeat_kv(v, H // v.shape[1])
+    if scale is None:
+        scale = D ** -0.5
     out = torch.empty_like(q)
+    neg = torch.finfo(q.dtype).min
     for s in range(0, T, chunk):
         e = min(s + chunk, T)
-        lo = max(0, s - window_size) if causal else max(0, s - window_size)
+        lo = max(0, s - window_size)
         hi = e if causal else min(T, e + window_size)
         qi = torch.arange(s, e, device=q.device).unsqueeze(1)
         ki = torch.arange(lo, hi, device=q.device).unsqueeze(0)
@@ -96,9 +110,10 @@ def _sdpa_sliding_window(q, k, v, window_size, causal, scale, chunk=1024):
             m = (qi >= ki) & (qi - ki <= window_size)
         else:
             m = (qi - ki).abs() <= window_size
-        out[:, :, s:e] = F.scaled_dot_product_attention(
-            q[:, :, s:e], k[:, :, lo:hi], v[:, :, lo:hi],
-            attn_mask=m.view(1, 1, e - s, hi - lo), scale=scale)
+        att = torch.matmul(q[:, :, s:e], k[:, :, lo:hi].transpose(-1, -2)) * scale
+        att = att.masked_fill(~m.view(1, 1, e - s, hi - lo), neg)
+        att = torch.softmax(att.float(), dim=-1).to(q.dtype)
+        out[:, :, s:e] = torch.matmul(att, v[:, :, lo:hi])
     return out
 
 
