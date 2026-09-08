@@ -31,6 +31,7 @@ import LinearTTT  # noqa: F401
 from Training.train import build_model_config
 from diag_common import load_model
 from diag_retrieval import ablate, ttt_layers
+from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
 
 SUITES = {
     'recall': ['swde', 'fda', 'squad_completion'],
@@ -108,14 +109,39 @@ def main():
     else:
         sel = []
 
+    # NOT model_config.max_position_embeddings. build_model_config sets that to
+    # max(checkpoint value, cfg max_length), and Llama-3.1-8B ships 131072, so it
+    # stays 131072 however short the training context was. Handing that to lm-eval
+    # makes it roll wikitext in 128k-token windows on a model trained at 8k --
+    # wrong to report, and it OOMs a 96 GB GH200 before the first request lands.
+    # The evaluation context must be the context the model was trained at.
+    eval_len = int(config.model.max_length)
+    print(f'eval context length {eval_len} '
+          f'(config max_position_embeddings {model_config.max_position_embeddings})')
     lm = HFLM(pretrained=model, tokenizer=args.base,
-              batch_size=args.batch_size, max_length=model_config.max_position_embeddings)
+              batch_size=args.batch_size, max_length=eval_len)
 
     kwargs = dict(model=lm, tasks=tasks, task_manager=tm, limit=args.limit)
     if args.num_fewshot is not None:
         kwargs['num_fewshot'] = args.num_fewshot
 
-    with ablate(sel, args.ablate if sel else None):
+    # diag_common.load_model calls model.eval() but leaves requires_grad set --
+    # the TTT parameters and the LoRA adapters come back from training still
+    # trainable, so without this every forward builds an autograd graph and
+    # retains 32 layers of activations. diag_retrieval gets away with it because
+    # score_ar is decorated @torch.no_grad(); this script had no such guard, and
+    # the retained graph is what put 79 GB on the card before a single
+    # loglikelihood_rolling window was scored.
+    for prm in model.parameters():
+        prm.requires_grad_(False)
+
+    # lm-eval sends a different sequence length for almost every request, so
+    # flex_attention never settles on a compiled kernel and falls back to the
+    # dense [B, H, Q, KV] path. Use the chunked SDPA window instead: same
+    # numerics, memory bounded by the window rather than the sequence.
+    use_sdpa_sliding_window(True)
+
+    with torch.no_grad(), ablate(sel, args.ablate if sel else None):
         res = lm_eval.simple_evaluate(**kwargs)
 
     print(f'\n{"task":<22}{"metric":<18}{"value":>9}')

@@ -65,6 +65,43 @@ def _compiled_flex_attention():
     return _flex_attention_compiled
 
 
+# Inference fallback. flex_attention only reaches its Triton kernel when dynamo
+# lowers the call; under lm-eval, which sends a different sequence length for
+# nearly every request, it drops to `sdpa_dense` and materialises [B, H, Q, KV]
+# -- 32 GiB at batch 4 / 8192 tokens / 32 heads, which OOMs a 96 GB GH200 even
+# though the window is 512. This path never depends on the compiler: it walks
+# the query axis in blocks and each block attends only to its own span plus
+# `window_size` tokens of history, so the peak is B*H*C*(C+W) instead of
+# B*H*T*T. Off by default -- training has one fixed shape, compiles once, and
+# should keep the fused kernel.
+_force_sdpa_window = False
+
+
+def use_sdpa_sliding_window(enable: bool = True):
+    """Route sliding_window_attention through the chunked SDPA path."""
+    global _force_sdpa_window
+    _force_sdpa_window = enable
+
+
+def _sdpa_sliding_window(q, k, v, window_size, causal, scale, chunk=1024):
+    B, H, T, D = q.shape
+    out = torch.empty_like(q)
+    for s in range(0, T, chunk):
+        e = min(s + chunk, T)
+        lo = max(0, s - window_size) if causal else max(0, s - window_size)
+        hi = e if causal else min(T, e + window_size)
+        qi = torch.arange(s, e, device=q.device).unsqueeze(1)
+        ki = torch.arange(lo, hi, device=q.device).unsqueeze(0)
+        if causal:
+            m = (qi >= ki) & (qi - ki <= window_size)
+        else:
+            m = (qi - ki).abs() <= window_size
+        out[:, :, s:e] = F.scaled_dot_product_attention(
+            q[:, :, s:e], k[:, :, lo:hi], v[:, :, lo:hi],
+            attn_mask=m.view(1, 1, e - s, hi - lo), scale=scale)
+    return out
+
+
 def sliding_window_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,6 +120,9 @@ def sliding_window_attention(
     # causally valid and within the window (trimmed before calling), so no mask needed.
     if Q_len != KV_len:
         return _compiled_flex_attention()(q, k, v, scale=scale)
+
+    if _force_sdpa_window:
+        return _sdpa_sliding_window(q, k, v, window_size, causal, scale)
 
     if causal:
         def mask_mod(b, h, q_idx, kv_idx):
