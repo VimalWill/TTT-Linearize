@@ -180,6 +180,15 @@ def main():
         prm.requires_grad_(False)
 
     use_sdpa_sliding_window(True)
+    causality = None
+    if getattr(model.config, 'ttt_share_groups', None):
+        from test_causality import assert_causal
+        chunk = model.config.lact_chunk_size
+        generator = torch.Generator(device=model.device).manual_seed(0)
+        probe = torch.randint(model.config.vocab_size, (1, 3 * chunk),
+                              device=model.device, generator=generator)
+        causality = assert_causal(model, probe, chunk)
+        print('Shared-memory causality tripwire: passed')
     model.config.use_cache = True
     if getattr(model, 'generation_config', None) is not None:
         model.generation_config.use_cache = True
@@ -202,7 +211,8 @@ def main():
     with open(path, 'w') as f:
         json.dump({'ckpt': args.ckpt, 'adapter': args.adapter, 'tasks': tasks,
                    'limit': args.limit, 'ablate': args.ablate,
-                   'layers': args.layers, 'results': flat}, f, indent=2)
+                   'layers': args.layers, 'causality': causality,
+                   'results': flat}, f, indent=2)
     print(f'\nwrote {path}')
 
 

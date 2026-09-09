@@ -1,25 +1,17 @@
 # Stage 1 -- attention transfer, ONE unified interior memory.
 #
-# Layers 2-27 collapse from 26 memories to one: a single parameter set and a
-# single running state, read by each member's q and written by each member's
-# k/v in depth order. L0-L1 and L28-L31 keep their own -- the layer-wise
-# allocation sweep put the measured TTT capacity at both ends of the stack.
+# Layers 2-27 collapse from 26 memories to one. L2 writes: it runs the inner
+# loop and publishes its per-chunk trajectory. L3-L27 read block c with their
+# own q, which is causal because block c is the state before chunk c was folded
+# in -- sharing the FINAL state instead leaks the whole sequence into every
+# reader. L0-L1 and L28-L31 keep their own; the layer-wise allocation sweep put
+# the measured TTT capacity at both ends of the stack.
 # 7 memories of 32; state 44.0 MB against 201.3 MB.
 #
-# KNOWN BUG -- read before trusting any number from this config. A follower
-# starts from the previous member's state after the WHOLE sequence, so it reads
-# a memory fitted on future tokens. See test_causality.py. The fix is to thread
-# the per-chunk trajectory W[c] instead of W_final.
-#
-# REQUIRES ttt_retention_group_root. Retention fires once per chunk per layer,
-# so uncorrected a 26-layer group decays by alpha^(26*16) = 5e-4 over 8192 --
-# wiped before any member reads it, which is what sat an earlier 23-layer
-# attempt at CE 11.3-12.5 against a uniform baseline of 11.76. The g-th root
-# restores a private memory's 0.748.
-#
-# ttt_base_lr moves with it automatically: the root pushes the per-layer alpha
-# to 0.99930 at g=26, so the model rescales base_lr by (1-alpha^(1/g))/(1-alpha)
-# = 1/25.8. The yml carries the PRIVATE value -- do not pre-divide it here.
+# Retention needs no group correction under this scheme. Only the leader
+# writes, so the state decays alpha^c exactly as a private memory does -- the
+# alpha^(g*c) over-decay that wiped an earlier 23-layer group cannot arise, and
+# ttt_base_lr keeps its private calibration.
 #
 # Sharing is l2-only: the dot operator does not return its converged weights.
 # Cannot be evaluated zero-shot -- independently trained memories do not
@@ -48,7 +40,6 @@ model:
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
   ttt_share_groups: [[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]]
-  ttt_retention_group_root: True   # REQUIRED at g=26; see header
   fw_init_gain: 1.0              # measured: gain 2.0 gave |f|/|v|=0.47 at
                                  # chunk 0 on real PG19 features and diverged
                                  # by chunk 2; target band is 0.05-0.2

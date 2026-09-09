@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import fla
 import LinearTTT
 import torch.utils
 import torch.utils.data
@@ -18,7 +17,6 @@ from peft import LoraConfig, TaskType, PeftModel, get_peft_model
 
 from Training.trainer import DefaultTrainer, FinetuneTrainer
 from Training.utils import get_optimizer_and_scheduler, count_model_params
-from Training.dataloader import load_data
 
 
 # Parameters belonging to the test-time-training branch. These have no
@@ -76,6 +74,7 @@ def set_trainable_params(model, config):
 
 
 def train(config):
+    from Training.dataloader import load_data
 
     # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
     #        'ttt_ar' = autoregressive finetune on the LM loss

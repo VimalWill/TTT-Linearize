@@ -150,7 +150,11 @@ class DefaultTrainer():
                     for fname in ["adapter_model.safetensors", "adapter_model.bin"]:
                         fpath = os.path.join(ckpt_path, fname)
                         if os.path.exists(fpath):
-                            weights = torch.load(fpath, map_location="cpu")
+                            if fname.endswith('.safetensors'):
+                                from safetensors.torch import load_file
+                                weights = load_file(fpath, device="cpu")
+                            else:
+                                weights = torch.load(fpath, map_location="cpu")
                             set_peft_model_state_dict(model, weights)
                             break
                     # The adapters are only half the checkpoint -- the TTT
@@ -169,7 +173,12 @@ class DefaultTrainer():
                             )
                         print(f'-> Restored {matched}/{len(sd)} TTT tensors')
                 else:
-                    model.from_pretrained(ckpt_path)
+                    model = model.from_pretrained(
+                        ckpt_path,
+                        torch_dtype=model.dtype,
+                        device_map=getattr(model, 'hf_device_map', {'': model.device}),
+                    )
+                    self.model = model
                 print(f'-> Loading best checkpoint from {ckpt_path}')
             except Exception as e:
                 print(e)
@@ -464,4 +473,3 @@ class FinetuneTrainer(DefaultTrainer):
         outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
                    'seq_len': targets.shape[-1] + 1}
         return (loss, outputs) if return_outputs else loss
-    

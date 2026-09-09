@@ -46,16 +46,9 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         ttt_inner_loss='dot',
         ttt_retention_init_bias=4.0,   # sigmoid(4.0) ~ 0.982 decay per chunk
         # Layer groups that SHARE one running fast-weight memory, GQA-style:
-        # e.g. [[2,3,...,24]] gives the whole interior a single state, read by
-        # each member's q and written by each member's k/v in depth order.
-        # One parameter set and one live state per group instead of per layer.
+        # the lowest index writes, the rest read its per-chunk trajectory with
+        # their own q. One parameter set and one live state per group.
         ttt_share_groups=None,
-        # Take the g-th root of the retention gate inside a group of g layers.
-        # Without it a shared state decays by alpha^(g*chunks) where a private
-        # one decays by alpha^chunks, so ttt_retention_init_bias means something
-        # different at every group size. Set False only to reproduce runs from
-        # before the correction.
-        ttt_retention_group_root=True,
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -96,9 +89,34 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
         self.ttt_share_groups = ttt_share_groups
-        self.ttt_retention_group_root = ttt_retention_group_root
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm
         self.fw_init_gain = fw_init_gain
         self.ttt_scale_init_bias = ttt_scale_init_bias
+        self.validate_ttt()
+
+    def validate_ttt(self):
+        """Also called at model construction after harness config overrides."""
+        if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
+            raise ValueError('lact_chunk_size must be a positive integer')
+        groups = self.ttt_share_groups or []
+        if not isinstance(groups, (list, tuple)):
+            raise ValueError('ttt_share_groups must be a list of layer groups')
+        if groups and self.ttt_inner_loss != 'l2':
+            raise ValueError('Shared trajectories require ttt_inner_loss="l2"')
+        seen = set()
+        for group in groups:
+            if not isinstance(group, (list, tuple)) or not group:
+                raise ValueError('Each ttt_share_groups entry must be a nonempty list of layer indices')
+            for index in group:
+                if type(index) is not int or not 0 <= index < self.num_hidden_layers:
+                    raise ValueError(f'Invalid shared layer index: {index!r}')
+                if index in seen:
+                    raise ValueError(f'Layer {index} occurs more than once in ttt_share_groups')
+                seen.add(index)
+            if isinstance(self.ttt_inter_multi, (list, tuple)):
+                if len(self.ttt_inter_multi) != self.num_hidden_layers:
+                    raise ValueError('ttt_inter_multi must contain one value per layer')
+                if len({self.ttt_inter_multi[i] for i in group}) != 1:
+                    raise ValueError('ttt_inter_multi must match within each shared group')

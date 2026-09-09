@@ -67,6 +67,7 @@ def block_causal_lact_swiglu_l2(
     return_state: bool = False,
     init_momentum: tuple = None,
     return_momentum: bool = False,
+    return_trajectory: bool = False,
 ):
     """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias.
 
@@ -79,7 +80,16 @@ def block_causal_lact_swiglu_l2(
     `retention` replaces upstream's renormalisation: W <- alpha * W + dW rather
     than W <- L2Norm(W + dW) * ||W_0||. retention=None means no magnitude
     control at all -- debugging only.
+
+    `return_trajectory` appends (T0, T1, T2), each [n_blocks, b, ...], holding
+    the weights used to READ each block: T[c] is the state before chunk c was
+    folded in, so it depends only on chunks < c. That is what a layer sharing
+    this memory must read -- the final state saw the whole sequence and handing
+    it to another layer leaks the future. n_blocks = one per applied chunk plus
+    one for the tail, and block c serves positions [c*chunk_size, ...).
     """
+    if chunk_size < 1 or k.shape[1] < 1:
+        raise ValueError('chunk_size and sequence length must be positive')
     if momentum is not None:
         # Momentum buffers persist ACROSS chunks, so an incremental caller
         # resuming mid-sequence must hand them back in or the state drifts from
@@ -95,6 +105,7 @@ def block_causal_lact_swiglu_l2(
     v = v.transpose(1, 2)   # [b, dv, l]
 
     output = torch.zeros_like(v)
+    traj0, traj1, traj2 = [], [], []
 
     e_index = 0
     seq_len = k.shape[1]
@@ -110,6 +121,10 @@ def block_causal_lact_swiglu_l2(
         lr2i = lr2[:, s_index:e_index, :]
 
         # apply first: weights fit on chunks strictly before this one
+        if return_trajectory:
+            traj0.append(w0)
+            traj1.append(w1)
+            traj2.append(w2)
         h = torch.bmm(w2, qi)
         gate = F.silu(torch.bmm(w0, qi), inplace=True)
         output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
@@ -152,6 +167,10 @@ def block_causal_lact_swiglu_l2(
             w2 = w2 + dw2
 
     # tail chunk: read out with the final weights, no further update
+    if return_trajectory:
+        traj0.append(w0)
+        traj1.append(w1)
+        traj2.append(w2)
     s_index = e_index
     e_index = seq_len
     qi = q[:, :, s_index:e_index]
@@ -163,8 +182,51 @@ def block_causal_lact_swiglu_l2(
     if return_momentum:
         mom = ((dw0_momentum, dw1_momentum, dw2_momentum)
                if momentum is not None else None)
-        return out, w0, w1, w2, mom
-    return (out, w0, w1, w2) if return_state else out
+        ret = (out, w0, w1, w2, mom)
+    elif return_state or return_trajectory:
+        ret = (out, w0, w1, w2)
+    else:
+        return out
+    if return_trajectory:
+        ret = ret + ((torch.stack(traj0), torch.stack(traj1),
+                      torch.stack(traj2)),)
+    return ret
 
 
-__all__ = ['block_causal_lact_swiglu_l2', 'swiglu_l2_grads']
+@torch.compile()
+@torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
+def read_lact_swiglu_l2(traj, q, chunk_size: int):
+    """Read a shared memory trajectory with this layer's own queries.
+
+    `traj` is the (T0, T1, T2) triple from
+    `block_causal_lact_swiglu_l2(..., return_trajectory=True)`. Block c holds
+    the weights the writer used to read positions
+    [c*chunk_size, (c+1)*chunk_size), so this readout sees only chunks < c and
+    is causal. Same arithmetic and the same [b, l, dv] output as the operator's
+    own readout -- no inner loop, because a reader never updates the memory.
+    """
+    T0, T1, T2 = traj
+    n_blocks = T0.shape[0]
+    seq_len = q.shape[1]
+    if chunk_size < 1 or seq_len < 1:
+        raise ValueError('chunk_size and sequence length must be positive')
+    expected = (seq_len + chunk_size - 1) // chunk_size
+    if any(t.shape[0] != expected for t in traj):
+        raise ValueError(
+            f'trajectory must have {expected} blocks for {seq_len} positions at chunk '
+            f'{chunk_size}, got {[t.shape[0] for t in traj]}. The writer and '
+            'the reader must run on the same sequence length.'
+        )
+    q = q.transpose(1, 2)                                    # [b, dk, l]
+    blocks = []
+    for c in range(n_blocks):
+        s_index = c * chunk_size
+        e_index = min(s_index + chunk_size, seq_len)
+        qi = q[:, :, s_index:e_index]
+        gate = F.silu(torch.bmm(T0[c], qi), inplace=True)
+        blocks.append(torch.bmm(T1[c], gate * torch.bmm(T2[c], qi)))
+    return torch.cat(blocks, dim=2).transpose(1, 2)
+
+
+__all__ = ['block_causal_lact_swiglu_l2', 'read_lact_swiglu_l2',
+           'swiglu_l2_grads']
