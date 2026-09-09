@@ -153,12 +153,10 @@ class DefaultTrainer():
                             weights = torch.load(fpath, map_location="cpu")
                             set_peft_model_state_dict(model, weights)
                             break
-                    # The adapters are only half the checkpoint: the TTT
-                    # parameters are plain base-model tensors that training also
-                    # updates, saved separately by save_checkpoint. Without this
-                    # the returned model carries the LAST step's memory with the
-                    # BEST step's adapters. Keys were saved from this same
-                    # PeftModel, so they match directly.
+                    # The adapters are only half the checkpoint -- the TTT
+                    # tensors are saved separately by save_checkpoint. Without
+                    # this the model carries the LAST step's memory with the
+                    # BEST step's adapters.
                     ttt = os.path.join(ckpt_path, 'ttt_params.pt')
                     if os.path.exists(ttt):
                         sd = torch.load(ttt, map_location='cpu')
@@ -348,12 +346,9 @@ class DefaultTrainer():
                 loss, eval_metrics = self.compute_loss(model, data, return_outputs=True)
                 if not self.compute_loss_backprop:
                     loss = loss.item()  # otherwise already float
-                # The total loss goes under its own key. It used to be filed
-                # under `metric_for_best_model`, which for stage 1 is
-                # 'eval/loss_ce' -- the same key compute_loss returns the pure
-                # CE under. The two then interleaved in one list, so the
-                # reported 'eval/loss_ce' was an average of alternating CE and
-                # (1000*MSE + CE) values, and checkpoints were selected on it.
+                # The total loss goes under its own key. Filed under
+                # metric_for_best_model it collided with stage 1's
+                # 'eval/loss_ce', averaging CE with (1000*MSE + CE).
                 for k, v in [('loss_total', loss), *eval_metrics.items()]:
                     step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
                 
@@ -368,11 +363,9 @@ class DefaultTrainer():
             # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
-            # Stage 2 (`ttt_ar`) selects on 'eval/loss', and `FinetuneTrainer`
-            # returns no metric by that name -- it relied on the total loss
-            # being filed under `metric_for_best_model` here. Preserve that,
-            # but only when the metric is not a real one compute_loss returns,
-            # so stage 1's 'eval/loss_ce' stays the pure CE.
+            # Stage 2 selects on 'eval/loss', which compute_loss never returns
+            # -- it relied on the total loss being filed here. Preserve that,
+            # but only for metrics compute_loss does not already return.
             if (self.metric_for_best_model is not None
                     and self.metric_for_best_model not in step_eval_metrics):
                 step_eval_metrics[self.metric_for_best_model] = \
@@ -466,7 +459,7 @@ class FinetuneTrainer(DefaultTrainer):
         outputs = outputs.cpu()
         # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the
         # 'ppl' below is a mean of per-batch exp(CE), which Jensen-inflates above
-        # exp(mean CE) -- and exp(mean CE) is what diag_ce.py reports, i.e. what
+        # exp(mean CE) -- and exp(mean CE) is what the eval reports, i.e. what
         # the recorded dot-path numbers (31, 18.1) are on.
         outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
                    'seq_len': targets.shape[-1] + 1}

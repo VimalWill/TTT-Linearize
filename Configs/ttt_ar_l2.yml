@@ -3,13 +3,9 @@
 #
 # EVERY `model:` memory key below must match Configs/ttt_at_l2.yml exactly.
 # build_model_config rebuilds the config from the yml, so an omitted key
-# silently reverts to its dot default and runs the l2-trained fast weights under
-# the wrong rule. Specifically, without ttt_inner_loss: 'l2':
-#   - the update reverts to the Hebbian bias with Eq. 8's renorm
-#   - retention_proj is never constructed, so stage 1's retention weights load
-#     as unexpected keys and the gate disappears with no error
-#   - ttt_use_muon goes False, which the l2 equilibrium requires to be stable
-#   - ttt_base_lr reverts to 1e-2, ~50x the calibrated value
+# silently reverts to its dot default and runs the l2-trained weights under the
+# wrong rule -- retention_proj is never built and the gate vanishes with no
+# error, muon goes off, and base_lr reverts ~50x above the calibrated value.
 data:
   name: "pg19"
   path: "emozilla/pg19"

@@ -48,14 +48,12 @@ def build_model_config(config):
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue
-        # OmegaConf hands us ListConfig/DictConfig, which PretrainedConfig
-        # cannot JSON-serialise -- printing or saving the config then dies with
-        # "Object of type ListConfig is not JSON serializable". Convert to plain
-        # containers so list-valued keys (ttt_share_groups, ttt_inter_multi)
-        # survive both __repr__ and save_pretrained.
+        # PretrainedConfig cannot JSON-serialise ListConfig/DictConfig, so
+        # list-valued keys (ttt_share_groups, ttt_inter_multi) would break both
+        # __repr__ and save_pretrained. Convert to plain containers.
         if OmegaConf.is_config(v):
             v = OmegaConf.to_object(v)
-        # Configs/liger.yml spells it `attn_varient`
+        # checkpoints carry the `attn_varient` misspelling
         setattr(model_config, 'attn_variant' if k == 'attn_varient' else k, v)
     # the packing width is what the layer actually sees
     model_config.max_position_embeddings = max(

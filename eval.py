@@ -1,37 +1,93 @@
-"""Standard benchmarks for a linearized checkpoint, via lm-eval-harness.
-
-Two suites, matching Based (Arora et al., arXiv:2402.18668, Table 1):
-
-  recall      swde, fda, squad_completion -- the recall-intensive tasks
-  commonsense piqa, arc_easy, arc_challenge, hellaswag, winogrande,
-              lambada_openai -- the control set, which Based notes does NOT
-              need recall capacity because the inputs are short
-
-Can also drive the layer sweep on standard tasks rather than the AR-slice
-metric in diag_retrieval.py: pass --ablate ttt --layers N. That is the same
-measurement on a reportable benchmark, but it costs a full harness pass per
-layer, so use --limit.
-
-    # headline numbers
-    python3 eval_harness.py --cfg Configs/ttt_ar_l2.yml \
-        --ckpt $TTT_CKPT_DIR/ttt_at_l2/best_ckpt \
-        --adapter $TTT_CKPT_DIR/ttt_ar_l2/best_ckpt --suite recall commonsense
-
-    # one layer ablated, cheap
-    python3 eval_harness.py ... --suite recall --limit 200 --ablate ttt --layers 16
-"""
 
 import argparse
+import contextlib
 import json
+import os
+import re
 
 import torch
+from transformers import AutoModelForCausalLM
 from omegaconf import OmegaConf
 
 import LinearTTT  # noqa: F401
 from Training.train import build_model_config
-from diag_common import load_model
-from diag_retrieval import ablate, ttt_layers
 from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
+
+_PEFT_PREFIX = re.compile(r'^base_model\.model\.')
+
+
+def load_ttt_params(model, adapter, verbose=True):
+    """Overlay `adapter/ttt_params.pt` onto an *unwrapped* model.
+
+    ttt_params.pt is written from a PeftModel, so its keys carry peft's wrapper
+    prefix and load into an unwrapped model matching NOTHING, which strict=False
+    hides. Any stage-2 measurement was then really stage-1 TTT weights with
+    stage-2 adapters. Hence the prefix strip and the raise on zero matches --
+    both are load-bearing, do not drop them.
+    """
+    ttt = os.path.join(adapter, 'ttt_params.pt')
+    if not os.path.exists(ttt):
+        if verbose:
+            print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
+        return 0
+    sd = torch.load(ttt, map_location='cpu')
+    sd = {_PEFT_PREFIX.sub('', k): v for k, v in sd.items()}
+    unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
+    matched = len(sd) - len(unexpected)
+    if matched == 0:
+        raise RuntimeError(
+            f'{ttt} holds {len(sd)} tensors but none match this model. '
+            f'First saved key after prefix strip: {next(iter(sd))}'
+        )
+    if verbose:
+        print(f'  overlaid {matched}/{len(sd)} saved TTT tensors')
+        if unexpected:
+            print(f'  WARNING: {len(unexpected)} unmatched, e.g. {unexpected[0]}')
+    return matched
+
+
+def load_model(path, model_config, adapter=None, verbose=True):
+    """Full checkpoint, optionally with PEFT adapters and saved TTT params."""
+    model = AutoModelForCausalLM.from_pretrained(
+        path, config=model_config, device_map={'': 0}
+    ).to(torch.bfloat16)
+    if adapter:
+        from peft import PeftModel
+        load_ttt_params(model, adapter, verbose=verbose)
+        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+    return model.eval()
+
+
+def ttt_layers(model):
+    base = getattr(model, 'model', model)
+    base = getattr(base, 'model', base)
+    layers = getattr(base, 'layers', None)
+    if layers is not None:
+        out = [l.self_attn for l in layers]
+        if all(type(m).__name__ == 'LinearTTTAttention' for m in out):
+            return out
+    return [m for m in model.modules() if type(m).__name__ == 'LinearTTTAttention']
+
+
+@contextlib.contextmanager
+def ablate(mods, branch):
+    """branch: 'ttt' | 'attn' | 'both' | None, or a list of those."""
+    if branch is None or not mods:
+        yield
+        return
+    which = ['ttt', 'attn'] if branch == 'both' else (
+        [branch] if isinstance(branch, str) else list(branch))
+    attrs = ['_ablate_ttt' if b == 'ttt' else '_ablate_attn' for b in which]
+    for m in mods:
+        for a in attrs:
+            setattr(m, a, True)
+    try:
+        yield
+    finally:
+        for m in mods:
+            for a in attrs:
+                setattr(m, a, False)
+
 
 SUITES = {
     'recall': ['swde', 'fda', 'squad_completion'],
@@ -75,7 +131,7 @@ def main():
     ap.add_argument('--ablate', choices=['ttt', 'attn'], default=None)
     ap.add_argument('--layers', type=int, nargs='+', default=None,
                     help='layers to ablate; omit with --ablate for whole-branch')
-    ap.add_argument('--out', default='eval_harness')
+    ap.add_argument('--out', default='eval')
     args = ap.parse_args()
 
     tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
@@ -109,12 +165,7 @@ def main():
     else:
         sel = []
 
-    # NOT model_config.max_position_embeddings. build_model_config sets that to
-    # max(checkpoint value, cfg max_length), and Llama-3.1-8B ships 131072, so it
-    # stays 131072 however short the training context was. Handing that to lm-eval
-    # makes it roll wikitext in 128k-token windows on a model trained at 8k --
-    # wrong to report, and it OOMs a 96 GB GH200 before the first request lands.
-    # The evaluation context must be the context the model was trained at.
+
     eval_len = int(config.model.max_length)
     print(f'eval context length {eval_len} '
           f'(config max_position_embeddings {model_config.max_position_embeddings})')
@@ -125,29 +176,10 @@ def main():
     if args.num_fewshot is not None:
         kwargs['num_fewshot'] = args.num_fewshot
 
-    # diag_common.load_model calls model.eval() but leaves requires_grad set --
-    # the TTT parameters and the LoRA adapters come back from training still
-    # trainable, so without this every forward builds an autograd graph and
-    # retains 32 layers of activations. diag_retrieval gets away with it because
-    # score_ar is decorated @torch.no_grad(); this script had no such guard, and
-    # the retained graph is what put 79 GB on the card before a single
-    # loglikelihood_rolling window was scored.
     for prm in model.parameters():
         prm.requires_grad_(False)
 
-    # lm-eval sends a different sequence length for almost every request, so
-    # flex_attention never settles on a compiled kernel and falls back to the
-    # dense [B, H, Q, KV] path. Use the chunked SDPA window instead: same
-    # numerics, memory bounded by the window rather than the sequence.
     use_sdpa_sliding_window(True)
-
-    # The generate_until tasks (swde, fda, squad_completion, nq_open, drop,
-    # triviaqa) need incremental decode: without it every generated token
-    # re-encodes the whole prefix. LinearTTTAttention._decode_step provides it --
-    # prefill parks the converged fast weights and a rolling k/v window, and each
-    # step reads the frozen memory plus the window. Exact for continuations
-    # shorter than lact_chunk_size, which is every one of these tasks; it raises
-    # rather than approximating if a continuation runs longer.
     model.config.use_cache = True
     if getattr(model, 'generation_config', None) is not None:
         model.generation_config.use_cache = True

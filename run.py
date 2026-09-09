@@ -23,7 +23,8 @@ def set_random_seed(seed=0):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str, default="configs/liger.yaml")
+    parser.add_argument("--cfg", type=str, required=True,
+                        help="e.g. Configs/ttt_at_l2.yml")
     args = parser.parse_args()
     return args
 

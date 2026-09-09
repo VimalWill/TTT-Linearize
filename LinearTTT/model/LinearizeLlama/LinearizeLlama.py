@@ -44,17 +44,14 @@ else:
     print("flash_attn_2 is not available")
 
 from fla.models.utils import Cache as FlaCache
-from fla.ops.gla import fused_chunk_gla, fused_recurrent_gla
 
 from .Configuration import LigerGLAConfig
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
 logger = logging.get_logger(__name__)
 
-# flex_attention only reaches its fused Triton kernel when the call is compiled.
-# Called bare it falls back to `math_attention`, which materialises the whole
-# [B, H, Q, KV] score matrix -- 8 GiB at 8192 tokens / 32 heads -- and applies
-# the mask afterwards, so the window buys nothing.
+# Must be compiled: called bare, flex_attention falls back to `math_attention`,
+# which materialises the whole [B, H, Q, KV] score matrix and masks afterwards.
 _flex_attention_compiled = None
 
 
@@ -65,15 +62,10 @@ def _compiled_flex_attention():
     return _flex_attention_compiled
 
 
-# Inference fallback. flex_attention only reaches its Triton kernel when dynamo
-# lowers the call; under lm-eval, which sends a different sequence length for
-# nearly every request, it drops to `sdpa_dense` and materialises [B, H, Q, KV]
-# -- 32 GiB at batch 4 / 8192 tokens / 32 heads, which OOMs a 96 GB GH200 even
-# though the window is 512. This path never depends on the compiler: it walks
-# the query axis in blocks and each block attends only to its own span plus
-# `window_size` tokens of history, so the peak is B*H*C*(C+W) instead of
-# B*H*T*T. Off by default -- training has one fixed shape, compiles once, and
-# should keep the fused kernel.
+# Inference fallback, for callers with a different sequence length per request
+# (lm-eval): dynamo stops lowering the call and flex drops to a dense
+# [B, H, Q, KV]. This path is compiler-independent -- peak B*H*C*(C+W), not
+# B*H*T*T. Off by default; training has one fixed shape and keeps the kernel.
 _force_sdpa_window = False
 
 
@@ -136,13 +128,9 @@ def sliding_window_attention(
     if Q_len != KV_len:
         return _compiled_flex_attention()(q, k, v, scale=scale)
 
-    # v is checked separately because apply_rotary_pos_emb BROADCASTS. Under
-    # generate() with use_cache=True, transformers hands this layer one new
-    # token while position_embeddings still cover the whole prefix, so q and k
-    # silently expand to the prefix length and v does not -- Q_len == KV_len
-    # passes and the attention is nonsense. There is no decode path here (the
-    # operator cannot resume fast weights), so the caller must pass the full
-    # sequence every step; say so rather than computing garbage.
+    # apply_rotary_pos_emb BROADCASTS, so under generate() q/k can silently
+    # expand to the prefix length while v does not -- Q_len == KV_len passes and
+    # the attention is nonsense. Fail loudly instead.
     if v.shape[2] != KV_len:
         raise RuntimeError(
             f'v has {v.shape[2]} positions but k has {KV_len}: q/k were '
@@ -166,12 +154,9 @@ def sliding_window_attention(
     if block_mask_cache is not None and cache_key in block_mask_cache:
         block_mask = block_mask_cache[cache_key]
     else:
-        # B=H=None, and _compile: mask_mod ignores b and h, so the mask is
-        # broadcast as [1, 1, Q, Q] instead of [B, H, Q, Q]. Passing B and H
-        # made create_block_mask materialise the dense per-head mask and sum it
-        # -- 32 * 32768^2 * 8 bytes = 256 GiB at 32k context, which OOMs a 96 GB
-        # GH200 before the model runs. _compile avoids materialising the dense
-        # mask at all. Verified the two masks are identical.
+        # B=H=None keeps the mask [1, 1, Q, Q]; passing them materialises the
+        # dense per-head mask (256 GiB at 32k). _compile avoids materialising it
+        # at all. Verified the two masks are identical.
         try:
             block_mask = create_block_mask(
                 mask_mod, None, None, Q_len, Q_len, device=device, _compile=True)
@@ -183,151 +168,6 @@ def sliding_window_attention(
 
     output = _compiled_flex_attention()(q, k, v, block_mask=block_mask, scale=scale)
     return output
-
-class LigerGatedLinearAttention(nn.Module):
-    def __init__(
-        self, 
-        config: LigerGLAConfig,
-        layer_idx: Optional[int] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-        
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
-        self.pool_g = nn.AdaptiveAvgPool1d(output_size=self.head_dim * self.num_key_value_heads)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[FlaCache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        last_state = None
-        if past_key_value is not None and len(past_key_value) > self.layer_idx:
-            last_state = past_key_value[self.layer_idx]
-
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        g = self.pool_g(k)
-
-        # dealing with left-padding
-        if attention_mask is not None:
-            v = v.mul_(attention_mask[:, -v.shape[-2]:, None])
-
-        q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
-        k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_key_value_heads)
-        v = rearrange(v, 'b n (h d) -> b h n d', h=self.num_key_value_heads)
-        g = rearrange(g, 'b n (h m) -> b h n m', h=self.num_key_value_heads)
-
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
-        g = repeat_kv(g, self.num_key_value_groups)
-
-        sq, sk, sv = q, k, v
-
-        # norm
-        q = F.softmax(q, dim=-1)
-        k = F.softmax(k, dim=-1)
-        
-        gate_logit_normalizer = 16
-        g = F.logsigmoid(g) / gate_logit_normalizer # (b, h, n, m)
-
-        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        offsets = kwargs.get('offsets', None)
-        scale = 1 
-        q, k, v, g = (x.to(torch.float32).contiguous() for x in (q, k, v, g))
-
-        if self.training or q.shape[-2] > 1:
-            o_, recurrent_state = fused_chunk_gla(q, k, v, g, scale=scale, initial_state=recurrent_state, output_final_state=True)
-        else:
-            o_, recurrent_state = fused_recurrent_gla(q, k, v, g, scale=scale, initial_state=recurrent_state, output_final_state=True)
-
-        if past_key_value is not None:
-            past_key_value.update(
-                recurrent_state=recurrent_state,
-                layer_idx=self.layer_idx,
-                offset=q.shape[1]
-            )
-        
-        q_len = hidden_states.size(-2)
-
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(sv, position_ids)
-        else:
-            cos, sin = position_embeddings
-        sq, sk = apply_rotary_pos_emb(sq, sk, cos, sin)
-
-        input_dtype = sq.dtype
-        if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
-            # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
-                target_dtype = self.config._pre_quantization_dtype
-            else:
-                target_dtype = self.q_proj.weight.dtype
-
-            logger.warning_once(
-                f"The input hidden states seems to be silently casted in float32, this might be related to"
-                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-                f" {target_dtype}."
-            )
-
-            sq = sq.to(target_dtype)
-            sk = sk.to(target_dtype)
-            sv = sv.to(target_dtype)
-
-        window_size = 64
-        if attention_mask is not None and 0.0 in attention_mask:
-            pass
-        else:
-            attention_mask = None
-
-        y = _flash_attention_forward( # Reashape to the expected shape for Flash Attention
-            sq.transpose(1, 2),
-            sk.transpose(1, 2),
-            sv.transpose(1, 2),
-            attention_mask,
-            q_len,
-            position_ids=position_ids,
-            dropout=0.0,
-            sliding_window=window_size,
-            use_top_left_mask=False,
-            is_causal=True,
-            target_dtype=torch.float32,
-        ).transpose(1, 2)
-        o_ = 0.5 * y + 0.5 * o_ 
-        o = rearrange(o_.bfloat16(), 'b h n d -> b n (h d)')
-        o = self.o_proj(o)
-
-        return o, None, past_key_value
 
 class LinearTTTAttention(nn.Module):
 
@@ -379,10 +219,8 @@ class LinearTTTAttention(nn.Module):
         self.ttt_use_momentum = getattr(config, 'ttt_use_momentum', True)
         self.ttt_prenorm = getattr(config, 'ttt_prenorm', False)
 
-        # 'dot' = LaCT Eq. 7 Hebbian bias, magnitude pinned by Eq. 8's renorm.
-        # 'l2'  = Atlas Eq. 9 regression bias, magnitude bounded by Eq. 32's
-        #         learned retention gate instead. See ttt_l2.py -- crossing the
-        #         two (l2 + renorm) makes the regression target unreachable.
+        # 'dot' = LaCT Eq. 7 + Eq. 8 renorm; 'l2' = Atlas Eq. 9 + Eq. 32
+        # retention gate. The pairings are not interchangeable -- see ttt_l2.py.
         self.ttt_inner_loss = getattr(config, 'ttt_inner_loss', 'dot')
         if self.ttt_inner_loss not in ('dot', 'l2'):
             raise ValueError(
@@ -393,16 +231,10 @@ class LinearTTTAttention(nn.Module):
                 "ttt_inner_loss='l2' has no prenorm variant; set ttt_prenorm=False."
             )
 
-        # State per layer is 3 * num_ttt_heads * d_h * d_in, i.e. exactly
-        # proportional to ttt_inter_multi, while d_in/d_out stay at ttt_head_dim
-        # -- so this is the knob for allocating state ACROSS layers without
-        # touching the feature map. num_ttt_heads would also scale state
-        # (LaCT Eq. 14, 3*d^2/nh) but changes ttt_head_dim with it, and so
-        # changes the l2_norm geometry the memory operates in.
-        #
-        # Accepts a scalar (uniform, the default) or a per-layer list, for
-        # allocating capacity by measured retrieval demand -- see
-        # diag_retrieval.py for the anchor score that would drive it.
+        # State is 3 * num_ttt_heads * d_h * d_in, proportional to
+        # ttt_inter_multi while d_in/d_out stay at ttt_head_dim -- the knob for
+        # allocating state across layers without touching the feature map.
+        # Scalar (uniform) or a per-layer list.
         inter = getattr(config, 'ttt_inter_multi', 1.0)
         if isinstance(inter, (list, tuple)):
             if layer_idx is None:
@@ -456,28 +288,20 @@ class LinearTTTAttention(nn.Module):
         self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
         self.fw_init_gain = gain
 
-        # Shared-memory group, GQA-style: every layer in a group reads and
-        # writes ONE running fast-weight state, threaded through in depth order.
-        # `_ttt_store` is installed by LigerGLAModel; None means unshared.
-        # Incremental decode cache: the frozen fast weights plus a rolling k/v
-        # window, set at the end of prefill. None means "not decoding".
+        # Incremental decode cache: the converged fast weights plus a rolling
+        # k/v window, set at the end of prefill. None means "not decoding".
         self._decode_state = None
         self._share_gid = None
         self._share_leader = True    # meaningless unless _share_gid is set
         self._share_size = 1
+        # Shared-memory group: every member reads and writes ONE running state,
+        # threaded through in depth order. `_ttt_store` is installed by
+        # LigerGLAModel; None means unshared.
         self._ttt_store = None
-        # Retention compounds with group size. `w0 = w0 * a_i + dw0` in ttt_l2
-        # fires once per chunk PER LAYER, and a shared state is threaded through
-        # every member of its group, so the state a group of g layers carries
-        # across `c` chunks decays by alpha^(g*c) where a private state decays by
-        # alpha^c. ttt_retention_init_bias was picked against the private
-        # exponent (see reset_ttt_parameters), so sharing silently multiplies it
-        # by g: at the default 4.0 and 8192/512 chunks, a private state retains
-        # 0.982^16 = 0.75 but a group of 4 retains 0.982^64 = 0.31 and a group of
-        # 26 retains 5e-4 -- wiped before it can serve a long-range read, which
-        # leaves the sliding window to carry retrieval it cannot reach past.
-        # Taking the g-th root restores the private model's decay envelope: g
-        # applications of alpha^(1/g) compose back to alpha.
+        # Retention fires once per chunk PER LAYER, so a group of g decays by
+        # alpha^(g*c) where a private state decays by alpha^c -- at g=26 that is
+        # 5e-4 over 8192, wiped before any member can read it. The g-th root
+        # restores the private decay envelope: g applications compose back.
         self.ttt_retention_group_root = getattr(
             config, 'ttt_retention_group_root', True)
         groups = getattr(config, 'ttt_share_groups', None) or []
@@ -497,18 +321,10 @@ class LinearTTTAttention(nn.Module):
                 self._share_size = len(g)
                 break
 
-        # ttt_base_lr IS TIED TO THE RETENTION, so the root correction has to
-        # move it too. Under Muon the fast weights sit at
-        #     ||W||_eq ~ lr * sqrt(d) / (1 - alpha)
-        # (see Configs/ttt_at_l2.yml), and ttt_base_lr was calibrated to hold
-        # ||W||_eq at ||W_0||, i.e. lr ~ (1 - alpha) * fw_init_gain. Taking the
-        # g-th root pushes the per-layer alpha towards 1 -- 0.982 -> 0.99930 at
-        # g = 26 -- which shrinks (1 - alpha) by ~g and inflates the equilibrium
-        # by the same factor. Left alone, g = 26 runs the fast weights ~26x above
-        # the calibrated band and hits exactly the failure the config header
-        # warns about: the update grows W superlinearly and retention cannot
-        # hold it. Rescaling by (1 - alpha^(1/g)) / (1 - alpha) keeps the
-        # equilibrium where fw_init_gain put it.
+        # ttt_base_lr is tied to the retention, so the root correction moves it
+        # too: under Muon ||W||_eq ~ lr * sqrt(d) / (1 - alpha), and the root
+        # shrinks (1 - alpha) by ~g. Rescaling keeps the equilibrium where
+        # fw_init_gain put it; left alone the fast weights run ~g x too large.
         if (self.ttt_retention_group_root and self._share_size > 1
                 and self.ttt_inner_loss == 'l2'):
             a = 1.0 / (1.0 + math.exp(-self.ttt_retention_init_bias))
@@ -523,11 +339,9 @@ class LinearTTTAttention(nn.Module):
 
         self._block_mask_cache = {}
 
-        # Branch ablation, for the retrieval-anchoring diagnostic. The two
-        # branches are summed inside forward, so a module hook cannot separate
-        # them; zeroing the fast weights instead would also perturb the inner
-        # loop and so would not be a clean ablation. Set via
-        # diag_retrieval.ablate(); always False in training.
+        # Branch ablation for the retrieval diagnostic. The branches are summed
+        # forward, so a module hook cannot separate them. Always False in
+        # training.
         self._ablate_ttt = False
         self._ablate_attn = False
 
@@ -539,12 +353,10 @@ class LinearTTTAttention(nn.Module):
         including the output gate, whose whole job is to start nearly closed.
         """
         d_in, d_h = self.ttt_head_dim, self.w0.shape[1]
-        # A non-leader in a share group has no fast weights of its own -- w0/w1/w2
-        # are aliases of its leader's. Re-initialising them here would overwrite
-        # the leader's values, and transformers does exactly that on load: the
-        # follower keys are absent from a shared checkpoint, so they come back as
-        # missing keys and _init_weights runs on those layers. Without this guard
-        # stage 2 would silently start from random interior memories.
+        # A non-leader's w0/w1/w2 alias its leader's. Follower keys are absent
+        # from a shared checkpoint, so they come back as missing and
+        # _init_weights runs on those layers -- without this guard it would
+        # overwrite the leader's loaded values with noise.
         own_fast_weights = self._share_gid is None or self._share_leader
         with torch.no_grad():
             if own_fast_weights:
@@ -553,22 +365,19 @@ class LinearTTTAttention(nn.Module):
                 self.w2.normal_(0, 1 / math.sqrt(d_in)).mul_(self.fw_init_gain)
             self.ttt_qk_scale.fill_(1.0)
             self.ttt_qk_offset.zero_()
-            # ttt_norm is the only RMSNorm in this model with no counterpart in
-            # the Llama checkpoint, and LlamaPreTrainedModel._init_weights only
-            # handles Linear/Embedding. Under from_pretrained's meta-device path
-            # it would otherwise be materialised from uninitialised memory.
+            # The only RMSNorm with no counterpart in the Llama checkpoint;
+            # _init_weights handles Linear/Embedding only, so under the
+            # meta-device path this would come back uninitialised.
             self.ttt_norm.weight.fill_(1.0)
         # Start the TTT branch nearly closed so the frozen host's residual
         # stream survives step 0, but not fully closed: silu(0) == 0 would cut
         # the gradient to lr_proj and the fast weights entirely.
         nn.init.zeros_(self.ttt_scale_proj.weight)
         nn.init.constant_(self.ttt_scale_proj.bias, self.ttt_scale_init_bias)
-        # Start retention near 1 so the memory is not wiped between chunks:
-        # alpha^16 at 8192/512 is 0.75 for sigmoid(4.0) but 1.5e-5 for
-        # sigmoid(0.0), which would erase the state before it can be read. That
-        # arithmetic is the PRIVATE exponent; inside a share group the state
-        # takes g decay steps per chunk, which ttt_retention_group_root undoes so
-        # this bias keeps meaning the same thing at every group size.
+        # Start retention near 1 so the memory survives between chunks: alpha^16
+        # is 0.75 at sigmoid(4.0) but 1.5e-5 at sigmoid(0.0). This is the PRIVATE
+        # exponent; ttt_retention_group_root keeps it meaning the same thing
+        # inside a share group.
         if hasattr(self, 'retention_proj'):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
@@ -583,13 +392,10 @@ class LinearTTTAttention(nn.Module):
             rearrange(x, 'b n (h d) -> (b h) n d', h=self.num_ttt_heads) for x in (q, k, v)
         )
         if self.ttt_inner_loss == 'l2':
-            # The dot bias only needs v's direction, so upstream leaves its
-            # magnitude alone. A regression bias is fitting ||v|| itself, and
-            # measured on PG19 the raw ||v|| varies ~30x across heads (mean
-            # |f|/|v| 0.057 vs max 1.8), so a single inner lr cannot serve them
-            # all. Unit-norm targets put every head on the same scale; the
-            # output magnitude is set downstream by ttt_norm + ttt_scale_proj
-            # regardless.
+            # A regression bias fits ||v|| itself, and raw ||v|| varies ~30x
+            # across heads, so one inner lr cannot serve them all. Unit-norm
+            # targets put every head on the same scale; output magnitude is set
+            # downstream by ttt_norm + ttt_scale_proj regardless.
             v = l2_norm(v)
         return l2_norm(q), l2_norm(k), v
 
@@ -606,12 +412,9 @@ class LinearTTTAttention(nn.Module):
                 'sampling both feed one; beam search and prompt chunking do not.'
             )
 
-        # Apply-then-update, and "apply" comes first: a query in chunk i reads
-        # weights fitted on chunks 0..i-1, so any chunk that completed before
-        # this token must already be folded in. The buffer can arrive full
-        # straight out of prefill -- a prefix that is a multiple of chunk_size
-        # leaves a whole unapplied chunk behind, because the operator's loop
-        # stops at seq_len - chunk_size. Checking here rather than after the
+        # Apply first: a query in chunk i reads weights fitted on chunks
+        # 0..i-1. The buffer can arrive full out of prefill, since the
+        # operator's loop stops at seq_len - chunk_size. Checking BEFORE the
         # readout is what makes those positions match a full-sequence forward.
         if st['k_buf'] is not None and st['k_buf'].shape[1] >= self.lact_chunk_size:
             self._apply_deferred_chunk(st)
@@ -630,20 +433,16 @@ class LinearTTTAttention(nn.Module):
             cos, sin = self.rotary_emb(v, position_ids)
         else:
             cos, sin = position_embeddings
-        # generate() slices input_ids to the new token but can still hand down
-        # position_embeddings spanning the whole prefix. apply_rotary_pos_emb
-        # would then BROADCAST q and k up to the prefix length while v stays at
-        # one position -- silent, and the source of the original decode crash.
-        # Take the tail so the rotary phase matches the token actually being
-        # decoded.
+        # generate() can hand down position_embeddings spanning the whole
+        # prefix, which would BROADCAST q/k up while v stays at one position.
+        # Take the tail so the rotary phase matches the token being decoded.
         if cos.shape[-2] != q_len:
             cos, sin = cos[..., -q_len:, :], sin[..., -q_len:, :]
         aq, ak = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Keep window_size + 1 positions: mask_mod admits q_idx - kv_idx <=
-        # window_size, so a query sees itself plus window_size of history. Every
-        # retained key is then in-window and causally valid for this single
-        # query, which is why no mask is needed here.
+        # window_size + 1 positions: a query sees itself plus window_size of
+        # history, so every retained key is in-window and causally valid and no
+        # mask is needed.
         keep = self.window_size + 1
         st['k'] = torch.cat([st['k'], ak], dim=2)[:, :, -keep:]
         st['v'] = torch.cat([st['v'], v], dim=2)[:, :, -keep:]
@@ -681,12 +480,10 @@ class LinearTTTAttention(nn.Module):
         o = attn_out.to(ttt_out.dtype) + ttt_out
         out = self.o_proj(o.to(self.o_proj.weight.dtype))
 
-        # Apply-then-update: this token was READ with the pre-chunk weights above,
-        # which is correct -- the update using the chunk it belongs to lands
-        # afterwards and is seen by the next token. Buffer this token's update
-        # inputs and, once a full chunk has accumulated, run the real update. The
-        # buffer starts at prefill's remainder (prefix % chunk), so the boundary
-        # falls exactly where a full-sequence forward would put it.
+        # This token was READ with the pre-chunk weights above; its own update
+        # lands afterwards and is seen by the next token. Buffer the update
+        # inputs until a full chunk accumulates. The buffer starts at prefill's
+        # remainder so the boundary falls where a full-sequence forward puts it.
         _, ttt_k_new, ttt_v_new = self._ttt_features(
             *(rearrange(x, 'b h n d -> b n (h d)') for x in (q, k, v))
         )
@@ -729,12 +526,10 @@ class LinearTTTAttention(nn.Module):
     def _apply_deferred_chunk(self, st):
         """Run the one chunk update the buffered tokens are now due.
 
-        Reuses the operator instead of reimplementing its update: its loop is
-        `range(0, seq_len - chunk_size, chunk_size)`, so a sequence of exactly
-        chunk_size does nothing. Feeding chunk_size + 1 makes it perform exactly
-        one update over [0, chunk_size) and then a tail readout over the padding
-        token, which we discard -- the padding token cannot affect the update,
-        only the readout reads it.
+        Reuses the operator rather than reimplementing the update. Its loop is
+        `range(0, seq_len - chunk_size, chunk_size)`, so chunk_size + 1 tokens
+        give exactly one update over [0, chunk_size) plus a tail readout over
+        the padding token, which we discard.
         """
         C = self.lact_chunk_size
         pad = lambda x: None if x is None else torch.cat([x[:, :C], x[:, C - 1:C]], dim=1)
@@ -768,17 +563,12 @@ class LinearTTTAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # ---------------- incremental decode ----------------
-        # Prefill runs the full path below and parks the converged fast weights
-        # and a rolling k/v window in _decode_state; every later step reuses them
-        # instead of re-encoding the prefix, which is what makes generation O(1)
-        # per token instead of O(prefix).
-        #
-        # The fast weights are FROZEN during decode, and that is exact rather
-        # than an approximation: the operator is apply-then-update on
-        # lact_chunk_size blocks, so a continuation shorter than one chunk
-        # produces no update at all -- prefill's final weights are precisely the
-        # weights a full-sequence forward would use for those positions. Crossing
-        # a chunk boundary would need the deferred update, so that raises.
+        # Prefill parks the converged fast weights and a rolling k/v window in
+        # _decode_state; later steps reuse them instead of re-encoding the
+        # prefix, making generation O(1) per token. Freezing the weights within
+        # a chunk is exact, not an approximation: apply-then-update on
+        # lact_chunk_size blocks means a sub-chunk continuation produces no
+        # update at all. Crossing a boundary goes through _apply_deferred_chunk.
         if cache_position is not None and int(cache_position[0]) == 0:
             self._decode_state = None          # new sequence, drop any stale state
         if use_cache and self._decode_state is not None:
@@ -873,13 +663,15 @@ class LinearTTTAttention(nn.Module):
         else:
             ttt_op = block_causal_lact_swiglu
         # Shared state. The entering value is whatever the previous member of
-        # this group produced; only the group leader starts from the parameter.
+        # this group produced; only the leader starts from the parameter.
+        # Entering states are recorded per layer under grad because gradient
+        # checkpointing re-runs each layer during backward, by which time the
+        # running value has advanced to the end of the group.
         #
-        # Entering states are recorded per layer when grad is enabled because
-        # gradient checkpointing re-runs each layer during backward, and by then
-        # the running value has advanced to the end of the group -- a recompute
-        # would otherwise see the wrong state. Under no_grad nothing is recorded,
-        # so inference really does hold one state per group instead of per layer.
+        # KNOWN BUG: exit[gid] is the previous member's state after the WHOLE
+        # sequence, so every follower reads a memory fitted on future tokens.
+        # See test_causality.py. The fix is to thread the per-chunk trajectory
+        # W[c] -- which depends only on chunks < c -- instead of W_final.
         store = self._ttt_store
         shared = self._share_gid is not None and store is not None
         if shared:
@@ -924,20 +716,18 @@ class LinearTTTAttention(nn.Module):
             store['exit'][gid] = (nw0, nw1, nw2)
         if use_cache:
             # Park what decode needs: the converged fast weights, and the last
-            # window_size + 1 post-RoPE keys and values. In the shared case these
-            # are this layer's own converged weights, which is right -- a
-            # full-sequence forward one token longer would hand this layer the
-            # same state, since neither the group order nor any chunk boundary
-            # changes within a sub-chunk continuation.
+            # window_size + 1 post-RoPE keys and values.
+            #
+            # Unshared layers match a full-sequence forward exactly. Shared ones
+            # do NOT: a follower parks its own weights, but one more token can
+            # push an upstream member across a chunk boundary and change this
+            # layer's entering state. Same root cause as the note above.
             keep = self.window_size + 1
-            # Seed the update buffer with this prefix's remainder: the tokens
-            # after the last chunk boundary the operator actually processed. That
-            # is what puts decode's next boundary exactly where a full-sequence
-            # forward would put it, rather than one chunk after the prompt ends.
-            # NOT q_len % chunk_size. The operator's loop is
-            # range(0, seq_len - C, C), so it performs ceil((q_len - C) / C)
-            # updates and the trailing tokens after the last APPLIED chunk are
-            # still pending -- for q_len = 1024 that is a full 512, not 0.
+            # Seed the buffer with the tokens after the last chunk boundary the
+            # operator actually processed, so decode's next boundary falls where
+            # a full-sequence forward puts it. NOT q_len % chunk_size: the loop
+            # is range(0, seq_len - C, C), so it applies ceil((q_len - C) / C)
+            # chunks -- at q_len = 1024 the remainder is 512, not 0.
             C = self.lact_chunk_size
             n_upd = math.ceil((q_len - C) / C) if q_len > C else 0
             r = q_len - C * n_upd
@@ -967,11 +757,9 @@ class LinearTTTAttention(nn.Module):
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
 
-        # Attention transfer (LoLCATS stage 1): alongside the hybrid output,
-        # compute what full causal softmax attention would have produced from the
-        # same q/k/v, so the trainer can regress one onto the other per layer.
-        # The teacher is detached -- it is the frozen pretrained behaviour, not
-        # something to optimise.
+        # Attention transfer (LoLCATS stage 1): what full causal softmax
+        # attention would have produced from the same q/k/v, for the trainer to
+        # regress onto per layer. Detached -- it is frozen pretrained behaviour.
         aux = None
         if output_attentions:
             with torch.no_grad():
@@ -987,14 +775,11 @@ class LigerGLADecoderLayer(LlamaDecoderLayer):
     def __init__(self, config: LigerGLAConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         self.hidden_size = config.hidden_size
-        # `attn_varient` is the spelling used in Configs/liger.yml; accept both.
-        variant = getattr(config, 'attn_variant', None) or getattr(config, 'attn_varient', 'liger')
-        if variant == 'liger':
-            self.self_attn = LigerGatedLinearAttention(config=config, layer_idx=layer_idx)
-        elif variant == 'ttt':
-            self.self_attn = LinearTTTAttention(config=config, layer_idx=layer_idx)
-        else:
+        # checkpoints carry the `attn_varient` misspelling; accept both
+        variant = getattr(config, 'attn_variant', None) or getattr(config, 'attn_varient', 'ttt')
+        if variant != 'ttt':
             raise NotImplementedError(f'unknown attn_variant: {variant}')
+        self.self_attn = LinearTTTAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1029,13 +814,11 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # Shared fast-weight memory. Every layer in a group is given the SAME
-        # Parameter objects as its leader -- one w0/w1/w2 for the group rather
-        # than one per layer, so gradients accumulate into a single set -- and a
-        # reference to one mutable store through which the running state is
-        # threaded in depth order. The store is used rather than the forward
-        # signature because gradient checkpointing calls the layers with
-        # positional arguments.
+        # Shared fast-weight memory: every member of a group gets its leader's
+        # Parameter objects, so gradients accumulate into one set, plus a
+        # reference to a mutable store threading the running state in depth
+        # order. A store rather than an argument because gradient checkpointing
+        # calls the layers positionally.
         self._ttt_store = {'enter': {}, 'exit': {}}
         for layer in self.layers:
             layer.self_attn._ttt_store = self._ttt_store
@@ -1045,13 +828,9 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         """Give every member of a share group its leader's Parameter objects.
 
         Must be re-applied after weight loading, not only at construction:
-        from_pretrained with device_map materialises parameters through
-        accelerate, which REPLACES the Parameter objects rather than copying
-        into them, so any Python-level aliasing set up in __init__ is silently
-        undone. The symptom is subtle -- layers 3..N then own private
-        fast weights that they never read (they take the threaded state
-        instead) and that therefore receive no gradient, while the group is
-        initialised only by its leader.
+        device_map materialises parameters through accelerate, which REPLACES
+        the Parameter objects and silently undoes any aliasing from __init__.
+        Followers then own private weights they never read and never train.
         """
         n = 0
         for g in (getattr(self.config, 'ttt_share_groups', None) or []):
@@ -1066,10 +845,8 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
                         f'{tuple(a.w0.shape)} -- ttt_inter_multi must match '
                         'within a share group'
                     )
-                # count only genuine re-ties: tie_weights() is called several
-                # times by from_pretrained (post_init, then after loading, on
-                # both this model and the CausalLM wrapper), and re-tying an
-                # already-aliased parameter is a no-op worth staying quiet about
+                # count only genuine re-ties -- from_pretrained calls
+                # tie_weights() several times and re-tying is a no-op
                 if a.w0 is not lead.w0:
                     n += 1
                 a.w0, a.w1, a.w2 = lead.w0, lead.w1, lead.w2
@@ -1135,7 +912,7 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
 
         causal_mask = attention_mask
 
-        hidden_states = inputs_embeds
+        hidden_states = inputs_embedsare
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -1215,9 +992,7 @@ class LigerGLAForCausalLM(LlamaForCausalLM, LigerGLAPreTrainedModel, GenerationM
 
     def tie_weights(self):
         # from_pretrained calls tie_weights() on the TOP-LEVEL model after
-        # loading, so the shared TTT memories have to be re-tied from here --
-        # accelerate's device_map path replaces Parameter objects and undoes any
-        # aliasing done during __init__.
+        # loading, so the shared memories must be re-tied from here too.
         super().tie_weights()
         self.model._tie_ttt_memories()
 
@@ -1227,11 +1002,8 @@ class LigerGLAForCausalLM(LlamaForCausalLM, LigerGLAPreTrainedModel, GenerationM
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # safe_serialization refuses to write tensors that share storage unless
-        # they are declared here, so a shared-memory checkpoint dies at the first
-        # save with "shared tensors ... mismatching the transformers base
-        # configuration". Every non-leader member of a share group aliases its
-        # leader's w0/w1/w2, so name them.
+        # safe_serialization refuses to write storage-sharing tensors unless
+        # they are declared here. Every follower aliases its leader's w0/w1/w2.
         extra = [f'model.layers.{li}.self_attn.{w}'
                  for g in (getattr(config, 'ttt_share_groups', None) or [])
                  for li in sorted(g)[1:]

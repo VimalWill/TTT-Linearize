@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Loader for the LaCT test-time-training operator.
-
-`third_party/LaCT` is a git submodule with no package `__init__.py` chain, so it
-cannot be imported by name. `lact_llm/lact_model/ttt_operation.py` only depends
-on torch (unlike `minimal_implementations/`, which imports flash_attn at module
-scope), so we load that file directly by path.
-"""
-
 import importlib.util
 import math
 import os

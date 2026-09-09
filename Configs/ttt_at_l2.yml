@@ -1,39 +1,24 @@
-# Stage 1 -- attention transfer, with a Titans/Atlas-style memory instead of
-# LaCT's. THREE coupled changes vs the original dot-product memory, not one --
-# they do not work separately (see LinearTTT/.../ttt_l2.py). The dot config
-# (ttt_at.yml, deleted; ttt_inner_loss 'dot', no retention gate, LaCT Eq. 8's
-# renorm) reached ppl 18.1 against this design's 13.4 on matched diag_ce, at
-# twice the stage-2 budget:
-#   ttt_inner_loss: 'l2'  -- Atlas Eq. 9 regression bias, carries the residual
-#   ttt_base_lr           -- becomes a real hyperparameter only now; see below
-#   retention gate        -- Atlas Eq. 32, replaces LaCT Eq. 8's renorm, so the
-#                            regression target is reachable at all
-#   fw_init_gain          -- the readout scale must land near ||v||: too low and
-#                            dw ~ gain^2 cannot bootstrap against the decay (the
-#                            memory fades out), too high and the update grows W
-#                            superlinearly and the retention gate cannot hold it
-# Treat this as a different memory design, not a single-variable ablation.
+# Stage 1 -- attention transfer with a Titans/Atlas-style memory.
 #
-# fw_init_gain is CALIBRATED, not guessed. Measured on real PG19 features via
-#   diag_inner.py --cfg <this> --ckpt meta-llama/Llama-3.1-8B
-# gain 2.0 gave |f(k)|/|v| = 0.47 at chunk 0, doubled by chunk 1 and diverged to
-# NaN at chunk 2. Target |f|/|v| ~ 0.05-0.2 at chunk 0 AND roughly flat across
-# chunks; watch the max column too, since the worst head diverges first.
+# Per-layer regression of the hybrid output onto full softmax attention from the
+# same q/k/v. No LM loss, no LoRA: the pretrained projections are the teacher.
+# The TTT fast weights have no counterpart in the checkpoint, so they cannot be
+# warm-started the way Liger warm-starts a GLA gate from pretrained K.
 #
-# Calibration log (diag_inner.py on meta-llama/Llama-3.1-8B, PG19 val):
-#   gain 2.0, lr 1e-2 -> |f|/|v| 0.47 at c0, NaN at c2
-#   gain 1.0, lr 1e-2 -> |f|/|v| 0.059 at c0 (in band), loss 1.050 -> 0.973
-#                        across c0->c1 (first descent seen), NaN at c2
-#   gain 1.0, lr 1e-4 -> pending
-# Note the mean/max spread: 0.059 vs 1.77 at c0. A single lr cannot suit both,
-# so if the tail is still what diverges, the next lever is normalising v for the
-# l2 path (q and k are already unit-norm in _ttt_features, v is not), not a
-# smaller lr -- shrinking to protect the worst head starves the rest.
-# Per-layer regression of the hybrid output onto full softmax attention computed
-# from the same q/k/v. No LM loss, no LoRA: the pretrained projections are the
-# teacher and must not move. This exists because the TTT fast weights have no
-# counterpart in the checkpoint, so they cannot be warm-started the way Liger
-# warm-starts a GLA gate from pretrained K.
+# THREE coupled changes vs the dot-product memory; they do not work separately
+# (see ttt_l2.py). The dot design reached ppl 18.1 against this one's 13.4 on
+# matched CE, at twice the stage-2 budget.
+#   ttt_inner_loss: 'l2'  Atlas Eq. 9 regression bias, carries the residual
+#   retention gate        Atlas Eq. 32, replaces Eq. 8's renorm so the
+#                         regression target is reachable at all
+#   ttt_base_lr           becomes a real hyperparameter only now
+#   fw_init_gain          the readout scale must land near ||v||: too low and
+#                         dw ~ gain^2 cannot bootstrap against the decay, too
+#                         high and W grows superlinearly past the gate's hold
+#
+# fw_init_gain is calibrated, not guessed: target |f(k)|/|v| ~ 0.05-0.2 at chunk
+# 0 and roughly flat across chunks. gain 1.0 measures 0.059; gain 2.0 gave 0.47
+# and diverged to NaN by chunk 2.
 data:
   name: "pg19"
   path: "emozilla/pg19"

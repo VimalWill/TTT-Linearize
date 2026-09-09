@@ -1,45 +1,3 @@
-# -*- coding: utf-8 -*-
-"""LaCT operator with an l2-regression inner objective and a retention gate.
-
-Upstream's `block_causal_lact_swiglu` descends the dot-product bias
-
-    L(f_W(k), v) = -f_W(k)^T v                                  (LaCT Eq. 7)
-
-and controls the fast-weight magnitude by projecting every row back onto its
-*initial* norm after each update (LaCT Eq. 8). Those two choices belong
-together: a direction-only objective is unbounded, so a fixed-norm sphere is
-exactly the right constraint, and the output scale is set downstream by
-`ttt_norm` + `ttt_scale_proj` anyway.
-
-This module implements the other coherent pairing, from Titans / Atlas
-(Behrouz et al., arXiv:2505.23735). The objective becomes l2 regression
-
-    L(f_W(k), v) = 1/2 * || f_W(k) - v ||^2                      (Atlas Eq. 9)
-
-whose gradient carries the residual (v - f_W(k)), so a key that already reads
-out correctly produces no update -- error correction rather than Hebbian
-accumulation. Crucially, the magnitude control changes with it: Atlas Eq. 32
-uses a *learned retention gate* rather than a norm projection,
-
-    M_t = alpha_t * M_{t-1} - eta_t * NewtonSchulz(S_t)
-    S_t = theta_t * S_{t-1} + grad(...)
-
-with alpha_t in (0, 1) from a per-token projection. Decay bounds the memory
-multiplicatively instead of pinning it to a sphere, so ||W|| is free to grow
-until f_W(k) can actually reach v.
-
-Pairing l2 with Eq. 8 instead -- which is what a naive `dot -> l2` swap gives
-you -- does not work: the rows are pinned at ||W_0||, the reachable readout
-magnitude sits ~14x below ||v|| on a trained checkpoint, and the update spends
-itself inflating ||pred|| without aligning it. Measured, the inner loss climbs
-*above* 1.0 (worse than predicting zero) while training diverges. The l2 update
-is self-limiting once the residual closes, so it does not need the sphere.
-
-Kept identical to upstream: the SwiGLU fast-weight function, the
-apply-then-update order, per-token/per-matrix learning rates, momentum, and the
-optional Muon step.
-"""
-
 import torch
 import torch.nn.functional as F
 
@@ -66,18 +24,13 @@ def swiglu_l2_grads(w0, w1, w2, ki, vi, lr0i, lr1i, lr2i):
     gate = F.silu(gate_before_act, inplace=False)
     hidden = gate * hidden_before_mul                        # [b, dh, l]
 
-    # The term the dot-product bias does not have: what the memory currently
-    # retrieves for these keys.
+    # What the memory currently retrieves for these keys -- the term the
+    # dot-product bias does not have.
     #
-    # In fp32, deliberately. This is the only subtraction in either operator,
-    # and training drives pred -> v by construction, so err is a difference of
-    # two nearly-equal numbers precisely when the memory is working. In bf16
-    # (8 mantissa bits) its relative error grows without bound as that happens.
-    # One fp32 bmm per chunk is a rounding error against the operator's 18 units.
-    # Only the subtraction needs the extra precision; err is then cast back to
-    # vi's dtype and used exactly where upstream uses vi, so the rest of the
-    # pass keeps upstream's single-dtype structure rather than threading a
-    # second dtype through the bmms.
+    # fp32 deliberately: training drives pred -> v, so err is a difference of
+    # nearly-equal numbers exactly when the memory works, and bf16's 8 mantissa
+    # bits lose it. Only the subtraction needs the precision; err is cast back
+    # to vi's dtype and used where upstream uses vi.
     acc = torch.promote_types(torch.float32,
                               torch.promote_types(w1.dtype, vi.dtype))
     with torch.autocast(device_type=vi.device.type, enabled=False):
@@ -120,22 +73,17 @@ def block_causal_lact_swiglu_l2(
     Same signature plus `retention`, same apply-then-update (shifted block
     causal) order, same output shape [b, l, dv].
 
-    `return_state` additionally returns the converged (w0, w1, w2), which is
-    what a memory shared across layers needs -- upstream returns only the output,
-    which is also why there is no incremental-decode path.
+    `return_state` additionally returns the converged (w0, w1, w2), which a
+    shared memory and the decode path both need; upstream returns only output.
 
-    `retention` replaces upstream's channel-wise renormalisation: instead of
-    W <- L2Norm(W + dW) * ||W_0||, this does W <- alpha * W + dW. Passing
-    retention=None falls back to no magnitude control at all, which is only
-    sensible for debugging -- the l2 update is self-limiting but nothing then
-    bounds the accumulated drift.
+    `retention` replaces upstream's renormalisation: W <- alpha * W + dW rather
+    than W <- L2Norm(W + dW) * ||W_0||. retention=None means no magnitude
+    control at all -- debugging only.
     """
     if momentum is not None:
-        # The momentum buffers persist ACROSS chunks -- each chunk's update
-        # carries the previous chunk's dw, gated by m_i. An incremental caller
-        # that resumes mid-sequence therefore has to hand them back in, or every
-        # resumed chunk silently starts from zero momentum and the state drifts
-        # from what a single pass would produce.
+        # Momentum buffers persist ACROSS chunks, so an incremental caller
+        # resuming mid-sequence must hand them back in or the state drifts from
+        # what a single pass produces.
         if init_momentum is not None:
             dw0_momentum, dw1_momentum, dw2_momentum = init_momentum
         else:
@@ -179,14 +127,12 @@ def block_causal_lact_swiglu_l2(
             dw2_momentum = dw2
 
         if use_muon:
-            # Atlas Eq. 32 applies eta_t OUTSIDE Newton-Schulz for a reason:
-            # NS returns the nearest semi-orthogonal matrix, so it discards the
-            # magnitude of its input -- including the per-token lr already folded
-            # into dw. Upstream can ignore this because Eq. 8 rescales W right
-            # afterwards (hence its "conclusion: 1.0 is good" note on the muon
-            # lr), but with the retention gate an unscaled orthogonal update is
-            # O(1) against ||W|| and blows up immediately. Reapply the lr as the
-            # chunk-mean per head, which is the eta_t of Eq. 32.
+            # Atlas Eq. 32 applies eta_t OUTSIDE Newton-Schulz: NS returns the
+            # nearest semi-orthogonal matrix and so discards its input's
+            # magnitude, including the per-token lr folded into dw. Upstream
+            # gets away with it because Eq. 8 rescales W afterwards; with the
+            # retention gate an unscaled orthogonal update is O(1) against ||W||
+            # and blows up. Reapply the lr as the per-head chunk mean.
             eta0 = lr0i.mean(dim=1, keepdim=True)
             eta1 = lr1i.mean(dim=1, keepdim=True)
             eta2 = lr2i.mean(dim=1, keepdim=True)
@@ -194,8 +140,7 @@ def block_causal_lact_swiglu_l2(
             dw1 = zeropower_via_newtonschulz5(dw1).type_as(dw1) * eta1
             dw2 = zeropower_via_newtonschulz5(dw2).type_as(dw2) * eta2
 
-        # Atlas Eq. 32: multiplicative decay of the old memory, in place of
-        # LaCT Eq. 8's projection back onto the initial row norms.
+        # Atlas Eq. 32: multiplicative decay in place of Eq. 8's projection.
         if retention is not None:
             a_i = retention[:, s_index:e_index, :].mean(dim=1, keepdim=True)
             w0 = w0 * a_i + dw0

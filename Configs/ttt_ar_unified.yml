@@ -1,46 +1,27 @@
 # Stage 2 -- autoregressive finetune, ONE unified interior memory.
 #
-# Layers 2-27 collapse from 26 memories to ONE: a single parameter set and a
+# Layers 2-27 collapse from 26 memories to one: a single parameter set and a
 # single running state, read by each member's q and written by each member's
 # k/v in depth order. L0-L1 and L28-L31 keep their own -- the layer-wise
-# allocation sweep put the measured TTT capacity at both ends of the stack, so
-# the ends are the last place to unify.
+# allocation sweep put the measured TTT capacity at both ends of the stack.
+# 7 memories of 32; state 44.0 MB against 201.3 MB.
 #
-# Total memories 7 of 32.  State 44.0 MB against 201.3 MB (4.6x).
+# KNOWN BUG -- read before trusting any number from this config. A follower
+# starts from the previous member's state after the WHOLE sequence, so it reads
+# a memory fitted on future tokens. See test_causality.py. The fix is to thread
+# the per-chunk trajectory W[c] instead of W_final.
 #
-# THIS CONFIG ONLY MAKES SENSE WITH ttt_retention_group_root. Retention fires
-# once per chunk per layer, so before the correction a 26-layer group decayed
-# its state by alpha^(26*16) = 5e-4 over 8192 -- wiped long before any member
-# could read it. That is what sat stage 1 at CE 11.3-12.5 (uniform is 11.76) on
-# the earlier 23-layer attempt, and what left the sliding window carrying
-# retrieval it cannot reach past. With the g-th root the group retains the same
-# 0.748 as a private memory.
+# REQUIRES ttt_retention_group_root. Retention fires once per chunk per layer,
+# so uncorrected a 26-layer group decays by alpha^(26*16) = 5e-4 over 8192 --
+# wiped before any member reads it, which is what sat an earlier 23-layer
+# attempt at CE 11.3-12.5 against a uniform baseline of 11.76. The g-th root
+# restores a private memory's 0.748.
 #
-# ttt_base_lr MOVES WITH IT, automatically. lr is calibrated as
-# (1 - alpha) * fw_init_gain to hold ||W||_eq at ||W_0||; the root pushes the
-# per-layer alpha to 0.99930 at g = 26, so the model rescales the base lr by
-# (1 - alpha^(1/g)) / (1 - alpha) = 1/25.8, giving an effective 0.018 -> 0.00070.
-# Without that rescale the fast weights settle ~26x above the calibrated band and
-# stage 1 diverges with loss_mse and loss_ce both climbing. The yml still carries
-# the PRIVATE value 0.018 -- do not pre-divide it here.
+# ttt_base_lr moves with it automatically: the root pushes the per-layer alpha
+# to 0.99930 at g=26, so the model rescales base_lr by (1-alpha^(1/g))/(1-alpha)
+# = 1/25.8. The yml carries the PRIVATE value -- do not pre-divide it here.
 #
-# WHAT THIS RUN TESTS. Per-layer memories hold up past the training length and
-# the unified one did not. If decay was the cause, this should keep the shared
-# model's win at the trained length AND stop the collapse at 32k. If it still
-# collapses, the limit is capacity -- one state cannot hold 26 layers' worth of
-# long-range associations.
-#
-# THE FALLBACK, if it does collapse: groups of 4 over the interior --
-#   [[2,3,4,5],[6,7,8,9],[10,11,12,13],[14,15,16,17],[18,19,20,21],[22,23,24]]
-# with L0-L1 and L25-L31 private. 15 memories of 32, 94.4 MB. That reached ppl
-# 10.6 against per-layer's 13.4 at 201 MB, at the TRAINED length -- but it lost
-# beyond the window at 32k, and it was fitted under the UNCORRECTED decay
-# (effective retention 0.313, not 0.748), so it needs a rerun before it is a
-# fair comparison either way.
-#
-# Sharing is l2-only: upstream's dot operator does not return its converged
-# weights, so there is no state to hand to the next layer.
-#
+# Sharing is l2-only: the dot operator does not return its converged weights.
 # Cannot be evaluated zero-shot -- independently trained memories do not
 # collapse into one by pruning, so both stages retrain.
 data:
@@ -53,17 +34,15 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  # stage 1's output. `best_ckpt` is written on every eval improvement
-  # (trainer.py), while `best` is only written after the training loop finishes
-  # (train.py) -- so `best` is absent if stage 1 was interrupted. They hold the
-  # same weights, since `best` is `best_ckpt` reloaded and re-saved, so point at
-  # `best_ckpt`: it exists either way.
+  # stage 1's output. `best_ckpt` is written on every eval improvement; `best`
+  # only after the loop finishes, so it is absent if stage 1 was interrupted.
+  # Same weights either way -- point at `best_ckpt`.
   pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_unified/best_ckpt
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
   window_size: 512        # must be >= lact_chunk_size
-  # --- must mirror Configs/ttt_at_l2.yml ---
+  # --- must mirror Configs/ttt_at_unified.yml ---
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
@@ -77,13 +56,11 @@ model:
 train:
   optim: 'adamw_torch'
   lr: 0.0001
-  # One epoch. The stage-2 budget is part of the comparison: Configs/ttt_ar_l2.yml
-  # (per-layer) still runs 2, so a unified number from this config is measured at
-  # HALF the per-layer budget and any win here is a lower bound.
+  # Half the per-layer budget (ttt_ar_l2.yml runs 2), so any win is a lower bound.
   epochs: 1
   max_grad_norm: 1.0
   gradient_checkpointing: True
-  # ~209 gradient steps for 200 books @ 8192, so keep these small
+  # ~209 gradient steps for 200 books @ 8192
   eval_steps: 25
   save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
   # set TTT_CKPT_DIR to project space; falls back to ./checkpoints
