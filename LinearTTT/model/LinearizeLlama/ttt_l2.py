@@ -112,6 +112,8 @@ def block_causal_lact_swiglu_l2(
     momentum: torch.Tensor = None,    # [b, s, 1]
     retention: torch.Tensor = None,   # [b, s, 1], alpha in (0, 1)
     return_state: bool = False,
+    init_momentum: tuple = None,
+    return_momentum: bool = False,
 ):
     """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias.
 
@@ -129,9 +131,17 @@ def block_causal_lact_swiglu_l2(
     bounds the accumulated drift.
     """
     if momentum is not None:
-        dw0_momentum = torch.zeros_like(w0)
-        dw1_momentum = torch.zeros_like(w1)
-        dw2_momentum = torch.zeros_like(w2)
+        # The momentum buffers persist ACROSS chunks -- each chunk's update
+        # carries the previous chunk's dw, gated by m_i. An incremental caller
+        # that resumes mid-sequence therefore has to hand them back in, or every
+        # resumed chunk silently starts from zero momentum and the state drifts
+        # from what a single pass would produce.
+        if init_momentum is not None:
+            dw0_momentum, dw1_momentum, dw2_momentum = init_momentum
+        else:
+            dw0_momentum = torch.zeros_like(w0)
+            dw1_momentum = torch.zeros_like(w1)
+            dw2_momentum = torch.zeros_like(w2)
 
     q = q.transpose(1, 2)   # [b, dk, l]
     v = v.transpose(1, 2)   # [b, dv, l]
@@ -205,6 +215,10 @@ def block_causal_lact_swiglu_l2(
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
     out = output.transpose(1, 2)
+    if return_momentum:
+        mom = ((dw0_momentum, dw1_momentum, dw2_momentum)
+               if momentum is not None else None)
+        return out, w0, w1, w2, mom
     return (out, w0, w1, w2) if return_state else out
 
 

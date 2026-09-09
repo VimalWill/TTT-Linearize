@@ -740,13 +740,14 @@ class LinearTTTAttention(nn.Module):
         pad = lambda x: None if x is None else torch.cat([x[:, :C], x[:, C - 1:C]], dim=1)
         k, v = pad(st['k_buf']), pad(st['v_buf'])
         lr0, lr1, lr2 = (pad(b) for b in st['lr_buf'])
-        _, w0, w1, w2 = block_causal_lact_swiglu_l2(
+        _, w0, w1, w2, mom = block_causal_lact_swiglu_l2(
             st['w0'], st['w1'], st['w2'], k, k, v, lr0, lr1, lr2,
             chunk_size=C, use_muon=self.ttt_use_muon,
             momentum=pad(st['mom_buf']), retention=pad(st['ret_buf']),
-            return_state=True,
+            init_momentum=st['mom_state'], return_momentum=True,
         )
         st['w0'], st['w1'], st['w2'] = w0.detach(), w1.detach(), w2.detach()
+        st['mom_state'] = None if mom is None else tuple(x.detach() for x in mom)
         keep = lambda x: None if x is None else x[:, C:]
         st['k_buf'], st['v_buf'] = keep(st['k_buf']), keep(st['v_buf'])
         st['lr_buf'] = [keep(b) for b in st['lr_buf']]
@@ -903,6 +904,7 @@ class LinearTTTAttention(nn.Module):
                     'or run generation with use_cache=False.'
                 )
             ttt_kwargs['return_state'] = True
+            ttt_kwargs['return_momentum'] = True
 
         ttt_out = ttt_op(
             w0, w1, w2,
@@ -913,10 +915,13 @@ class LinearTTTAttention(nn.Module):
             momentum=momentum,
             **ttt_kwargs,
         )
-        if shared or use_cache:
+        nmom = None
+        if use_cache:
+            ttt_out, nw0, nw1, nw2, nmom = ttt_out
+        elif shared:
             ttt_out, nw0, nw1, nw2 = ttt_out
-            if shared:
-                store['exit'][gid] = (nw0, nw1, nw2)
+        if shared:
+            store['exit'][gid] = (nw0, nw1, nw2)
         if use_cache:
             # Park what decode needs: the converged fast weights, and the last
             # window_size + 1 post-RoPE keys and values. In the shared case these
@@ -944,6 +949,7 @@ class LinearTTTAttention(nn.Module):
                 'lr_buf': [tail(lr0), tail(lr1), tail(lr2)],
                 'mom_buf': tail(momentum),
                 'ret_buf': tail(ttt_kwargs.get('retention')),
+                'mom_state': None if nmom is None else tuple(x.detach() for x in nmom),
             }
 
         ttt_out = self.ttt_norm(ttt_out)
