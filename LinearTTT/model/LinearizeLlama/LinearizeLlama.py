@@ -606,6 +606,16 @@ class LinearTTTAttention(nn.Module):
                 'sampling both feed one; beam search and prompt chunking do not.'
             )
 
+        # Apply-then-update, and "apply" comes first: a query in chunk i reads
+        # weights fitted on chunks 0..i-1, so any chunk that completed before
+        # this token must already be folded in. The buffer can arrive full
+        # straight out of prefill -- a prefix that is a multiple of chunk_size
+        # leaves a whole unapplied chunk behind, because the operator's loop
+        # stops at seq_len - chunk_size. Checking here rather than after the
+        # readout is what makes those positions match a full-sequence forward.
+        if st['k_buf'] is not None and st['k_buf'].shape[1] >= self.lact_chunk_size:
+            self._apply_deferred_chunk(st)
+
         q = rearrange(self.q_proj(hidden_states), 'b n (h d) -> b h n d',
                       h=self.num_heads)
         k = rearrange(self.k_proj(hidden_states), 'b n (h d) -> b h n d',
@@ -689,8 +699,6 @@ class LinearTTTAttention(nn.Module):
         st['lr_buf'] = [app(st['lr_buf'][i], lr[i]) for i in range(3)]
         st['mom_buf'] = None if mom is None else app(st['mom_buf'], mom)
         st['ret_buf'] = None if ret is None else app(st['ret_buf'], ret)
-        if st['k_buf'].shape[1] >= self.lact_chunk_size:
-            self._apply_deferred_chunk(st)
         return (out, None, past_key_value)
 
     # ---- helpers shared by prefill and decode, so the two cannot drift ----
@@ -921,7 +929,13 @@ class LinearTTTAttention(nn.Module):
             # after the last chunk boundary the operator actually processed. That
             # is what puts decode's next boundary exactly where a full-sequence
             # forward would put it, rather than one chunk after the prompt ends.
-            r = q_len % self.lact_chunk_size
+            # NOT q_len % chunk_size. The operator's loop is
+            # range(0, seq_len - C, C), so it performs ceil((q_len - C) / C)
+            # updates and the trailing tokens after the last APPLIED chunk are
+            # still pending -- for q_len = 1024 that is a full 512, not 0.
+            C = self.lact_chunk_size
+            n_upd = math.ceil((q_len - C) / C) if q_len > C else 0
+            r = q_len - C * n_upd
             tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
             self._decode_state = {
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),

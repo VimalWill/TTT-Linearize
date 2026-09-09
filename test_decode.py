@@ -46,10 +46,20 @@ def check(prefix, gen):
         got = torch.stack(got, dim=1)
     r = ref[:, prefix - 1:prefix - 1 + gen]
     d = (got.float() - r.float()).abs()
-    agree = (got.argmax(-1) == r.argmax(-1)).float().mean().item()
-    crosses = (prefix % C) + gen >= C
-    print(f'prefix {prefix:>5}  gen {gen:>3}  crosses chunk boundary: {str(crosses):<5} '
-          f'max {d.max().item():.4f}  mean {d.mean().item():.4f}  argmax {agree:.1%}')
+    bad = (got.argmax(-1) != r.argmax(-1))[0]
+    agree = 1.0 - bad.float().mean().item()
+    print(f'prefix {prefix:>5}  gen {gen:>3}  '
+          f'max {d.max().item():7.4f}  mean {d.mean().item():7.4f}  argmax {agree:6.1%}')
+    if bad.any():
+        # A disagreement on a near-tie is bf16 noise; one on a confident token is
+        # a logic error. The reference's own top-2 margin tells them apart.
+        top2 = r[0].float().topk(2, dim=-1).values
+        margin = (top2[:, 0] - top2[:, 1])
+        idx = bad.nonzero().flatten()
+        print('   disagreements at decode step / reference top-2 margin:')
+        for i in idx[:8].tolist():
+            print(f'     step {i:>4}  margin {margin[i].item():7.4f}'
+                  f'{"   <- tie, likely numerical" if margin[i] < 0.5 else "   <- CONFIDENT, real error"}')
     return agree
 
 
