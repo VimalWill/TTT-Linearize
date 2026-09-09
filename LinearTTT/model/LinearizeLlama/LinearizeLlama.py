@@ -605,14 +605,6 @@ class LinearTTTAttention(nn.Module):
                 f'decode expects one token per step, got {q_len}. Greedy and '
                 'sampling both feed one; beam search and prompt chunking do not.'
             )
-        if st['since_update'] + 1 >= self.lact_chunk_size:
-            raise NotImplementedError(
-                f'continuation reached lact_chunk_size ({self.lact_chunk_size}) '
-                'tokens, so the fast weights would need the deferred chunk '
-                'update that decode skips. Re-run with use_cache=False, or '
-                'raise lact_chunk_size.'
-            )
-        st['since_update'] += 1
 
         q = rearrange(self.q_proj(hidden_states), 'b n (h d) -> b h n d',
                       h=self.num_heads)
@@ -677,7 +669,80 @@ class LinearTTTAttention(nn.Module):
         if self._ablate_ttt:
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
-        return (self.o_proj(o.to(self.o_proj.weight.dtype)), None, past_key_value)
+        out = self.o_proj(o.to(self.o_proj.weight.dtype))
+
+        # Apply-then-update: this token was READ with the pre-chunk weights above,
+        # which is correct -- the update using the chunk it belongs to lands
+        # afterwards and is seen by the next token. Buffer this token's update
+        # inputs and, once a full chunk has accumulated, run the real update. The
+        # buffer starts at prefill's remainder (prefix % chunk), so the boundary
+        # falls exactly where a full-sequence forward would put it.
+        _, ttt_k_new, ttt_v_new = self._ttt_features(
+            *(rearrange(x, 'b h n d -> b n (h d)') for x in (q, k, v))
+        )
+        lr = self._decode_lr(hidden_states)
+        mom = self._decode_momentum(hidden_states)
+        ret = self._decode_retention(hidden_states)
+        app = lambda a, b: b if a is None else torch.cat([a, b], dim=1)
+        st['k_buf'] = app(st['k_buf'], ttt_k_new)
+        st['v_buf'] = app(st['v_buf'], ttt_v_new)
+        st['lr_buf'] = [app(st['lr_buf'][i], lr[i]) for i in range(3)]
+        st['mom_buf'] = None if mom is None else app(st['mom_buf'], mom)
+        st['ret_buf'] = None if ret is None else app(st['ret_buf'], ret)
+        if st['k_buf'].shape[1] >= self.lact_chunk_size:
+            self._apply_deferred_chunk(st)
+        return (out, None, past_key_value)
+
+    # ---- helpers shared by prefill and decode, so the two cannot drift ----
+
+    def _decode_lr(self, hidden_states):
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            lr = F.linear(hidden_states.float(), self.lr_proj.weight.float(),
+                          self.lr_proj.bias.float())
+        lr = F.softplus(lr + self.base_lr_inv)
+        return rearrange(lr, 'b n (h lrs d) -> lrs (b h) n d',
+                         lrs=3, h=self.num_ttt_heads, d=1)
+
+    def _decode_momentum(self, hidden_states):
+        if not self.ttt_use_momentum:
+            return None
+        return rearrange(self.momentum_proj(hidden_states).float(),
+                         'b n (h d) -> (b h) n d', h=self.num_ttt_heads)
+
+    def _decode_retention(self, hidden_states):
+        if self.ttt_inner_loss != 'l2':
+            return None
+        r = rearrange(self.retention_proj(hidden_states).float(),
+                      'b n (h d) -> (b h) n d', h=self.num_ttt_heads)
+        if self.ttt_retention_group_root and self._share_size > 1:
+            r = r.pow(1.0 / self._share_size)
+        return r
+
+    def _apply_deferred_chunk(self, st):
+        """Run the one chunk update the buffered tokens are now due.
+
+        Reuses the operator instead of reimplementing its update: its loop is
+        `range(0, seq_len - chunk_size, chunk_size)`, so a sequence of exactly
+        chunk_size does nothing. Feeding chunk_size + 1 makes it perform exactly
+        one update over [0, chunk_size) and then a tail readout over the padding
+        token, which we discard -- the padding token cannot affect the update,
+        only the readout reads it.
+        """
+        C = self.lact_chunk_size
+        pad = lambda x: None if x is None else torch.cat([x[:, :C], x[:, C - 1:C]], dim=1)
+        k, v = pad(st['k_buf']), pad(st['v_buf'])
+        lr0, lr1, lr2 = (pad(b) for b in st['lr_buf'])
+        _, w0, w1, w2 = block_causal_lact_swiglu_l2(
+            st['w0'], st['w1'], st['w2'], k, k, v, lr0, lr1, lr2,
+            chunk_size=C, use_muon=self.ttt_use_muon,
+            momentum=pad(st['mom_buf']), retention=pad(st['ret_buf']),
+            return_state=True,
+        )
+        st['w0'], st['w1'], st['w2'] = w0.detach(), w1.detach(), w2.detach()
+        keep = lambda x: None if x is None else x[:, C:]
+        st['k_buf'], st['v_buf'] = keep(st['k_buf']), keep(st['v_buf'])
+        st['lr_buf'] = [keep(b) for b in st['lr_buf']]
+        st['mom_buf'], st['ret_buf'] = keep(st['mom_buf']), keep(st['ret_buf'])
 
     def forward(
         self,
@@ -852,10 +917,19 @@ class LinearTTTAttention(nn.Module):
             # same state, since neither the group order nor any chunk boundary
             # changes within a sub-chunk continuation.
             keep = self.window_size + 1
+            # Seed the update buffer with this prefix's remainder: the tokens
+            # after the last chunk boundary the operator actually processed. That
+            # is what puts decode's next boundary exactly where a full-sequence
+            # forward would put it, rather than one chunk after the prompt ends.
+            r = q_len % self.lact_chunk_size
+            tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
             self._decode_state = {
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
                 'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
-                'since_update': q_len % self.lact_chunk_size,
+                'k_buf': tail(ttt_k), 'v_buf': tail(ttt_v),
+                'lr_buf': [tail(lr0), tail(lr1), tail(lr2)],
+                'mom_buf': tail(momentum),
+                'ret_buf': tail(ttt_kwargs.get('retention')),
             }
 
         ttt_out = self.ttt_norm(ttt_out)
