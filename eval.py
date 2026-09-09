@@ -2,10 +2,12 @@
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from omegaconf import OmegaConf
 
@@ -89,6 +91,260 @@ def ablate(mods, branch):
                 setattr(m, a, False)
 
 
+# ------------------------------------------------------------------ AR slices
+
+def ar_masks(ids, edges, chunk=None):
+    """Split a sequence into associative-recall slices by retrieval distance.
+
+    A token at position t is an AR hit if the bigram (ids[t-1], ids[t]) occurred
+    earlier in the same sequence; its distance is how far back. This is the
+    Zoology / Based AR split, bucketed so the window and the memory can be told
+    apart -- hits closer than window_size are servable by attention alone.
+
+    ids: [T] on cpu. -> dict name -> bool mask [T], aligned to ids (position t
+    means "the loss on predicting ids[t]").
+    """
+    T = ids.shape[0]
+    last = {}
+    dist = torch.zeros(T, dtype=torch.long)
+    for t in range(1, T):
+        bg = (int(ids[t - 1]), int(ids[t]))
+        prev = last.get(bg)
+        if prev is not None:
+            dist[t] = t - prev
+        last[bg] = t
+
+    masks = {}
+    hit = dist > 0
+
+    # Chunk-crossing split. Apply-then-update means a query in chunk i reads
+    # weights fitted on chunks 0..i-1, so a source in the query's OWN chunk is
+    # invisible to the TTT branch by construction -- same-chunk hits are a
+    # structural control. Raw distance does not separate these: a hit at
+    # distance < chunk is same- or previous-chunk depending on the query's
+    # offset, so that bucket is a mixture of both.
+    if chunk:
+        # The mask is aligned to the target token t, but its CE comes from
+        # the logit at query position t-1.  Use that position for both sides
+        # of the comparison; using t misclassifies targets at chunk starts.
+        query = torch.arange(T) - 1
+        src = query - dist
+        same = hit & ((query // chunk) == (src.clamp(min=0) // chunk))
+        masks['ar_same_chunk'] = same
+        cross = hit & ~same
+        pfx = 'ar_x'
+    else:
+        cross = hit
+        pfx = 'ar_'
+
+    lo = 0
+    for hi in edges:
+        name = f'{pfx}{lo}_{hi}' if hi != math.inf else f'{pfx}{lo}+'
+        masks[name] = cross & (dist > lo) & (dist <= hi)
+        lo = hi
+    masks['other'] = ~hit
+    masks['other'][0] = False
+    return masks
+
+
+@torch.no_grad()
+def score_ar(model, seqs, masks, batch):
+    """Mean CE per slice. -> (means, counts, per_seq).
+
+    per_seq[name][i] is sequence i's own mean CE on that slice, or nan if that
+    sequence has no token there. Slice membership does not depend on ablation,
+    so these line up across runs and callers can form PAIRED deltas -- which
+    cancel per-sequence difficulty and give a real standard error instead of a
+    pooled point estimate. At ~0.02 nats per layer the pairing is what makes
+    the effect resolvable at all.
+    """
+    names = list(masks[0].keys())
+    tot = {n: 0.0 for n in names}
+    cnt = {n: 0 for n in names}
+    ps = {n: [float('nan')] * len(seqs) for n in names}
+    dev = model.device
+    for i in range(0, len(seqs), batch):
+        ids = torch.stack(seqs[i:i + batch]).to(dev)
+        logits = model(input_ids=ids, use_cache=False).logits
+        # Loss on predicting token t comes from logits at t-1. Chunked over
+        # positions: at 32k the full [b, T, 128256] in fp32 plus its log_softmax
+        # is ~42 GB on top of the model's own 16 GB, which does not fit.
+        STEP = 2048
+        tgt = ids[:, 1:]
+        parts = []
+        for a in range(0, tgt.shape[1], STEP):
+            b_ = min(a + STEP, tgt.shape[1])
+            lp = F.log_softmax(logits[:, a:b_, :].float(), dim=-1)
+            parts.append(-lp.gather(-1, tgt[:, a:b_].unsqueeze(-1)).squeeze(-1))
+            del lp
+        nll = torch.cat(parts, dim=1)                            # [b, T-1]
+        del logits, parts
+        for j in range(ids.shape[0]):
+            m = masks[i + j]
+            for n in names:
+                sel = m[n][1:].to(dev)
+                k = int(sel.sum())
+                if k:
+                    v = float(nll[j][sel].sum())
+                    tot[n] += v
+                    cnt[n] += k
+                    ps[n][i + j] = v / k
+    means = {n: (tot[n] / cnt[n] if cnt[n] else float('nan')) for n in names}
+    return means, cnt, ps
+
+
+def paired(a, b):
+    """Mean and standard error of the paired difference a - b, nan-skipping."""
+    d = [x - y for x, y in zip(a, b)
+         if x == x and y == y]                                # drop nan pairs
+    n = len(d)
+    if n == 0:
+        return float('nan'), float('nan'), 0
+    m = sum(d) / n
+    if n < 2:
+        return m, float('nan'), n
+    var = sum((x - m) ** 2 for x in d) / (n - 1)
+    return m, (var / n) ** 0.5, n
+
+
+@torch.no_grad()
+def gate_by_layer(model, mods, ids, batch):
+    """Mean |silu(ttt_scale_proj(h))| per layer -- is the branch even open?
+
+    ABSOLUTE value, deliberately. These gates train negative and silu is
+    negative on (-inf, 0), so a signed mean cancels to ~0 and every layer looks
+    shut regardless of how hard the branch is driving.
+    """
+    acc = [0.0] * len(mods)
+    hooks = []
+
+    def mk(i):
+        def fn(_m, _inp, out):
+            acc[i] += F.silu(out.detach().float()).abs().mean().item()
+        return fn
+
+    for i, m in enumerate(mods):
+        hooks.append(m.ttt_scale_proj.register_forward_hook(mk(i)))
+    n_calls = 0
+    for i in range(0, min(batch, ids.shape[0]), batch):
+        model(input_ids=ids[i:i + batch].to(model.device), use_cache=False)
+        n_calls += 1
+    for h in hooks:
+        h.remove()
+    return [a / max(n_calls, 1) for a in acc]
+
+
+def run_retrieval(args, model, model_config, config, mods):
+    """Per-layer x per-slice ablation sweep -> one tidy CSV, ready to plot."""
+    from Training.dataloader import load_data
+
+    chunk = model_config.lact_chunk_size
+    print(f'window_size = {model_config.window_size}, chunk = {chunk}')
+
+    cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+    if args.seq_len:
+        cfg.model.max_length = args.seq_len
+        print(f'context override: {args.seq_len} tokens')
+    if args.data_path:
+        cfg.data.path = args.data_path
+    if args.data_name:
+        cfg.data.name = args.data_name
+    if not (args.data_path or args.data_name):
+        print(f'corpus: {cfg.data.path} -- NOTE this is the training corpus; '
+              'pass --data-path for a number comparable to published AR-slice')
+
+    edges = list(args.edges) + [math.inf]
+    seqs, masks = [], []
+    for b in load_data(cfg)['validation']:
+        # every row, not just the first: the loader's batch is micro_batch_size
+        for row in b['input_ids']:
+            if len(seqs) >= args.seqs:
+                break
+            ids = row.cpu()
+            seqs.append(ids)
+            masks.append(ar_masks(ids, edges, chunk))
+        if len(seqs) >= args.seqs:
+            break
+    if not seqs:
+        raise RuntimeError('validation loader yielded nothing')
+    lens = {s.shape[0] for s in seqs}
+    if len(lens) != 1:
+        raise RuntimeError(f'ragged validation sequences {sorted(lens)}; '
+                           'score_ar stacks them, so they must be equal length')
+    names = list(masks[0].keys())
+    print(f'{len(seqs)} sequences of {seqs[0].shape[0]} tokens; slices {names}')
+
+    run = lambda: score_ar(model, seqs, masks, args.ar_batch)
+
+    base, counts, base_ps = run()
+    print('\nbaseline, no ablation')
+    for n in names:
+        if not counts[n]:
+            print(f'  {n:>16}  EMPTY -- no such tokens at this length')
+            continue
+        print(f'  {n:>16}  CE {base[n]:7.4f}  ppl {math.exp(base[n]):9.2f}  '
+              f'{counts[n]:>9,} tokens')
+    # An unpopulated bucket makes every delta nan and nan-poisons the sweep.
+    # The far bucket is empty whenever --seq-len was not applied.
+    empty = [n for n in names if not counts[n]]
+    if empty:
+        print(f'  dropping empty slices: {empty}')
+        names = [n for n in names if counts[n]]
+
+    gates = gate_by_layer(model, mods, torch.stack(seqs[:args.ar_batch]),
+                          args.ar_batch)
+
+    branches = ['ttt', 'attn'] if args.branch == 'both' else [args.branch]
+    targets = args.layers if args.layers is not None else list(range(len(mods)))
+
+    print('\nwhole-branch ablation (all layers at once)')
+    whole = {}
+    for br in branches:
+        with ablate(mods, br):
+            whole[br] = run()[0]
+        print(f'  -{br:<4} ' + '  '.join(
+            f'{n} {whole[br][n]:6.3f} ({whole[br][n] - base[n]:+6.3f})' for n in names))
+
+    rows = []
+    for br in branches:
+        print(f'\nper-layer, ablating {br}   (paired dCE +- SE over {len(seqs)} sequences)')
+        print(f'{"layer":>5} {"gate":>6}' + ''.join(f'{n:>20}' for n in names))
+        for li in targets:
+            with ablate([mods[li]], br):
+                _, _, ps = run()
+            d, se = {}, {}
+            for n in names:
+                d[n], se[n], _ = paired(ps[n], base_ps[n])
+            rows.append((br, li, gates[li], d, se))
+            print(f'{li:>5} {gates[li]:>6.3f}'
+                  + ''.join(f'{d[n]:>+13.4f}+-{se[n]:5.4f}' for n in names))
+
+    path = f'{args.out}_retrieval.csv'
+    n_pair = {n: paired(base_ps[n], base_ps[n])[2] for n in names}
+    with open(path, 'w') as f:
+        f.write('branch,layer,gate,'
+                + ','.join(f'dCE_{n},se_{n}' for n in names) + '\n')
+        # layer -1 is the unablated baseline in ABSOLUTE CE. Without it the file
+        # holds only deltas, and deltas from two models are not comparable -- a
+        # smaller delta can mean "this branch matters less" or "this model is
+        # stronger and more redundant", and only the baseline separates them.
+        # the se_ column on these rows carries n, not a standard error
+        f.write('baseline,-1,,'
+                + ','.join(f'{base[n]:.5f},{n_pair[n]}' for n in names) + '\n')
+        f.write('count,-3,,'
+                + ','.join(f'{counts[n]},{n_pair[n]}' for n in names) + '\n')
+        # whole-branch rows as ABSOLUTE CE, not deltas: on a base checkpoint the
+        # unablated baseline is polluted by the randomly initialised memory, so
+        # `whole_-ttt` at a full-length window IS the clean attention reference.
+        for br, ce in whole.items():
+            f.write(f'whole_-{br},-2,,'
+                    + ','.join(f'{ce[n]:.5f},' for n in names) + '\n')
+        for br, li, g, d, se in rows:
+            f.write(f'{br},{li},{g:.5f},'
+                    + ','.join(f'{d[n]:.5f},{se[n]:.5f}' for n in names) + '\n')
+    print(f'\nwrote {path}')
+
+
 SUITES = {
     'recall': ['swde', 'fda', 'squad_completion'],
     'commonsense': ['piqa', 'arc_easy', 'arc_challenge', 'hellaswag',
@@ -132,10 +388,37 @@ def main():
     ap.add_argument('--layers', type=int, nargs='+', default=None,
                     help='layers to ablate; omit with --ablate for whole-branch')
     ap.add_argument('--out', default='eval')
+    # ---- AR-slice retrieval sweep (does not use lm_eval) ----
+    ap.add_argument('--retrieval', action='store_true',
+                    help='per-layer x retrieval-distance ablation sweep -> CSV')
+    ap.add_argument('--seqs', type=int, default=32,
+                    help='retrieval: validation sequences to score')
+    ap.add_argument('--edges', type=int, nargs='+',
+                    default=[512, 2048, 8192, 16384],
+                    help='retrieval: distance bucket upper edges; +inf appended')
+    ap.add_argument('--seq-len', type=int, default=None,
+                    help='retrieval: override context length. Run at the TRAINED '
+                         'length -- past it both shared and per-layer decay, so a '
+                         'longer sweep measures extrapolation, not retrieval')
+    ap.add_argument('--data-path', default=None,
+                    help='retrieval: override corpus (default is the TRAINING corpus)')
+    ap.add_argument('--data-name', default=None)
+    ap.add_argument('--ar-batch', type=int, default=2,
+                    help='retrieval: sequences per forward')
+    ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='both',
+                    help='retrieval: which branch(es) to ablate per layer')
     args = ap.parse_args()
 
-    tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
-    tm = resolve(tasks)
+    # Fail before a multi-minute checkpoint load, not after.
+    if args.retrieval and args.ablate:
+        raise SystemExit('--ablate is meaningless with --retrieval: the sweep '
+                         'ablates each layer itself. Use --layers to restrict '
+                         'which layers it sweeps, and --branch to pick the branch.')
+
+    tasks, tm = None, None
+    if not args.retrieval:
+        tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
+        tm = resolve(tasks)
 
     # lm-eval sends a different sequence length for nearly every request, while
     # sliding_window_attention compiles flex_attention with dynamic=False. Past
@@ -147,9 +430,6 @@ def main():
     # own compiled kernel and the window is actually exploited.
     torch._dynamo.config.cache_size_limit = 256
     torch._dynamo.config.accumulated_cache_size_limit = 1024
-
-    import lm_eval
-    from lm_eval.models.huggingface import HFLM
 
     config = OmegaConf.load(args.cfg)
     cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
@@ -165,6 +445,27 @@ def main():
     else:
         sel = []
 
+    for prm in model.parameters():
+        prm.requires_grad_(False)
+    use_sdpa_sliding_window(True)
+
+    causality = None
+    if getattr(model.config, 'ttt_share_groups', None):
+        from test_causality import assert_causal
+        chunk = model.config.lact_chunk_size
+        generator = torch.Generator(device=model.device).manual_seed(0)
+        probe = torch.randint(model.config.vocab_size, (1, 3 * chunk),
+                              device=model.device, generator=generator)
+        causality = assert_causal(model, probe, chunk)
+        print('Shared-memory causality tripwire: passed')
+
+    if args.retrieval:
+        with torch.no_grad():
+            run_retrieval(args, model, model_config, config, mods)
+        return
+
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
 
     eval_len = int(config.model.max_length)
     print(f'eval context length {eval_len} '
@@ -176,19 +477,6 @@ def main():
     if args.num_fewshot is not None:
         kwargs['num_fewshot'] = args.num_fewshot
 
-    for prm in model.parameters():
-        prm.requires_grad_(False)
-
-    use_sdpa_sliding_window(True)
-    causality = None
-    if getattr(model.config, 'ttt_share_groups', None):
-        from test_causality import assert_causal
-        chunk = model.config.lact_chunk_size
-        generator = torch.Generator(device=model.device).manual_seed(0)
-        probe = torch.randint(model.config.vocab_size, (1, 3 * chunk),
-                              device=model.device, generator=generator)
-        causality = assert_causal(model, probe, chunk)
-        print('Shared-memory causality tripwire: passed')
     model.config.use_cache = True
     if getattr(model, 'generation_config', None) is not None:
         model.generation_config.use_cache = True
