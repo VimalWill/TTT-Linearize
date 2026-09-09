@@ -185,14 +185,45 @@ class DefaultTrainer():
                 print('-> Returning most recent model instead')
         return model            
     
+    def _optimizer_step(self, accumulated_batches, accumulation_steps):
+        """Normalize an accumulation window, check/clip gradients, then update."""
+        params = [p for group in self.optimizer.param_groups for p in group['params']
+                  if p.grad is not None]
+        if not params:
+            return False
+        # Each loss was divided by accumulation_steps before backward. A short
+        # final window must instead average over the batches actually present.
+        if accumulated_batches != accumulation_steps:
+            scale = accumulation_steps / accumulated_batches
+            for param in params:
+                param.grad.mul_(scale)
+        max_norm = self.args.max_grad_norm
+        norm = torch.nn.utils.clip_grad_norm_(
+            params, max_norm if max_norm is not None and max_norm > 0 else float('inf'),
+        )
+        if not torch.isfinite(norm):
+            print('\n-> Nonfinite gradient norm, skipping accumulated update')
+            self.optimizer.zero_grad()
+            return False
+        self.optimizer.step()
+        if not self.scheduler_step_after_epoch and self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad()
+        self.grad_step += 1
+        return True
+
     def train_step(self, model, epoch) -> nn.Module:
         if self.gradient_accumulation_steps is None:
             accum_iter = 1
         else:
             accum_iter = self.gradient_accumulation_steps
+        if not isinstance(accum_iter, int) or isinstance(accum_iter, bool) or accum_iter < 1:
+            raise ValueError('gradient_accumulation_steps must be a positive integer')
 
         model.train()
         model.zero_grad()        
+        accumulated_batches = 0
+        num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, leave=False, colour='blue', desc=f'-> Training (epoch {epoch} / {self.args.num_train_epochs})')
         total_loss = 0
         eval_for_step = False
@@ -214,9 +245,10 @@ class DefaultTrainer():
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f'\n-> NaN/Inf loss at step {ix}, skipping batch')
                 self.optimizer.zero_grad()
+                accumulated_batches = 0
                 self.step += 1
                 continue
-            loss /= accum_iter
+            loss = loss / accum_iter
             if not self.compute_loss_backprop:
                 # loss.backward() did not occur in compute_loss
                 try:
@@ -224,14 +256,13 @@ class DefaultTrainer():
                 except Exception as e:
                     print(f'\n-> Backward error at step {ix}: {e}, skipping')
                     self.optimizer.zero_grad()
+                    accumulated_batches = 0
                     self.step += 1
                     continue
-            if (self.step + 1) % accum_iter == 0:  # and self.step != 0:
-                self.optimizer.step()
-                if not self.scheduler_step_after_epoch and self.scheduler is not None:
-                    self.scheduler.step()
-                self.optimizer.zero_grad()
-                self.grad_step += 1
+            accumulated_batches += 1
+            if accumulated_batches == accum_iter or ix + 1 == num_batches:
+                self._optimizer_step(accumulated_batches, accum_iter)
+                accumulated_batches = 0
                 if not self.compute_loss_backprop:
                     loss = loss.detach().cpu().item()
             
