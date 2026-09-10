@@ -47,8 +47,14 @@ model:
 train:
   optim: 'adamw_torch'
   lr: 0.0001
-  # Half the per-layer budget (ttt_ar_l2.yml runs 2), so any win is a lower bound.
-  epochs: 1
+  # Matched to ttt_ar_l2.yml. Was 1 -- half the per-layer budget -- which made a
+  # win a lower bound but left the epoch count as a confound the other way, and
+  # left the inner-loop projections (lr/retention/momentum) undertrained. Those
+  # set the SIZE of each test-time update, so miscalibration shows up only where
+  # the update loop runs AND the distribution differs from training: WikiText
+  # 26.90 vs the per-layer arm's 10.19, while commonsense (seqs < chunk, no
+  # updates) and PG19 (in-domain) both won.
+  epochs: 2
   max_grad_norm: 1.0
   gradient_checkpointing: True
   # ~209 gradient steps for 200 books @ 8192
