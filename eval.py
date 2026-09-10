@@ -305,6 +305,19 @@ def run_retrieval(args, model, model_config, config, mods):
         print(f'  -{br:<4} ' + '  '.join(
             f'{n} {whole[br][n]:6.3f} ({whole[br][n] - base[n]:+6.3f})' for n in names))
 
+    group = {}
+    if args.group:
+        bad = [i for i in args.group if not 0 <= i < len(mods)]
+        if bad:
+            raise SystemExit(f'--group layer(s) out of range for {len(mods)} layers: {bad}')
+        print(f'\ngrouped ablation, layers {args.group[0]}-{args.group[-1]} '
+              f'({len(args.group)} layers) together')
+        for br in branches:
+            with ablate([mods[i] for i in args.group], br):
+                group[br] = run()[0]
+            print(f'  -{br:<4} ' + '  '.join(
+                f'{n} {group[br][n]:6.3f} ({group[br][n] - base[n]:+6.3f})' for n in names))
+
     rows = []
     for br in branches:
         print(f'\nper-layer, ablating {br}   (paired dCE +- SE over {len(seqs)} sequences)')
@@ -338,6 +351,11 @@ def run_retrieval(args, model, model_config, config, mods):
         # `whole_-ttt` at a full-length window IS the clean attention reference.
         for br, ce in whole.items():
             f.write(f'whole_-{br},-2,,'
+                    + ','.join(f'{ce[n]:.5f},' for n in names) + '\n')
+        # layer -4, ABSOLUTE CE like the whole-branch rows. This is the only
+        # row that measures a shared memory rather than one layer's readout.
+        for br, ce in group.items():
+            f.write(f'group_-{br},-4,,'
                     + ','.join(f'{ce[n]:.5f},' for n in names) + '\n')
         for br, li, g, d, se in rows:
             f.write(f'{br},{li},{g:.5f},'
@@ -397,9 +415,12 @@ def main():
                     default=[512, 2048, 8192, 16384],
                     help='retrieval: distance bucket upper edges; +inf appended')
     ap.add_argument('--seq-len', type=int, default=None,
-                    help='retrieval: override context length. Run at the TRAINED '
-                         'length -- past it both shared and per-layer decay, so a '
-                         'longer sweep measures extrapolation, not retrieval')
+                    help='override eval context length, both paths. REQUIRED for '
+                         'a long-context suite: config max_length is 8192, so '
+                         'without this RULER at 32k silently truncates to 8k. '
+                         'Retrieval: run at the TRAINED length -- past it both '
+                         'shared and per-layer decay, so a longer sweep measures '
+                         'extrapolation, not retrieval')
     ap.add_argument('--data-path', default=None,
                     help='retrieval: override corpus (default is the TRAINING corpus)')
     ap.add_argument('--data-name', default=None)
@@ -407,6 +428,14 @@ def main():
                     help='retrieval: sequences per forward')
     ap.add_argument('--branch', choices=['ttt', 'attn', 'both'], default='both',
                     help='retrieval: which branch(es) to ablate per layer')
+    ap.add_argument('--group', type=int, nargs='+', default=None,
+                    help='retrieval: ALSO ablate these layers together, as one '
+                         'extra row. Required to measure a shared memory: '
+                         'ablating one reader leaves the memory intact -- the '
+                         'writer still writes and every other reader still '
+                         'reads -- so per-layer rows measure a single readout, '
+                         'never the group. Only with every member off is the '
+                         "group's contribution to the residual stream zero.")
     args = ap.parse_args()
 
     # Fail before a multi-minute checkpoint load, not after.
@@ -467,9 +496,13 @@ def main():
     import lm_eval
     from lm_eval.models.huggingface import HFLM
 
-    eval_len = int(config.model.max_length)
-    print(f'eval context length {eval_len} '
-          f'(config max_position_embeddings {model_config.max_position_embeddings})')
+    eval_len = int(args.seq_len or config.model.max_length)
+    if eval_len > model_config.max_position_embeddings:
+        raise SystemExit(f'--seq-len {eval_len} exceeds the model\'s '
+                         f'max_position_embeddings {model_config.max_position_embeddings}')
+    print(f'eval context length {eval_len}'
+          + (' (--seq-len override)' if args.seq_len else ' (from config.model.max_length)')
+          + f'; model max_position_embeddings {model_config.max_position_embeddings}')
     lm = HFLM(pretrained=model, tokenizer=args.base,
               batch_size=args.batch_size, max_length=eval_len)
 
