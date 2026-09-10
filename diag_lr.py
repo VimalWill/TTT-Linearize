@@ -37,24 +37,34 @@ def stats(x):
 
 @torch.no_grad()
 def probe(model, mods, ids):
-    """-> {layer: (lr_stats, ret_stats)} for one batch."""
+    """-> {layer: {'lr': stats, 'ret': stats}} for one batch.
+
+    lr is recomputed from the layer's INPUT rather than hooked on lr_proj: the
+    forward bypasses the module (`F.linear(h.float(), lr_proj.weight.float(),
+    ...)` inside an autocast-disabled block), so a forward hook on lr_proj never
+    fires. A pre-hook on the attention module sees exactly the tensor the
+    forward uses -- post-input_layernorm hidden states.
+
+    Reader layers are measured too, but their lr never reaches the memory: they
+    run no inner loop. Only the writer's row is causal for the shared state.
+    """
     acc = {}
     hooks = []
 
-    def mk(i, kind):
-        def fn(mod, inp, out):
-            if kind == 'lr':
-                # mirror the forward exactly: softplus AFTER the bias shift
-                v = F.softplus(out.float() + mods[i].base_lr_inv)
-            else:
-                v = out.float()          # retention_proj ends in Sigmoid
-            acc.setdefault(i, {})[kind] = stats(v)
+    def mk(i):
+        def fn(mod, args, kwargs):
+            h = args[0] if args else kwargs.get('hidden_states')
+            if h is None:
+                return
+            lr = F.linear(h.float(), mod.lr_proj.weight.float(),
+                          mod.lr_proj.bias.float())
+            acc.setdefault(i, {})['lr'] = stats(F.softplus(lr + mod.base_lr_inv))
+            if hasattr(mod, 'retention_proj'):
+                acc[i]['ret'] = stats(mod.retention_proj(h).float())
         return fn
 
     for i, m in enumerate(mods):
-        hooks.append(m.lr_proj.register_forward_hook(mk(i, 'lr')))
-        if hasattr(m, 'retention_proj'):
-            hooks.append(m.retention_proj.register_forward_hook(mk(i, 'ret')))
+        hooks.append(m.register_forward_pre_hook(mk(i), with_kwargs=True))
     model(input_ids=ids.to(model.device), use_cache=False)
     for h in hooks:
         h.remove()
@@ -101,18 +111,19 @@ def main():
 
     print(f'\n{"":6}{"":9}{"--------- in-domain ---------":>30}'
           f'{"--------- wikitext ----------":>30}{"":>10}')
-    print(f'{"layer":>6}{"role":>9}' + ''.join(f'{h:>7}' for h in
+    print(f'{"layer":>6} {"role":>13}' + ''.join(f'{h:>7}' for h in
           ('mean', 'p50', 'p99', 'max')) * 2 + f'{"p99 x":>10}')
     worst = []
     for i in sorted(a):
-        role = ('writer' if i in writers else 'reader') if groups else 'private'
+        role = ('writer' if i in writers
+                else 'reader' if i in readers else 'private')
         for kind in ('lr', 'ret'):
             if kind not in a[i]:
                 continue
             x, y = a[i][kind], b[i][kind]
             ratio = y[2] / x[2] if x[2] else float('nan')
             tag = f'{role}/{kind}'
-            print(f'{i:>6}{tag:>9}' + ''.join(f'{v:>7.3f}' for v in x)
+            print(f'{i:>6} {tag:>13}' + ''.join(f'{v:>7.3f}' for v in x)
                   + ''.join(f'{v:>7.3f}' for v in y) + f'{ratio:>10.2f}')
             if kind == 'lr':
                 worst.append((ratio, i, role))
