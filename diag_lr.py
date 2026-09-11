@@ -7,30 +7,26 @@ training corpus; on another corpus the hidden states shift and lr can run hot.
 Under Muon that matters doubly -- Newton-Schulz discards the update's magnitude
 and eta is reapplied afterwards, so lr alone sets how hard each chunk is written.
 
-That predicts exactly the observed pattern: invisible on short sequences (the
-update loop never runs), fine in-domain (calibrated), bad out-of-domain.
+LR miscalibration is one hypothesis for degradation after chunk updates;
+these statistics alone do not establish its effect on language-model loss.
 
-    python diag_lr.py --cfg Configs/ttt_ar_unified.yml --ckpt BASE --adapter ADAPTER
+    python diag_lr.py --cfg configs/ttt_ar_unified.yml --ckpt BASE --adapter ADAPTER
 
 Prints per-layer lr and retention stats on the training corpus vs wikitext.
-In a shared model only the WRITER's values reach the memory -- readers run no
-inner loop -- so the writer row is the one that matters.
+Shared writers and private-memory layers update memory. Reader projections are
+hypothetical: readers run no inner loop and do not apply their LR or retention.
 """
 import argparse
 
 import torch
 import torch.nn.functional as F
-from omegaconf import OmegaConf
-from transformers import AutoTokenizer
-
-import LinearTTT  # noqa: F401
-from Training.train import build_model_config
-from eval import load_model, ttt_layers
 
 
 def stats(x):
     x = x.flatten().float()
-    q = torch.quantile(x[torch.randperm(x.numel())[:200_000]],
+    sample = x if x.numel() <= 200_000 else x[
+        torch.linspace(0, x.numel() - 1, 200_000, device=x.device).long()]
+    q = torch.quantile(sample,
                        torch.tensor([.5, .99], device=x.device))
     return x.mean().item(), q[0].item(), q[1].item(), x.max().item()
 
@@ -56,22 +52,34 @@ def probe(model, mods, ids):
             h = args[0] if args else kwargs.get('hidden_states')
             if h is None:
                 return
-            lr = F.linear(h.float(), mod.lr_proj.weight.float(),
-                          mod.lr_proj.bias.float())
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                lr = F.linear(h.float(), mod.lr_proj.weight.float(),
+                              mod.lr_proj.bias.float())
             acc.setdefault(i, {})['lr'] = stats(F.softplus(lr + mod.base_lr_inv))
             if hasattr(mod, 'retention_proj'):
                 acc[i]['ret'] = stats(mod.retention_proj(h).float())
         return fn
 
-    for i, m in enumerate(mods):
-        hooks.append(m.register_forward_pre_hook(mk(i), with_kwargs=True))
-    model(input_ids=ids.to(model.device), use_cache=False)
-    for h in hooks:
-        h.remove()
+    try:
+        for m in mods:
+            hooks.append(m.register_forward_pre_hook(mk(m.layer_idx), with_kwargs=True))
+        model(input_ids=ids.to(model.device), use_cache=False)
+    finally:
+        for h in hooks:
+            h.remove()
+    missing = [m.layer_idx for m in mods if 'lr' not in acc.get(m.layer_idx, {})]
+    if missing:
+        raise RuntimeError(f'No LR observations for layers {missing}')
     return acc
 
 
 def main():
+    from omegaconf import OmegaConf
+    from transformers import AutoTokenizer
+    import LinearTTT  # noqa: F401
+    from Training.train import build_model_config
+    from eval import load_model, ttt_layers
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--cfg', required=True)
     ap.add_argument('--ckpt', required=True)
@@ -92,7 +100,7 @@ def main():
     readers = {i for g in groups for i in g} - writers
     if groups:
         print(f'shared: writer(s) {sorted(writers)}, {len(readers)} readers '
-              '(readers run NO inner loop -- their lr never reaches the memory)')
+              '(reader lr/ret are hypothetical; private layers update their own memory)')
 
     # ---- in-domain batch, straight from the training loader ----
     from Training.dataloader import load_data
@@ -125,16 +133,17 @@ def main():
             tag = f'{role}/{kind}'
             print(f'{i:>6} {tag:>13}' + ''.join(f'{v:>7.3f}' for v in x)
                   + ''.join(f'{v:>7.3f}' for v in y) + f'{ratio:>10.2f}')
-            if kind == 'lr':
+            if kind == 'lr' and role != 'reader':
                 worst.append((ratio, i, role))
-    print('\np99 x  = wikitext p99 / in-domain p99. >1 means the memory is '
-          'written harder off-distribution.')
+    print('\np99 x = wikitext p99 / in-domain p99. For lr, >1 means higher '
+          'token LR p99; for ret, >1 means higher retention p99. '
+          'Neither alone establishes the cause of degradation.')
     worst.sort(reverse=True)
-    print('largest lr inflation: ' + ', '.join(
+    print('largest active-memory lr inflation: ' + ', '.join(
         f'L{i}({r:.2f}, {ro})' for r, i, ro in worst[:5]))
     if groups:
         w = [(r, i) for r, i, ro in worst if ro == 'writer']
-        print(f'WRITER lr inflation (the only one that reaches the memory): '
+        print(f'SHARED WRITER lr inflation: '
               + ', '.join(f'L{i}: {r:.2f}x' for r, i in w))
 
 
