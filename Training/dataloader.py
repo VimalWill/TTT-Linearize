@@ -86,6 +86,30 @@ def load_data(config):
         val_set = _take("validation", n_val_docs)
         test_set = _take("test", n_val_docs)
         cols = list(train_set.features)
+    elif "wikitext" in data_name.lower():
+        # WikiText rows are single LINES, not documents, so the pg19 branch is
+        # wrong for it three ways: it shuffles rows (scrambling articles, which
+        # destroys the long-range repeats the AR slices measure), it takes
+        # num_val_docs ROWS (a few hundred tokens), and the formatter adds
+        # BOS/EOS per row (a spurious repeated bigram on every line). Stream the
+        # lines IN ORDER and pack one contiguous prefix instead. data_name
+        # doubles as the HF config, e.g. wikitext-103-raw-v1.
+        # Default split is train: val/test hold ~8 sequences at 32k, and the
+        # model never trained on WikiText, so train is held out for it.
+        formatter = partial(template_and_tokenize_lm, tokenizer=tokenizer)
+        split = config.data.get("wikitext_split", "train")
+        # ~4.5 chars/token for Llama-3 on English; 5 leaves headroom
+        budget = int(input_len) * int(config.data.get("num_val_seqs", 64)) * 5
+
+        lines, total = [], 0
+        for row in load_dataset(data_path, data_name, split=split, streaming=True):
+            lines.append(row["text"])
+            total += len(row["text"])
+            if total >= budget:
+                break
+        val_set = convert_to_hf_dataset([{"text": "".join(lines)}], cache_dir)
+        train_set = test_set = val_set
+        cols = list(val_set.features)
     elif "longbench" in data_name.lower():
         formatter = partial(template_and_tokenize_longbench, tokenizer=tokenizer)
         # Load each task's JSONL directly (THUDM/LongBench uses a loading script not supported)

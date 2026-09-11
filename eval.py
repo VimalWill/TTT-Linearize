@@ -249,6 +249,8 @@ def run_retrieval(args, model, model_config, config, mods):
         cfg.data.path = args.data_path
     if args.data_name:
         cfg.data.name = args.data_name
+    # 2x headroom: the loader budgets characters, not tokens
+    cfg.data.num_val_seqs = 2 * args.seqs
     if not (args.data_path or args.data_name):
         print(f'corpus: {cfg.data.path} -- NOTE this is the training corpus; '
               'pass --data-path for a number comparable to published AR-slice')
