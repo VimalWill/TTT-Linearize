@@ -657,6 +657,9 @@ class LinearTTTAttention(nn.Module):
             raise RuntimeError('TTT state observation requires eval mode and l2 memory')
         if collect_trajectory:
             ttt_kwargs['return_trajectory'] = True
+        capture_decay = observer is not None and getattr(observer, 'capture_decay', False)
+        if capture_decay:
+            ttt_kwargs['return_decay'] = True
 
         if use_cache:
             if self.ttt_inner_loss != 'l2':
@@ -678,6 +681,11 @@ class LinearTTTAttention(nn.Module):
             momentum=momentum,
             **ttt_kwargs,
         )
+        if capture_decay:
+            # The diagnostic receives the multipliers actually applied inside
+            # the operator, including its reduction dtype and rounding.
+            decay = ttt_out[-1]
+            ttt_out = ttt_out[:-1]
         nmom = None
         traj = None
         if use_cache and collect_trajectory:
@@ -687,7 +695,10 @@ class LinearTTTAttention(nn.Module):
         elif collect_trajectory:
             ttt_out, nw0, nw1, nw2, traj = ttt_out
         if observer is not None:
-            observer(self, traj)
+            if capture_decay:
+                observer(self, traj, decay)
+            else:
+                observer(self, traj)
         if not shared:
             traj = None
         if use_cache:

@@ -63,8 +63,58 @@ def observe_states(mods, callback):
                 m._ttt_state_observer = old
 
 
+def trajectory_components(layer, trajectory, chunks, components, decay=None):
+    """CPU snapshots at state c: adaptation E_c and the preceding write U_{c-1}.
+
+    Subtract in float64 to reduce diagnostic cancellation, then perform SVD in
+    float32. The states themselves retain the operator's finite-precision error.
+    """
+    components = tuple(dict.fromkeys(components))
+    if not components or set(components) - {'state', 'adaptation', 'update'}:
+        raise ValueError('Unknown or empty state components')
+    available, heads = trajectory[0].shape[:2]
+    selected = sorted(set(c for c in chunks if 0 <= c < available))
+    need_decay = any(c != 'state' for c in components)
+    if need_decay:
+        if decay is None or tuple(decay.shape) != (available - 1, heads, 1, 1):
+            raise ValueError('Expected one applied per-head decay per transition')
+        alpha = decay.detach().double().cpu()
+        if not torch.isfinite(alpha).all() or (alpha < 0).any() or (alpha > 1).any():
+            raise ValueError('Retention multipliers must be finite and in [0, 1]')
+        accumulated = torch.cat([torch.ones(1, heads, 1, 1, dtype=torch.float64),
+                                 alpha.cumprod(0)], dim=0)
+    needed = sorted(set([0, *selected, *[c - 1 for c in selected if c > 0 and 'update' in components]]))
+    positions = {c: i for i, c in enumerate(needed)}
+    for name, states in zip(('w0', 'w1', 'w2'), trajectory):
+        copied = states.detach().index_select(
+            0, torch.tensor(needed, device=states.device)).float().cpu()
+        initial = copied[positions[0]].double()
+        for chunk in selected:
+            current = copied[positions[chunk]]
+            reference_norms = torch.linalg.vector_norm(current.double(), dim=(-2, -1))
+            for component in components:
+                if component == 'state':
+                    value = current
+                elif component == 'adaptation':
+                    value = (current.double() - accumulated[chunk] * initial).float()
+                else:
+                    if chunk == 0:
+                        continue  # no write has occurred before state 0
+                    previous = copied[positions[chunk - 1]].double()
+                    value = (current.double() - alpha[chunk - 1] * previous).float()
+                yield {
+                    'layer': layer.layer_idx,
+                    'role': 'private' if layer._share_gid is None else 'shared_writer',
+                    'matrix': name, 'chunk': chunk, 'component': component,
+                    'write_chunk': chunk - 1 if component == 'update' else None,
+                    'tokens_written': chunk * layer.lact_chunk_size,
+                    'chunk_size': layer.lact_chunk_size,
+                    'states': value, '_reference_norms': reference_norms,
+                }
+
+
 @torch.no_grad()
-def collect_states(model, mods, ids, chunks):
+def collect_states(model, mods, ids, chunks, components=('state',)):
     """One sequence -> detached CPU snapshots. No SVD inside model forward."""
     if ids.ndim != 2 or ids.shape[0] != 1:
         raise ValueError('Probe one [1, sequence_length] sequence at a time')
@@ -73,23 +123,11 @@ def collect_states(model, mods, ids, chunks):
     snapshots = []
     seen = set()
 
-    def capture(layer, trajectory):
+    def capture(layer, trajectory, decay=None):
         seen.add(layer.layer_idx)
-        available = trajectory[0].shape[0]
-        selected = sorted(set(c for c in chunks if c < available))
-        for name, states in zip(('w0', 'w1', 'w2'), trajectory):
-            # index_select allocates independent storage before CPU transfer.
-            copied = states.detach().index_select(
-                0, torch.tensor(selected, device=states.device)).float().cpu()
-            for position, chunk in enumerate(selected):
-                snapshots.append({
-                    'layer': layer.layer_idx,
-                    'role': 'private' if layer._share_gid is None else 'shared_writer',
-                    'matrix': name, 'chunk': chunk,
-                    'tokens_written': chunk * layer.lact_chunk_size,
-                    'chunk_size': layer.lact_chunk_size,
-                    'states': copied[position],
-                })
+        snapshots.extend(trajectory_components(layer, trajectory, chunks, components, decay))
+
+    capture.capture_decay = any(c != 'state' for c in components)
 
     with observe_states(mods, capture) as owners:
         device = next(model.parameters()).device
@@ -108,11 +146,15 @@ def rank_records(snapshots, corpus, sequence, svd_device):
                              f'layer {snapshot["layer"]}, {snapshot["matrix"]}')
         singular = torch.linalg.svdvals(matrices.to(svd_device)).cpu()
         for head, values in enumerate(singular):
-            yield {**{k: v for k, v in snapshot.items() if k != 'states'},
+            metrics = spectrum_stats(values)
+            reference = float(snapshot['_reference_norms'][head])
+            yield {**{k: v for k, v in snapshot.items() if k not in ('states', '_reference_norms')},
                    'corpus': corpus, 'sequence': sequence, 'head': head,
                    'rows': matrices.shape[-2], 'cols': matrices.shape[-1],
                    'rank_ceiling': min(matrices.shape[-2:]),
-                   **spectrum_stats(values), 'singular_values': values.tolist()}
+                   'state_frobenius_norm': reference,
+                   'relative_to_state_norm': metrics['frobenius_norm'] / reference if reference else None,
+                   **metrics, 'singular_values': values.tolist()}
 
 
 def split_tokens(tokens, seq_len, count):
@@ -178,14 +220,17 @@ def checkpoint_files(directory):
 def summarize(rows):
     grouped = defaultdict(list)
     for row in rows:
-        grouped[(row['corpus'], row['layer'], row['matrix'], row['chunk'])].append(row)
+        grouped[(row['corpus'], row.get('component', 'state'), row['layer'], row['matrix'], row['chunk'])].append(row)
     summary = []
-    for (corpus, layer, matrix, chunk), group in sorted(grouped.items()):
+    for (corpus, component, layer, matrix, chunk), group in sorted(grouped.items()):
         item = {'corpus': corpus, 'layer': layer, 'matrix': matrix, 'chunk': chunk,
+                'component': component,
+                'write_chunk': chunk - 1 if component == 'update' else None,
                 'role': group[0]['role'], 'rank_ceiling': group[0]['rank_ceiling'],
                 'n_sequences': len({r['sequence'] for r in group}), 'n_observations': len(group)}
-        for metric in ('r90', 'r95', 'r99', 'stable_rank', 'frobenius_norm'):
-            values = torch.tensor([r[metric] for r in group if r[metric] is not None],
+        for metric in ('r90', 'r95', 'r99', 'stable_rank', 'frobenius_norm',
+                       'state_frobenius_norm', 'relative_to_state_norm'):
+            values = torch.tensor([r[metric] for r in group if r.get(metric) is not None],
                                   dtype=torch.float64)
             item[metric] = ({'mean': values.mean().item(), 'median': torch.quantile(values, .5).item(),
                              'p90': torch.quantile(values, .9).item(), 'max': values.max().item()}
@@ -200,12 +245,13 @@ def plot_heatmaps(summary, out):
     import matplotlib.pyplot as plt
     import numpy as np
 
-    for corpus in sorted({row['corpus'] for row in summary}):
+    for corpus, component in sorted({(row['corpus'], row.get('component', 'state')) for row in summary}):
+        component_rows = [r for r in summary if r['corpus'] == corpus and r.get('component', 'state') == component]
         for metric in ('r95', 'r99'):
             fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-            ceiling = max(r['rank_ceiling'] for r in summary if r['corpus'] == corpus)
+            ceiling = max(r['rank_ceiling'] for r in component_rows)
             for ax, matrix in zip(axes, ('w0', 'w1', 'w2')):
-                cells = [r for r in summary if r['corpus'] == corpus and r['matrix'] == matrix]
+                cells = [r for r in component_rows if r['matrix'] == matrix]
                 layers = sorted({r['layer'] for r in cells})
                 chunks = sorted({r['chunk'] for r in cells})
                 grid = np.full((len(layers), len(chunks)), np.nan)
@@ -214,12 +260,15 @@ def plot_heatmaps(summary, out):
                 im = ax.imshow(grid, vmin=0, vmax=ceiling, aspect='auto', cmap='viridis')
                 ax.set_xticks(range(len(chunks)), chunks)
                 ax.set_yticks(range(len(layers)), [f'L{x}' for x in layers])
-                ax.set_xlabel('Chunk index (0 = learned initialization)')
+                ax.set_xlabel('State index c (after c updates)')
                 ax.set_title(matrix)
             fig.colorbar(im, ax=axes, label=f'Mean {metric} across sequences and heads')
-            fig.suptitle(f'{corpus}: full-state energy rank')
-            fig.savefig(out / f'{corpus}_{metric}.png', dpi=180)
-            fig.savefig(out / f'{corpus}_{metric}.pdf')
+            title = {'state': 'full state', 'adaptation': 'accumulated adaptation',
+                     'update': 'preceding write U[c-1]'}[component]
+            fig.suptitle(f'{corpus}: {title} energy rank')
+            stem = f'{corpus}_{metric}' if component == 'state' else f'{corpus}_{component}_{metric}'
+            fig.savefig(out / f'{stem}.png', dpi=180)
+            fig.savefig(out / f'{stem}.pdf')
             plt.close(fig)
 
 
@@ -234,6 +283,8 @@ def main():
     ap.add_argument('--seq-len', type=int, default=8192)
     ap.add_argument('--seqs', type=int, default=8)
     ap.add_argument('--chunks', type=int, nargs='+', default=[0, 1, 2, 4, 8, 15])
+    ap.add_argument('--components', nargs='+', choices=['state', 'adaptation', 'update'],
+                    default=['state'], help='full state, accumulated writes, or preceding chunk write')
     ap.add_argument('--svd-device', choices=['cpu', 'cuda'], default='cuda')
     ap.add_argument('--tokens-file', help='reuse tokens.pt from a previous probe')
     ap.add_argument('--no-plots', action='store_true')
@@ -263,9 +314,10 @@ def main():
     available = math.ceil(args.seq_len / model_config.lact_chunk_size)
     skipped = [c for c in chunks if c >= available]
     chunks = [c for c in chunks if c < available]
+    if set(args.components) == {'update'} and not any(c > 0 for c in chunks):
+        ap.error('No applied updates at the selected states; include a state index greater than 0')
     if skipped:
         print(f'Skipping unavailable chunk indices {skipped}; last read state is {available - 1}')
-    tokenizer = AutoTokenizer.from_pretrained(args.base)
     if args.tokens_file:
         saved = torch.load(args.tokens_file, map_location='cpu', weights_only=True)
         if saved['tokenizer'] != args.base:
@@ -273,6 +325,7 @@ def main():
         corpora = {name: saved['corpora'][name] for name in dict.fromkeys(args.corpora)}
         sources = {name: saved['sources'][name] for name in corpora}
     else:
+        tokenizer = AutoTokenizer.from_pretrained(args.base)
         corpora, sources = load_corpora(args, tokenizer)
     validate_tokens(corpora, args.seq_len, args.seqs, model_config.vocab_size)
     torch.save({'tokenizer': args.base, 'corpora': corpora, 'sources': sources}, out / 'tokens.pt')
@@ -283,7 +336,12 @@ def main():
                 'model_config': model_config.to_dict(), 'checkpoint_files': identity,
                 'complete': False,
                 'torch_version': str(torch.__version__),
-                'interpretation': 'Ranks of full per-head W0/W1/W2 states; no compression applied',
+                'interpretation': 'Per-head state components; no compression applied',
+                'component_definitions': {
+                    'state': 'W[c], the weights used to read chunk c',
+                    'adaptation': 'W[c] - prod(alpha[:c]) * W[0]',
+                    'update': 'W[c] - alpha[c-1] * W[c-1], for c >= 1'},
+                'subtraction': 'float64 from actual finite-precision states and operator decay; SVD float32',
                 'token_hashes': {name: hashlib.sha256(ids.numpy().tobytes()).hexdigest()
                                  for name, ids in corpora.items()}}
     source_root = Path(__file__).resolve().parent
@@ -310,7 +368,7 @@ def main():
         for corpus, sequences in corpora.items():
             for sequence, ids in enumerate(sequences):
                 print(f'{corpus}: sequence {sequence + 1}/{len(sequences)} — collecting states', flush=True)
-                snapshots = collect_states(backbone, mods, ids.unsqueeze(0), chunks)
+                snapshots = collect_states(backbone, mods, ids.unsqueeze(0), chunks, args.components)
                 for record in rank_records(snapshots, corpus, sequence, args.svd_device):
                     spectra.write(json.dumps(record, allow_nan=False) + '\n')
                     row = {k: v for k, v in record.items() if k != 'singular_values'}

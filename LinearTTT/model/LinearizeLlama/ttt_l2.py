@@ -68,6 +68,7 @@ def block_causal_lact_swiglu_l2(
     init_momentum: tuple = None,
     return_momentum: bool = False,
     return_trajectory: bool = False,
+    return_decay: bool = False,
 ):
     """Drop-in replacement for `block_causal_lact_swiglu` with the l2 bias.
 
@@ -87,6 +88,9 @@ def block_causal_lact_swiglu_l2(
     this memory must read -- the final state saw the whole sequence and handing
     it to another layer leaks the future. n_blocks = one per applied chunk plus
     one for the tail, and block c serves positions [c*chunk_size, ...).
+    `return_decay` appends the exact per-head retention multipliers applied by
+    this operator, [n_updates, batch*heads, 1, 1], for inference diagnostics.
+    It excludes the final read-only chunk.
     """
     if chunk_size < 1 or k.shape[1] < 1:
         raise ValueError('chunk_size and sequence length must be positive')
@@ -106,6 +110,7 @@ def block_causal_lact_swiglu_l2(
 
     output = torch.zeros_like(v)
     traj0, traj1, traj2 = [], [], []
+    decays = []
 
     e_index = 0
     seq_len = k.shape[1]
@@ -158,10 +163,14 @@ def block_causal_lact_swiglu_l2(
         # Atlas Eq. 32: multiplicative decay in place of Eq. 8's projection.
         if retention is not None:
             a_i = retention[:, s_index:e_index, :].mean(dim=1, keepdim=True)
+            if return_decay:
+                decays.append(a_i)
             w0 = w0 * a_i + dw0
             w1 = w1 * a_i + dw1
             w2 = w2 * a_i + dw2
         else:
+            if return_decay:
+                decays.append(w0.new_ones((w0.shape[0], 1, 1)))
             w0 = w0 + dw0
             w1 = w1 + dw1
             w2 = w2 + dw2
@@ -183,13 +192,15 @@ def block_causal_lact_swiglu_l2(
         mom = ((dw0_momentum, dw1_momentum, dw2_momentum)
                if momentum is not None else None)
         ret = (out, w0, w1, w2, mom)
-    elif return_state or return_trajectory:
+    elif return_state or return_trajectory or return_decay:
         ret = (out, w0, w1, w2)
     else:
         return out
     if return_trajectory:
         ret = ret + ((torch.stack(traj0), torch.stack(traj1),
                       torch.stack(traj2)),)
+    if return_decay:
+        ret = ret + (torch.stack(decays) if decays else w0.new_empty((0, w0.shape[0], 1, 1)),)
     return ret
 
 

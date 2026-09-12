@@ -1,8 +1,9 @@
 # Low-rank estimation of TTT memory states
 
-Status: the full-state spectral pilot is implemented in `diag_rank.py`.
-Update/adaptation spectra and compression interventions below remain follow-up
-experiments. Checkpoint weights are unchanged by observation.
+Status: full-state, applied-write and accumulated-adaptation spectra are
+implemented in `diag_rank.py`. Raw-gradient/momentum spectra and compression
+interventions below remain follow-up experiments. Checkpoint weights are
+unchanged by observation.
 
 ## Running the first pilot
 
@@ -45,6 +46,46 @@ Default SVD runs on CUDA in float32; `--svd-device cpu` moves SVD to CPU while
 model evaluation still uses CUDA. `--no-plots` skips Matplotlib. The output
 directory must be new to prevent mixing different experiments. These validation
 prefixes are a spectral pilot, not the full lm-eval WikiText test protocol.
+
+## Running the adaptation/write probe
+
+Sync `diag_rank.py`, `LinearTTT/model/LinearizeLlama/LinearizeLlama.py`, and
+`LinearTTT/model/LinearizeLlama/ttt_l2.py` to the cluster. This extension captures
+the retention multipliers actually used inside the compiled update operator.
+Ordinary training and evaluation leave that extra diagnostic output disabled.
+
+Reuse the exact previous pilot sequences and the same fixed checkpoint pair:
+
+```sh
+python diag_rank.py \
+  --cfg configs/ttt_ar_unified.yml \
+  --ckpt /work/nvme/bgly/vwilliam/ttt-checkpoints/ttt_at_unified/best_ckpt \
+  --adapter /work/nvme/bgly/vwilliam/ttt-checkpoints/ttt_ar_unified/best_ckpt \
+  --tokens-file /work/nvme/bgly/vwilliam/ttt-checkpoints/unified_rank_8192/tokens.pt \
+  --corpora pg19 wikitext --seq-len 8192 --seqs 8 \
+  --chunks 0 1 2 4 8 15 --components adaptation update \
+  --out /work/nvme/bgly/vwilliam/ttt-checkpoints/unified_adaptation_rank_8192
+```
+
+The output schema now includes `component` and `write_chunk`. At state index c:
+
+- `state`: W[c], the weights used to read chunk c, after exactly c updates.
+- `adaptation`: W[c] - prod(alpha[:c]) W[0]; identically zero at c=0.
+- `update`: W[c] - alpha[c-1] W[c-1], the write from chunk c-1. There is no
+  update row at c=0. Even when sampled states skip chunks, subtraction uses the
+  immediately preceding state, not the previously sampled state.
+
+The cumulative product and subtractions use float64 on copied CPU states; SVD
+uses float32. Tiny differences can still reflect rounding in the original
+operator. `relative_to_state_norm` and `state_frobenius_norm` quantify component
+size: avoid interpreting rank alone for a negligible component. The update is
+reconstructed from the actual state transition and includes transition rounding;
+it is not the raw gradient or a separately sampled pre-Muon direction.
+
+Outputs retain the same JSON/CSV names. Heatmaps are separated, for example
+`wikitext_adaptation_r95.png` and `wikitext_update_r95.png`. Summaries group by
+component so full states, accumulated adaptation, and individual writes are
+never averaged together. Existing state-only summaries remain plottable.
 
 ## Question and scope
 
