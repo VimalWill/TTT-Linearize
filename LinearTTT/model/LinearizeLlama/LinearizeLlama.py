@@ -648,7 +648,14 @@ class LinearTTTAttention(nn.Module):
         else:
             ttt_op = block_causal_lact_swiglu
 
-        if shared:
+        # Optional inference diagnostic: expose the actual per-chunk states
+        # for private memories as well. The callback runs outside the compiled
+        # operator and is never saved in a checkpoint/config.
+        observer = getattr(self, '_ttt_state_observer', None)
+        collect_trajectory = shared or observer is not None
+        if observer is not None and (self.training or self.ttt_inner_loss != 'l2'):
+            raise RuntimeError('TTT state observation requires eval mode and l2 memory')
+        if collect_trajectory:
             ttt_kwargs['return_trajectory'] = True
 
         if use_cache:
@@ -673,12 +680,16 @@ class LinearTTTAttention(nn.Module):
         )
         nmom = None
         traj = None
-        if use_cache and shared:
+        if use_cache and collect_trajectory:
             ttt_out, nw0, nw1, nw2, nmom, traj = ttt_out
         elif use_cache:
             ttt_out, nw0, nw1, nw2, nmom = ttt_out
-        elif shared:
+        elif collect_trajectory:
             ttt_out, nw0, nw1, nw2, traj = ttt_out
+        if observer is not None:
+            observer(self, traj)
+        if not shared:
+            traj = None
         if use_cache:
             keep = self.window_size + 1
             C = self.lact_chunk_size
