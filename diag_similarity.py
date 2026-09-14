@@ -32,7 +32,7 @@ def initial_readout(layer, projected_queries, output_dtype):
     w0, w1, w2 = (getattr(layer, name).float() for name in ('w0', 'w1', 'w2'))
     with torch.autocast(device_type=qi.device.type, enabled=qi.is_cuda, dtype=torch.bfloat16):
         output = torch.bmm(w1, F.silu(torch.bmm(w0, qi)) * torch.bmm(w2, qi)).transpose(1, 2)
-    return layer.ttt_norm(output.to(output_dtype))
+    return layer.ttt_norm(layer._align_ttt_readout(output.to(output_dtype)))
 
 
 @torch.no_grad()

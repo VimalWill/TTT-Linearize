@@ -49,6 +49,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         # the lowest index writes, the rest read its per-chunk trajectory with
         # their own q. One parameter set and one live state per group.
         ttt_share_groups=None,
+        ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -89,6 +90,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
         self.ttt_share_groups = ttt_share_groups
+        self.ttt_reader_alignment = ttt_reader_alignment
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm
@@ -101,6 +103,8 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
             raise ValueError('lact_chunk_size must be a positive integer')
         groups = self.ttt_share_groups or []
+        if self.ttt_reader_alignment not in ('none', 'linear'):
+            raise ValueError('ttt_reader_alignment must be "none" or "linear"')
         if not isinstance(groups, (list, tuple)):
             raise ValueError('ttt_share_groups must be a list of layer groups')
         if groups and self.ttt_inner_loss != 'l2':
@@ -120,3 +124,5 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
                     raise ValueError('ttt_inter_multi must contain one value per layer')
                 if len({self.ttt_inter_multi[i] for i in group}) != 1:
                     raise ValueError('ttt_inter_multi must match within each shared group')
+        if self.ttt_reader_alignment != 'none' and not any(len(g) > 1 for g in groups):
+            raise ValueError('Reader alignment requires at least one shared-memory reader')

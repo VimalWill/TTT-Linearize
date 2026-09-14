@@ -334,7 +334,8 @@ def run_retrieval(args, model, model_config, config, mods):
             print(f'{li:>5} {gates[li]:>6.3f}'
                   + ''.join(f'{d[n]:>+13.4f}+-{se[n]:5.4f}' for n in names))
 
-    path = f'{args.out}_retrieval.csv'
+    identity_tag = '_identity_readers' if getattr(args, 'identity_readers', False) else ''
+    path = f'{args.out}{identity_tag}_retrieval.csv'
     n_pair = {n: paired(base_ps[n], base_ps[n])[2] for n in names}
     with open(path, 'w') as f:
         f.write('branch,layer,gate,'
@@ -395,6 +396,8 @@ def main():
     ap.add_argument('--cfg', default='Configs/ttt_ar_l2.yml')
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--adapter', default=None)
+    ap.add_argument('--identity-readers', action='store_true',
+                    help='bypass learned reader alignment maps for the identity control')
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--suite', nargs='+', default=['recall'],
                     choices=sorted(SUITES), help='which predefined suites to run')
@@ -469,6 +472,13 @@ def main():
     model = load_model(args.ckpt, model_config, args.adapter)
 
     mods = ttt_layers(model)
+    if args.identity_readers:
+        aligned = [m for m in mods if m.ttt_reader_alignment is not None]
+        if not aligned:
+            raise SystemExit('--identity-readers requires a checkpoint/config with reader maps')
+        for m in aligned:
+            m._identity_reader_alignment = True
+        print(f'Identity control: bypassing {len(aligned)} reader alignment maps')
     if args.ablate:
         sel = mods if args.layers is None else [mods[i] for i in args.layers]
         which = 'all layers' if args.layers is None else f'layers {args.layers}'
@@ -482,7 +492,7 @@ def main():
 
     causality = None
     if getattr(model.config, 'ttt_share_groups', None):
-        from test_causality import assert_causal
+        from LinearTTT.diagnostics import assert_causal
         chunk = model.config.lact_chunk_size
         generator = torch.Generator(device=model.device).manual_seed(0)
         probe = torch.randint(model.config.vocab_size, (1, 3 * chunk),
@@ -530,11 +540,14 @@ def main():
 
     tag = f'_{args.ablate}' + ('_all' if args.layers is None else
                                '_L' + '-'.join(map(str, args.layers))) if args.ablate else ''
+    if args.identity_readers:
+        tag += '_identity_readers'
     path = f'{args.out}{tag}.json'
     with open(path, 'w') as f:
         json.dump({'ckpt': args.ckpt, 'adapter': args.adapter, 'tasks': tasks,
                    'limit': args.limit, 'ablate': args.ablate,
                    'layers': args.layers, 'causality': causality,
+                   'identity_readers': args.identity_readers,
                    'results': flat}, f, indent=2)
     print(f'\nwrote {path}')
 

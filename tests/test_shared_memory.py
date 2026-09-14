@@ -16,7 +16,7 @@ from LinearTTT.model.LinearizeLlama.ttt_l2 import (
     block_causal_lact_swiglu_l2 as write_memory,
     read_lact_swiglu_l2 as read_memory,
 )
-from test_causality import assert_causal
+from LinearTTT.diagnostics import assert_causal
 
 
 DEVICE = os.environ.get('TTT_TEST_DEVICE', 'cpu')

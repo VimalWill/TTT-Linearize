@@ -162,6 +162,32 @@ def sliding_window_attention(
     output = _compiled_flex_attention()(q, k, v, block_mask=block_mask, scale=scale)
     return output
 
+class ReaderOutputAlignment(nn.Module):
+    """Head-wise A_h y_h, initialized to I; unconstrained, not a rotation.
+
+    Kept as a separate module so missing weights in an older checkpoint are
+    explicitly identity-initialized by the Hugging Face loading path.
+    """
+    def __init__(self, heads, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(dim).repeat(heads, 1, 1))
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.weight.copy_(torch.eye(self.weight.shape[-1], device=self.weight.device,
+                                        dtype=self.weight.dtype).expand_as(self.weight))
+
+    def forward(self, readout):
+        heads, dim = self.weight.shape[:2]
+        batch_heads, tokens, width = readout.shape
+        if width != dim or batch_heads % heads:
+            raise ValueError('Readout shape does not match reader alignment heads/dim')
+        batch = batch_heads // heads
+        weights = self.weight.to(readout.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
+        return torch.matmul(readout.reshape(batch, heads, tokens, dim),
+                            weights.transpose(-1, -2)).reshape_as(readout)
+
+
 class LinearTTTAttention(nn.Module):
 
     def __init__(
@@ -308,6 +334,13 @@ class LinearTTTAttention(nn.Module):
                 self._share_size = len(g)
                 break
 
+        self.ttt_reader_alignment = (
+            ReaderOutputAlignment(self.num_ttt_heads, self.ttt_head_dim)
+            if getattr(config, 'ttt_reader_alignment', 'none') == 'linear'
+            and self._share_gid is not None and not self._share_leader else None
+        )
+        self._identity_reader_alignment = False
+
         # reset_ttt_parameters reads _share_gid/_share_leader, so the share
         # group must be resolved BEFORE it runs.
         self.reset_ttt_parameters()
@@ -350,6 +383,11 @@ class LinearTTTAttention(nn.Module):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
                               self.ttt_retention_init_bias)
+
+    def _align_ttt_readout(self, readout):
+        if self.ttt_reader_alignment is None or self._identity_reader_alignment:
+            return readout
+        return self.ttt_reader_alignment(readout)
 
     def _ttt_features(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """[b, n, inner_dim] -> [b * num_ttt_heads, n, ttt_head_dim]."""
@@ -441,7 +479,7 @@ class LinearTTTAttention(nn.Module):
             gate = F.silu(torch.bmm(w0, qi))
             ttt_out = torch.bmm(w1, gate * torch.bmm(w2, qi)).transpose(1, 2)
 
-        ttt_out = self.ttt_norm(ttt_out.to(hidden_states.dtype))
+        ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out.to(hidden_states.dtype)))
         ttt_scale = rearrange(
             F.silu(self.ttt_scale_proj(hidden_states)),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
@@ -727,7 +765,7 @@ class LinearTTTAttention(nn.Module):
         Shared by the writer and reader paths of forward() so the two cannot
         drift; `ttt_out` arrives as [b*h, n, d] from either.
         """
-        ttt_out = self.ttt_norm(ttt_out)
+        ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out))
         ttt_scale = rearrange(
             F.silu(self.ttt_scale_proj(hidden_states)),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
@@ -813,6 +851,8 @@ class LigerGLAPreTrainedModel(LlamaPreTrainedModel):
         # attention module its Linears have already been re-randomised.
         if isinstance(module, LinearTTTAttention):
             module.reset_ttt_parameters()
+        elif isinstance(module, ReaderOutputAlignment):
+            module.reset_parameters()
 
 class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
 
