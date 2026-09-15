@@ -26,7 +26,8 @@ data:
 model:
   name: 'ttt_ar'
   # stage 1's output -- the converged run (eval CE 2.988), not ttt_at_unified_1ep
-  pretrained_model_name_or_path: ${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_unified/best_ckpt
+  # TTT_INIT overrides for a chained resume; default is stage 1's output.
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_unified/best_ckpt}
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512

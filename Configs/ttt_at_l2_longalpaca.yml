@@ -23,7 +23,9 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_at'
-  pretrained_model_name_or_path: 'meta-llama/Llama-3.1-8B'
+  # Set TTT_INIT to a previous best_ckpt to continue a chained run;
+  # leave it unset for a cold start from the base model.
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,meta-llama/Llama-3.1-8B}
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
