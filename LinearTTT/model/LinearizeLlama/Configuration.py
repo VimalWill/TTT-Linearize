@@ -49,6 +49,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         # the lowest index writes, the rest read its per-chunk trajectory with
         # their own q. One parameter set and one live state per group.
         ttt_share_groups=None,
+        ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
         ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
@@ -90,6 +91,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
         self.ttt_share_groups = ttt_share_groups
+        self.ttt_layer_indices = ttt_layer_indices
         self.ttt_reader_alignment = ttt_reader_alignment
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
@@ -103,6 +105,10 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
             raise ValueError('lact_chunk_size must be a positive integer')
         groups = self.ttt_share_groups or []
+        active = (set(range(self.num_hidden_layers)) if self.ttt_layer_indices is None
+                  else set(self.ttt_layer_indices))
+        if self.ttt_layer_indices is not None and any(type(i) is not int or not 0 <= i < self.num_hidden_layers for i in active):
+            raise ValueError('ttt_layer_indices must contain valid layer indices')
         if self.ttt_reader_alignment not in ('none', 'linear'):
             raise ValueError('ttt_reader_alignment must be "none" or "linear"')
         if not isinstance(groups, (list, tuple)):
@@ -119,6 +125,8 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
                 if index in seen:
                     raise ValueError(f'Layer {index} occurs more than once in ttt_share_groups')
                 seen.add(index)
+                if index not in active:
+                    raise ValueError('Every shared-memory layer must retain the TTT branch')
             if isinstance(self.ttt_inter_multi, (list, tuple)):
                 if len(self.ttt_inter_multi) != self.num_hidden_layers:
                     raise ValueError('ttt_inter_multi must contain one value per layer')

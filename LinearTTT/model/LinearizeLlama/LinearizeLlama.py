@@ -272,38 +272,47 @@ class LinearTTTAttention(nn.Module):
                 f'ttt_head_dim={self.ttt_head_dim}'
             )
         gain = getattr(config, 'fw_init_gain', 0.5)
+
+        # Layers outside ttt_layer_indices keep the sliding-window branch and
+        # the pretrained block but carry NO test-time memory: no fast weights,
+        # no inner loop, no per-sequence state. Handled here rather than with a
+        # separate layer class, because a class built on LlamaDecoderLayer
+        # inherits FULL softmax attention and silently de-linearises the model.
+        _active = getattr(config, 'ttt_layer_indices', None)
+        self._ttt_enabled = _active is None or layer_idx in set(_active)
+
+        if self._ttt_enabled:
+            self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+            self.w1 = nn.Parameter(torch.randn(self.num_ttt_heads, d_out, d_h) / math.sqrt(d_h) * gain)
+            self.w2 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+
+            # per-token, per-head inner-loop learning rate (one scalar per fast weight)
+            self.lr_proj = nn.Linear(self.hidden_size, 3 * self.num_ttt_heads)
+            self.base_lr_inv = inv_softplus(getattr(config, 'ttt_base_lr', 1e-2))
+
+            if self.ttt_use_momentum:
+                self.momentum_proj = nn.Sequential(
+                    nn.Linear(self.hidden_size, self.num_ttt_heads),
+                    nn.Sigmoid(),
+                )
+
+            # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
+            # Eq. 8's renormalisation, which this would double up on.
+            self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
+            if self.ttt_inner_loss == 'l2':
+                self.retention_proj = nn.Sequential(
+                    nn.Linear(self.hidden_size, self.num_ttt_heads),
+                    nn.Sigmoid(),
+                )
+
        
-        self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
-        self.w1 = nn.Parameter(torch.randn(self.num_ttt_heads, d_out, d_h) / math.sqrt(d_h) * gain)
-        self.w2 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+            self.ttt_qk_scale = nn.Parameter(torch.ones(2, self.inner_dim))
+            self.ttt_qk_offset = nn.Parameter(torch.zeros(2, self.inner_dim))
 
-        # per-token, per-head inner-loop learning rate (one scalar per fast weight)
-        self.lr_proj = nn.Linear(self.hidden_size, 3 * self.num_ttt_heads)
-        self.base_lr_inv = inv_softplus(getattr(config, 'ttt_base_lr', 1e-2))
-
-        if self.ttt_use_momentum:
-            self.momentum_proj = nn.Sequential(
-                nn.Linear(self.hidden_size, self.num_ttt_heads),
-                nn.Sigmoid(),
-            )
-
-        # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
-        # Eq. 8's renormalisation, which this would double up on.
-        self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
-        if self.ttt_inner_loss == 'l2':
-            self.retention_proj = nn.Sequential(
-                nn.Linear(self.hidden_size, self.num_ttt_heads),
-                nn.Sigmoid(),
-            )
-
-       
-        self.ttt_qk_scale = nn.Parameter(torch.ones(2, self.inner_dim))
-        self.ttt_qk_offset = nn.Parameter(torch.zeros(2, self.inner_dim))
-
-        self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
-        self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
-        self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
-        self.fw_init_gain = gain
+            self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
+            self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
+            self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
+            self.fw_init_gain = gain
 
         # Incremental decode cache: the converged fast weights plus a rolling
         # k/v window, set at the end of prefill. None means "not decoding".
@@ -358,6 +367,8 @@ class LinearTTTAttention(nn.Module):
         Re-run from _init_weights: post_init() re-randomises every nn.Linear,
         including the output gate that must start nearly closed.
         """
+        if not self._ttt_enabled:
+            return
         d_in, d_h = self.ttt_head_dim, self.w0.shape[1]
         # A non-leader's w0/w1/w2 alias its leader's, and follower keys come
         # back missing from a shared checkpoint so _init_weights runs on them.
@@ -421,8 +432,10 @@ class LinearTTTAttention(nn.Module):
         # decode-time equivalent of reading its trajectory. The leader is the
         # lowest index in the group, so it has already stepped this token --
         # including any deferred chunk update -- by the time we get here.
-        reader = self._share_gid is not None and not self._share_leader
-        if reader:
+        reader = self._ttt_enabled and self._share_gid is not None and not self._share_leader
+        if not self._ttt_enabled:
+            src = None
+        elif reader:
             src = past_key_value.states.get(self._share_leader_idx)
             if src is None:
                 raise RuntimeError(
@@ -465,6 +478,10 @@ class LinearTTTAttention(nn.Module):
         st['v'] = torch.cat([st['v'], v], dim=2)[:, :, -keep:]
         attn_out = F.scaled_dot_product_attention(aq, st['k'], st['v'])
         attn_out = rearrange(attn_out, 'b h n d -> b n (h d)')
+
+        if not self._ttt_enabled:
+            return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
+                    None, past_key_value, None)
 
         # ---- global branch: read the frozen memory ----
         # ttt_l2's tail-chunk readout: w1 @ (silu(w0 @ q) * (w2 @ q)).
@@ -606,6 +623,15 @@ class LinearTTTAttention(nn.Module):
             block_mask_cache=self._block_mask_cache,
         )
         attn_out = rearrange(attn_out, 'b h n d -> b n (h d)')
+
+        if not self._ttt_enabled:
+            if use_cache:
+                keep = self.window_size + 1
+                past_key_value.states[self.layer_idx] = {
+                    'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                }
+            return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
+                    None, past_key_value, None)
 
         # ---------------- global branch: test-time training ----------------
         if q_len <= self.lact_chunk_size:
@@ -990,7 +1016,7 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
-            gid = decoder_layer.self_attn._share_gid
+            gid = getattr(decoder_layer.self_attn, '_share_gid', None)
             trajectory = trajectories.get(gid)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
