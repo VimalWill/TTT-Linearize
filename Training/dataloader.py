@@ -86,6 +86,52 @@ def load_data(config):
         val_set = _take("validation", n_val_docs)
         test_set = _take("test", n_val_docs)
         cols = list(train_set.features)
+    elif "longalpaca" in data_name.lower().replace("-", "").replace("_", "").replace(" ", ""):
+        # LongAlpaca: long instruction/answer pairs, one DOCUMENT per row, so
+        # unlike wikitext the per-row BOS/EOS from the LM formatter is correct --
+        # it marks real document boundaries. The Alpaca prompt template is NOT
+        # used: it masks the instruction to -100, and ConcatDataset then drops
+        # any packed chunk that is all prompt, which at 8k-32k silently discards
+        # most of the corpus. Every token is supervised instead.
+        # Matched on "longalpaca" specifically -- the default data_name is
+        # "alpaca_cleand", which a bare "alpaca" test would hijack.
+        formatter = partial(template_and_tokenize_lm, tokenizer=tokenizer)
+        min_chars = int(config.data.get("min_doc_chars", 0))
+        # eval.py sets num_val_seqs; training configs do not. Under eval we need
+        # enough TOKENS to fill --seqs windows, so budget by characters. Under
+        # training we want a sample COUNT, so honour num_{train,val}_docs.
+        eval_budget = config.data.get("num_val_seqs", None)
+
+        def _docs(skip, n_rows, n_chars=None):
+            rows, total = [], 0
+            it = load_dataset(data_path, split="train", streaming=True)
+            for row in itertools.islice(it, skip, None):
+                text = "\n\n".join(
+                    str(row[k]) for k in ("instruction", "input", "output")
+                    if row.get(k)
+                ) or str(row.get("text", ""))
+                if len(text) < min_chars:
+                    continue
+                rows.append({"text": text})
+                total += len(text)
+                if n_chars is not None and total >= n_chars:
+                    break
+                if n_chars is None and len(rows) >= n_rows:
+                    break
+            return convert_to_hf_dataset(rows, cache_dir), len(rows)
+
+        if eval_budget is not None:
+            # ~4.5 chars/token for Llama-3 on English; 5 leaves headroom
+            chars = int(input_len) * int(eval_budget) * 5
+            val_set, n_val_rows = _docs(0, 0, chars)
+            train_set, _ = _docs(n_val_rows, 0, chars)
+        else:
+            n_val = int(config.data.get("num_val_docs", 200))
+            n_train = int(config.data.get("num_train_docs", 12000))
+            val_set, n_val_rows = _docs(0, n_val)
+            train_set, _ = _docs(n_val_rows, n_train)
+        test_set = val_set
+        cols = list(val_set.features)
     elif "wikitext" in data_name.lower():
         # WikiText rows are single LINES, not documents, so the pg19 branch is
         # wrong for it three ways: it shuffles rows (scrambling articles, which
