@@ -32,8 +32,27 @@ def save_checkpoint(model, tokenizer, save_path):
     (w0/w1/w2, lr_proj, ttt_scale_proj, ...) are plain base-model tensors that
     training also updates, so they would be silently dropped -- measured once as
     an 18.9MB stage-2 checkpoint containing nothing but LoRA.
+
+    Shared TTT memories need the follower copies dropped by hand. safetensors
+    refuses to write tensors that alias each other, and declaring them in
+    _tied_weights_keys was not enough -- transformers' own dedup pass let them
+    through and the failure surfaced deeper, inside safe_save_file. Removing
+    them from the state dict is explicit and version-independent. Loading is
+    unaffected: the follower keys come back as missing and tie_weights()
+    re-aliases them to their leader, which is where the values live.
     """
-    model.save_pretrained(save_path)
+    sd = None
+    groups = getattr(getattr(model, 'config', None), 'ttt_share_groups', None)
+    if groups:
+        # match on suffix so this works whether or not a PeftModel wrapper has
+        # prefixed every key with base_model.model.
+        tails = tuple(f'layers.{li}.self_attn.{w}'
+                      for g in groups for li in sorted(g)[1:]
+                      for w in ('w0', 'w1', 'w2'))
+        sd = {k: v for k, v in model.state_dict().items() if not k.endswith(tails)}
+        print(f'-> dropped {len(model.state_dict()) - len(sd)} aliased '
+              f'fast-weight tensors from the checkpoint')
+    model.save_pretrained(save_path, state_dict=sd)
     tokenizer.save_pretrained(save_path)
     if isinstance(model, PeftModel):
         ttt = {n: p.detach().cpu() for n, p in model.named_parameters()
@@ -131,25 +150,80 @@ class DefaultTrainer():
                     for fname in ["adapter_model.safetensors", "adapter_model.bin"]:
                         fpath = os.path.join(ckpt_path, fname)
                         if os.path.exists(fpath):
-                            weights = torch.load(fpath, map_location="cpu")
+                            if fname.endswith('.safetensors'):
+                                from safetensors.torch import load_file
+                                weights = load_file(fpath, device="cpu")
+                            else:
+                                weights = torch.load(fpath, map_location="cpu")
                             set_peft_model_state_dict(model, weights)
                             break
+                    # The adapters are only half the checkpoint -- the TTT
+                    # tensors are saved separately by save_checkpoint. Without
+                    # this the model carries the LAST step's memory with the
+                    # BEST step's adapters.
+                    ttt = os.path.join(ckpt_path, 'ttt_params.pt')
+                    if os.path.exists(ttt):
+                        sd = torch.load(ttt, map_location='cpu')
+                        unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
+                        matched = len(sd) - len(unexpected)
+                        if matched == 0:
+                            raise RuntimeError(
+                                f'{ttt} has {len(sd)} tensors but none matched; '
+                                f'first key {next(iter(sd))}'
+                            )
+                        print(f'-> Restored {matched}/{len(sd)} TTT tensors')
                 else:
-                    model.from_pretrained(ckpt_path)
+                    model = model.from_pretrained(
+                        ckpt_path,
+                        torch_dtype=model.dtype,
+                        device_map=getattr(model, 'hf_device_map', {'': model.device}),
+                    )
+                    self.model = model
                 print(f'-> Loading best checkpoint from {ckpt_path}')
             except Exception as e:
                 print(e)
                 print('-> Returning most recent model instead')
         return model            
     
+    def _optimizer_step(self, accumulated_batches, accumulation_steps):
+        """Normalize an accumulation window, check/clip gradients, then update."""
+        params = [p for group in self.optimizer.param_groups for p in group['params']
+                  if p.grad is not None]
+        if not params:
+            return False
+        # Each loss was divided by accumulation_steps before backward. A short
+        # final window must instead average over the batches actually present.
+        if accumulated_batches != accumulation_steps:
+            scale = accumulation_steps / accumulated_batches
+            for param in params:
+                param.grad.mul_(scale)
+        max_norm = self.args.max_grad_norm
+        norm = torch.nn.utils.clip_grad_norm_(
+            params, max_norm if max_norm is not None and max_norm > 0 else float('inf'),
+        )
+        if not torch.isfinite(norm):
+            print('\n-> Nonfinite gradient norm, skipping accumulated update')
+            self.optimizer.zero_grad()
+            return False
+        self.optimizer.step()
+        if not self.scheduler_step_after_epoch and self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad()
+        self.grad_step += 1
+        return True
+
     def train_step(self, model, epoch) -> nn.Module:
         if self.gradient_accumulation_steps is None:
             accum_iter = 1
         else:
             accum_iter = self.gradient_accumulation_steps
+        if not isinstance(accum_iter, int) or isinstance(accum_iter, bool) or accum_iter < 1:
+            raise ValueError('gradient_accumulation_steps must be a positive integer')
 
         model.train()
         model.zero_grad()        
+        accumulated_batches = 0
+        num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, leave=False, colour='blue', desc=f'-> Training (epoch {epoch} / {self.args.num_train_epochs})')
         total_loss = 0
         eval_for_step = False
@@ -171,9 +245,10 @@ class DefaultTrainer():
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f'\n-> NaN/Inf loss at step {ix}, skipping batch')
                 self.optimizer.zero_grad()
+                accumulated_batches = 0
                 self.step += 1
                 continue
-            loss /= accum_iter
+            loss = loss / accum_iter
             if not self.compute_loss_backprop:
                 # loss.backward() did not occur in compute_loss
                 try:
@@ -181,14 +256,13 @@ class DefaultTrainer():
                 except Exception as e:
                     print(f'\n-> Backward error at step {ix}: {e}, skipping')
                     self.optimizer.zero_grad()
+                    accumulated_batches = 0
                     self.step += 1
                     continue
-            if (self.step + 1) % accum_iter == 0:  # and self.step != 0:
-                self.optimizer.step()
-                if not self.scheduler_step_after_epoch and self.scheduler is not None:
-                    self.scheduler.step()
-                self.optimizer.zero_grad()
-                self.grad_step += 1
+            accumulated_batches += 1
+            if accumulated_batches == accum_iter or ix + 1 == num_batches:
+                self._optimizer_step(accumulated_batches, accum_iter)
+                accumulated_batches = 0
                 if not self.compute_loss_backprop:
                     loss = loss.detach().cpu().item()
             
@@ -246,6 +320,11 @@ class DefaultTrainer():
         """
         with torch.no_grad():
             self.eval_metrics = self.compute_eval_metrics(model, step=step, **kwargs)
+            if self.metric_for_best_model not in self.eval_metrics:
+                raise KeyError(
+                    f'metric_for_best_model={self.metric_for_best_model!r} not in '
+                    f'eval metrics {sorted(self.eval_metrics)}'
+                )
             val_metric = self.eval_metrics[self.metric_for_best_model]
 
             # Save results
@@ -307,15 +386,12 @@ class DefaultTrainer():
                 loss, eval_metrics = self.compute_loss(model, data, return_outputs=True)
                 if not self.compute_loss_backprop:
                     loss = loss.item()  # otherwise already float
-                if ix == 0:
-                    step_eval_metrics[self.metric_for_best_model] = [loss]
-                    for k, v in eval_metrics.items():
-                        step_eval_metrics[f'eval/{k}'] = [v]
-                else:
-                    step_eval_metrics[self.metric_for_best_model].append(loss)
-                    for k, v in eval_metrics.items():
-                        step_eval_metrics[f'eval/{k}'].append(v)
-                        
+                # The total loss goes under its own key. Filed under
+                # metric_for_best_model it collided with stage 1's
+                # 'eval/loss_ce', averaging CE with (1000*MSE + CE).
+                for k, v in [('loss_total', loss), *eval_metrics.items()]:
+                    step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
+                
                 step_loss += loss
                 desc = f"Evaluating at step {step} | loss: {step_loss / (ix + 1):.3f}"
                 if self.optimizer is not None:
@@ -327,6 +403,18 @@ class DefaultTrainer():
             # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
+            # Stage 2 selects on 'eval/loss', which compute_loss never returns
+            # -- it relied on the total loss being filed here. Preserve that,
+            # but only for metrics compute_loss does not already return.
+            if (self.metric_for_best_model is not None
+                    and self.metric_for_best_model not in step_eval_metrics):
+                step_eval_metrics[self.metric_for_best_model] = \
+                    step_eval_metrics['eval/loss_total']
+            # ppl is averaged per batch above (mean of exp), which upper-bounds
+            # exp(mean CE); report the consistent one alongside it.
+            if 'eval/loss_ce' in step_eval_metrics:
+                step_eval_metrics['eval/ppl_from_mean_ce'] = float(
+                    torch.exp(torch.tensor(step_eval_metrics['eval/loss_ce'])))
             print(f'Eval step {step}:', step_eval_metrics)
             del loss
             torch.cuda.empty_cache()
@@ -409,6 +497,10 @@ class FinetuneTrainer(DefaultTrainer):
         
         targets = targets.cpu()
         outputs = outputs.cpu()
-        outputs = {'ppl': torch.exp(loss).item(), 'seq_len': targets.shape[-1] + 1}
+        # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the
+        # 'ppl' below is a mean of per-batch exp(CE), which Jensen-inflates above
+        # exp(mean CE) -- and exp(mean CE) is what the eval reports, i.e. what
+        # the recorded dot-path numbers (31, 18.1) are on.
+        outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
+                   'seq_len': targets.shape[-1] + 1}
         return (loss, outputs) if return_outputs else loss
-    

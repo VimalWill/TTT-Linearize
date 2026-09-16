@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Checkpoints -- the fallback output_dir when TTT_CKPT_DIR is unset
+checkpoints/
+*.pt
+*.safetensors
+
+# Diagnostic output. Every diag_*/eval_* script writes into the working
+# directory by default, so on the cluster these land in the repo.
+ttt_loss_per_token*.csv
+ttt_loss_per_token*.png
+retrieval_anchor*.csv
+eval_harness*.json
+*_metrics.json
+*.out
+*.err
+
+# Trackers / caches
+wandb/
+.cache/

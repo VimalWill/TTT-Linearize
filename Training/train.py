@@ -6,18 +6,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import fla
 import LinearTTT
 import torch.utils
 import torch.utils.data
 import torch.utils.data.dataloader
+from omegaconf import OmegaConf
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers import TrainingArguments
 from peft import LoraConfig, TaskType, PeftModel, get_peft_model
 
 from Training.trainer import DefaultTrainer, FinetuneTrainer
 from Training.utils import get_optimizer_and_scheduler, count_model_params
-from Training.dataloader import load_data
 
 
 # Parameters belonging to the test-time-training branch. These have no
@@ -26,7 +25,7 @@ from Training.dataloader import load_data
 TTT_PARAM_KEYS = (
     '.w0', '.w1', '.w2',
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
-    'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj',
+    'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj', 'retention_proj',
 )
 
 # yml `model:` keys consumed by the harness rather than by the model config
@@ -47,7 +46,12 @@ def build_model_config(config):
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue
-        # Configs/liger.yml spells it `attn_varient`
+        # PretrainedConfig cannot JSON-serialise ListConfig/DictConfig, so
+        # list-valued keys (ttt_share_groups, ttt_inter_multi) would break both
+        # __repr__ and save_pretrained. Convert to plain containers.
+        if OmegaConf.is_config(v):
+            v = OmegaConf.to_object(v)
+        # checkpoints carry the `attn_varient` misspelling
         setattr(model_config, 'attn_variant' if k == 'attn_varient' else k, v)
     # the packing width is what the layer actually sees
     model_config.max_position_embeddings = max(
@@ -70,6 +74,7 @@ def set_trainable_params(model, config):
 
 
 def train(config):
+    from Training.dataloader import load_data
 
     # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
     #        'ttt_ar' = autoregressive finetune on the LM loss

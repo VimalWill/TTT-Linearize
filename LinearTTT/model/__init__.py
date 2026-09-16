@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 from .LinearizeLlama import (
-    LigerGatedLinearAttention,
     LigerGLAConfig,
     LigerGLADecoderLayer,
     LigerGLAForCausalLM,
@@ -11,7 +10,6 @@ from .LinearizeLlama import (
 
 __all__ = [
     'LigerGLAConfig',
-    'LigerGatedLinearAttention',
     'LigerGLADecoderLayer',
     'LigerGLAForCausalLM',
     'LigerGLAModel',
