@@ -1,15 +1,7 @@
-# Stage 2 -- autoregressive finetune on LongAlpaca, ONE unified interior memory.
-#
-# Same architecture as Configs/ttt_ar_unified.yml; only the stage-2 corpus
-# changes from PG19 to LongAlpaca. Layers 2-27 collapse to one memory: L2 writes
-# and publishes its per-chunk trajectory, L3-L27 read block c with their own q.
-# L0-L1 and L28-L31 keep their own -- the layer-wise ablation puts the measured
-# TTT contribution there.
-#
-# NOTE ON COMPARABILITY: the Non-Unified baseline in Table 1 was trained on
-# PG19. A model finetuned here is NOT comparable to it -- the corpus, not the
-# architecture, would explain any difference. Retrain the separate arm on this
-# same corpus before putting the two in one table.
+# Stage 2 -- autoregressive finetune on LongAlpaca, SWA + TTT at every layer.
+# Matches Configs/ttt_at_unified.yml: two shared anchor memories with writers
+# L0/L28 and mapped readers L1/L29-L31; private memories at L2-L27.
+# Total: 28 independent memories and four learnable reader maps.
 #
 # LongAlpaca-12k holds ~12,000 samples, so num_train_docs caps out there.
 # Documents are instruction/answer pairs, every token supervised (the Alpaca
@@ -25,8 +17,7 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  # stage 1's output -- the converged run (eval CE 2.988), not ttt_at_unified_1ep
-  # TTT_INIT overrides for a chained resume; default is stage 1's output.
+  # Load stage 1 for this topology. TTT_INIT optionally overrides that path.
   pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_unified/best_ckpt}
   max_length: 8192
   attn_varient: "ttt"
@@ -36,7 +27,7 @@ model:
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
-  ttt_layer_indices: [0, 1, 28, 29, 30, 31]
+  ttt_layer_indices: null  # all layers, including when loading a restricted config
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
   fw_init_gain: 1.0

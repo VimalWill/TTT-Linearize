@@ -1,21 +1,9 @@
-# Stage 1 -- attention transfer, ONE unified interior memory.
-#
-# Layers 2-27 collapse from 26 memories to one. L2 writes: it runs the inner
-# loop and publishes its per-chunk trajectory. L3-L27 read block c with their
-# own q, which is causal because block c is the state before chunk c was folded
-# in -- sharing the FINAL state instead leaks the whole sequence into every
-# reader. L0-L1 and L28-L31 keep their own; the layer-wise allocation sweep put
-# the measured TTT capacity at both ends of the stack.
-# 7 memories of 32; state 44.0 MB against 201.3 MB.
-#
-# Retention needs no group correction under this scheme. Only the leader
-# writes, so the state decays alpha^c exactly as a private memory does -- the
-# alpha^(g*c) over-decay that wiped an earlier 23-layer group cannot arise, and
-# ttt_base_lr keeps its private calibration.
-#
-# Sharing is l2-only: the dot operator does not return its converged weights.
-# Cannot be evaluated zero-shot -- independently trained memories do not
-# collapse into one by pruning, so both stages retrain.
+# Stage 1 -- attention transfer, SWA + TTT at every layer.
+# Anchor groups [0,1] and [28,29,30,31] share separate causal memories.
+# L0 and L28 write; L1 and L29-L31 read through learnable output maps.
+# L2-L27 each write and read a private TTT memory.
+# Total: 28 independent memories, 32 reading layers, four reader maps.
+# Shared readers use the state before their current chunk's update.
 data:
   # LongAlpaca: long instruction/answer pairs, one document per row. Samples
   # exceed lact_chunk_size (512), so the inner loop runs during transfer.
@@ -46,9 +34,9 @@ model:
   # lr ~ (1 - alpha) * fw_init_gain = 0.018 at sigmoid(4.0) and gain 1.0.
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
-  # Only depth-local anchor layers retain TTT. L0/L1 and L28-L31 share
-  # separate causal memories; L2-L27 are attention-only blocks.
-  ttt_layer_indices: [0, 1, 28, 29, 30, 31]
+  # Explicit null enables TTT at every layer, overriding any restricted
+  # active-layer list inherited from an initialization checkpoint.
+  ttt_layer_indices: null
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
   fw_init_gain: 1.0              # measured: gain 2.0 gave |f|/|v|=0.47 at
