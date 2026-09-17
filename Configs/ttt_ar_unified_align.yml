@@ -1,5 +1,4 @@
-# Controlled continuation of the completed unified stage-1 + stage-2 model.
-# Train ONLY per-head reader output maps, initialized to identity.
+# Stage 2 (AR finetune) -- reader-alignment variant.
 data:
   name: pg19
   path: emozilla/pg19

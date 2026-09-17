@@ -1,15 +1,6 @@
-# Stage 1 -- attention transfer, SWA + TTT at every layer.
-# Anchor groups [0,1] and [28,29,30,31] share separate causal memories.
-# L0 and L28 write; L1 and L29-L31 read through learnable output maps.
-# L2-L27 each write and read a private TTT memory.
-# Total: 28 independent memories, 32 reading layers, four reader maps.
-# Shared readers use the state before their current chunk's update.
+# Stage 1 (attention transfer) -- anchor groups [0,1] and [28,29,30,31]
+# share memories; L2-L27 private. 28 memories total.
 data:
-  # LongAlpaca: long instruction/answer pairs, one document per row. Samples
-  # exceed lact_chunk_size (512), so the inner loop runs during transfer.
-  # ~12,000 samples exist in total; every token is supervised (the Alpaca
-  # prompt template is deliberately not used -- it masks the instruction to
-  # -100 and ConcatDataset then drops packed chunks that are all prompt).
   name: "longalpaca"
   path: "Yukang/LongAlpaca-12k"
   num_train_docs: 12000
@@ -19,51 +10,31 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_at'
-  # Set TTT_INIT to a previous best_ckpt to continue a chained run;
-  # leave it unset for a cold start from the base model.
   pretrained_model_name_or_path: ${oc.env:TTT_INIT,meta-llama/Llama-3.1-8B}
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
   window_size: 512        # must be >= lact_chunk_size
   ttt_inner_loss: 'l2'
-  # Muon is structurally required, not optional. Without it the equilibrium is
-  # REPELLING (dw ~ lr*||v||*W^2, so ||dw||/||W|| grows with W) and no lr sits
-  # between explosion and fade. Newton-Schulz sets ||dw|| from lr alone, giving
-  # ||W||_eq ~ lr * sqrt(d) / (1 - alpha); holding ||W|| at ||W_0|| then means
-  # lr ~ (1 - alpha) * fw_init_gain = 0.018 at sigmoid(4.0) and gain 1.0.
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
-  # Explicit null enables TTT at every layer, overriding any restricted
-  # active-layer list inherited from an initialization checkpoint.
   ttt_layer_indices: null
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
-  fw_init_gain: 1.0              # measured: gain 2.0 gave |f|/|v|=0.47 at
-                                 # chunk 0 on real PG19 features and diverged
-                                 # by chunk 2; target band is 0.05-0.2
+  fw_init_gain: 1.0              # gain 2.0 diverged by chunk 2
   ttt_use_momentum: True
   ttt_use_muon: True
   add_eos_token: False
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
-  # the l2 update depends on w1 (cubic in W), so the outer surface is stiffer;
-  # 1e-3 oscillated then diverged.
   lr: 0.0002
   epochs: 1
   max_grad_norm: 1.0
-  # MSE alone lets student and teacher drift together; the LM term anchors
-  # stage 1 to the pretrained manifold.
   mse_factor: 1000
   lm_loss_weight: 1.0
   metric_for_best_model: 'eval/loss_ce'
   gradient_checkpointing: True
-  # ~12000 docs at ~9k tokens pack to ~13k sequences of 8192, i.e. ~1650
-  # gradient steps. The 2000-doc run gave ~250 and was cut off mid-descent
-  # (CE still falling 0.25 per 25 steps), so do not shorten this again
-  # without checking that eval/loss_ce has actually flattened.
   eval_steps: 25
   save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
-  # run.py appends the config filename stem, so this stays the bare root
   output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}

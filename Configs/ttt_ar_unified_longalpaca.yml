@@ -1,12 +1,4 @@
-# Stage 2 -- autoregressive finetune on LongAlpaca, SWA + TTT at every layer.
-# Matches Configs/ttt_at_unified.yml: two shared anchor memories with writers
-# L0/L28 and mapped readers L1/L29-L31; private memories at L2-L27.
-# Total: 28 independent memories and four learnable reader maps.
-#
-# LongAlpaca-12k holds ~12,000 samples, so num_train_docs caps out there.
-# Documents are instruction/answer pairs, every token supervised (the Alpaca
-# prompt template is deliberately not used -- it masks the instruction to -100
-# and ConcatDataset then drops packed chunks that are all prompt).
+# Stage 2 (AR finetune) on LongAlpaca -- must mirror ttt_at_unified.yml.
 data:
   name: "longalpaca"
   path: "Yukang/LongAlpaca-12k"
@@ -17,13 +9,11 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  # Load stage 1 for this topology. TTT_INIT optionally overrides that path.
   pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_unified/best_ckpt}
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
   window_size: 512        # must be >= lact_chunk_size
-  # --- must mirror Configs/ttt_at_unified.yml ---
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
@@ -38,8 +28,6 @@ model:
 train:
   optim: 'adamw_torch'
   lr: 0.0001
-  # ~12k docs at ~9k tokens pack to ~13k sequences of 8192, i.e. ~1650 gradient
-  # steps per epoch against PG19's 313. One epoch is already 5x that budget.
   epochs: 1
   max_grad_norm: 1.0
   gradient_checkpointing: True
