@@ -394,7 +394,13 @@ def resolve(tasks):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cfg', default='Configs/ttt_ar_l2.yml')
-    ap.add_argument('--ckpt', required=True)
+    ap.add_argument('--ckpt', default=None,
+                    help='checkpoint to evaluate; omit only with --baseline')
+    ap.add_argument('--baseline', action='store_true',
+                    help='evaluate the unmodified teacher at --base instead of a '
+                         'linearized checkpoint: full softmax attention, no TTT '
+                         'branch, no sliding window. Gives the Llama reference row '
+                         'through the same harness and output format.')
     ap.add_argument('--adapter', default=None)
     ap.add_argument('--identity-readers', action='store_true',
                     help='bypass learned reader alignment maps for the identity control')
@@ -444,6 +450,14 @@ def main():
     args = ap.parse_args()
 
     # Fail before a multi-minute checkpoint load, not after.
+    if args.baseline:
+        if args.retrieval:
+            raise SystemExit('--baseline has no TTT branch to sweep; drop --retrieval')
+        if args.ablate or args.identity_readers:
+            raise SystemExit('--baseline has no TTT branch to ablate')
+    elif not args.ckpt:
+        raise SystemExit('--ckpt is required unless --baseline is given')
+
     if args.retrieval and args.ablate:
         raise SystemExit('--ablate is meaningless with --retrieval: the sweep '
                          'ablates each layer itself. Use --layers to restrict '
@@ -466,25 +480,34 @@ def main():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
 
     config = OmegaConf.load(args.cfg)
-    cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
-    cfg.model.pretrained_model_name_or_path = args.ckpt
-    model_config = build_model_config(cfg)
-    model = load_model(args.ckpt, model_config, args.adapter)
 
-    mods = ttt_layers(model)
-    if args.identity_readers:
-        aligned = [m for m in mods if m.ttt_reader_alignment is not None]
-        if not aligned:
-            raise SystemExit('--identity-readers requires a checkpoint/config with reader maps')
-        for m in aligned:
-            m._identity_reader_alignment = True
-        print(f'Identity control: bypassing {len(aligned)} reader alignment maps')
-    if args.ablate:
-        sel = mods if args.layers is None else [mods[i] for i in args.layers]
-        which = 'all layers' if args.layers is None else f'layers {args.layers}'
-        print(f'ablating {args.ablate} on {which} ({len(sel)} of {len(mods)})')
+    if args.baseline:
+        # The teacher, through the same harness: same tasks, same --seq-len, same
+        # JSON. Loaded as a plain causal LM so there is no TTT branch and no
+        # window -- a LigerGLA wrapper would give randomly initialised memories.
+        print(f'BASELINE: unmodified {args.base}, full attention, no TTT')
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base, device_map={'': 0}, torch_dtype=torch.bfloat16).eval()
+        model_config, mods, sel, causality = model.config, [], [], None
     else:
-        sel = []
+        cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        cfg.model.pretrained_model_name_or_path = args.ckpt
+        model_config = build_model_config(cfg)
+        model = load_model(args.ckpt, model_config, args.adapter)
+        mods = ttt_layers(model)
+        if args.identity_readers:
+            aligned = [m for m in mods if m.ttt_reader_alignment is not None]
+            if not aligned:
+                raise SystemExit('--identity-readers requires a checkpoint/config with reader maps')
+            for m in aligned:
+                m._identity_reader_alignment = True
+            print(f'Identity control: bypassing {len(aligned)} reader alignment maps')
+        if args.ablate:
+            sel = mods if args.layers is None else [mods[i] for i in args.layers]
+            which = 'all layers' if args.layers is None else f'layers {args.layers}'
+            print(f'ablating {args.ablate} on {which} ({len(sel)} of {len(mods)})')
+        else:
+            sel = []
 
     for prm in model.parameters():
         prm.requires_grad_(False)
@@ -544,7 +567,8 @@ def main():
         tag += '_identity_readers'
     path = f'{args.out}{tag}.json'
     with open(path, 'w') as f:
-        json.dump({'ckpt': args.ckpt, 'adapter': args.adapter, 'tasks': tasks,
+        json.dump({'ckpt': args.base if args.baseline else args.ckpt,
+                   'baseline': args.baseline, 'adapter': args.adapter, 'tasks': tasks,
                    'limit': args.limit, 'ablate': args.ablate,
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
