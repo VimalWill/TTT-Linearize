@@ -46,7 +46,7 @@ def load_data(config):
         'datasets'
     )
     input_len = config.model.max_length
-    concat_data = True
+    concat_data = bool(config.data.get('concat_data', True))
 
     tokenizer_path = config.model.pretrained_model_name_or_path
     tokenizer_name = tokenizer_path.split('/')[-1]
@@ -220,6 +220,32 @@ def load_data(config):
         train_set = ConcatDataset(train_set, chunk_size=input_len)
         val_set = ConcatDataset(val_set, chunk_size=input_len)
 
+    # Optional short-example mixture. Packed training gives the output gate only
+    # sequences where the memory is written and informative; it never sees the
+    # regime it has to shut off in. These stay UNPACKED at natural length.
+    short_path = config.data.get('short_mix_path', None)
+    if short_path:
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError(
+                'short_mix_path requires micro_batch_size 1: the collator pads to '
+                'the batch maximum, which would stretch short examples back over '
+                'lact_chunk_size and defeat the mixture')
+        n_short = int(config.data.get('short_mix_docs', 4000))
+        short_name = config.data.get('short_mix_name', None)
+        args = (short_path, short_name) if short_name else (short_path,)
+        rows = []
+        for row in itertools.islice(load_dataset(*args, split='train', streaming=True), n_short):
+            text = "\n\n".join(str(row[k]) for k in ('instruction', 'input', 'output')
+                                if row.get(k)) or str(row.get('text', ''))
+            if text.strip():
+                rows.append({'text': text})
+        short_set = convert_to_hf_dataset(rows, cache_dir).map(
+            partial(template_and_tokenize_lm, tokenizer=tokenizer, include_label=True),
+            remove_columns=['text'])
+        train_set = MixedDataset(train_set, short_set)
+        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path} '
+              f'({len(train_set)} training samples total)')
+
     loader_kwargs = {
         "batch_size": config.data.micro_batch_size,
         "num_workers": 0,
@@ -376,6 +402,33 @@ def download_metric():
     )
     shutil.copy(scrolls_metric_path, updated_scrolls_metric_path)
     return updated_scrolls_metric_path
+
+class MixedDataset(Dataset):
+    """Two datasets end to end, each keeping its own sample lengths.
+
+    Used to put SHORT examples (under lact_chunk_size, where the TTT inner loop
+    never runs) next to packed long ones, so the output gate gets gradient in
+    both regimes. Holds references rather than copying -- the packed side is
+    already hundreds of MB of python lists.
+
+    Requires micro_batch_size 1: the collator pads to the batch maximum, so a
+    batch mixing a 200-token example with an 8192-token one would pad the short
+    one up to 8192 and the inner loop would fire on padding.
+    """
+    def __init__(self, *parts):
+        self.parts = [p for p in parts if len(p)]
+        self.lens = [len(p) for p in self.parts]
+
+    def __len__(self):
+        return sum(self.lens)
+
+    def __getitem__(self, idx):
+        for part, n in zip(self.parts, self.lens):
+            if idx < n:
+                return part[idx]
+            idx -= n
+        raise IndexError(idx)
+
 
 class ConcatDataset(Dataset):
     """

@@ -20,6 +20,7 @@ model:
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
   ttt_layer_indices: [0, 1, 28, 29, 30, 31]   # DEPLOY: interior TTT not built
+  ttt_idle_zero: True    # loop never runs below chunk -> readout has no context
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
   fw_init_gain: 1.0

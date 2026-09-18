@@ -312,6 +312,16 @@ class LinearTTTAttention(nn.Module):
             self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
             self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
             self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
+            # 'sigmoid' makes the gate a true mixing weight gamma in [0,1]:
+            # o = gamma * o_ttt + o_swa. 'silu' spans (-0.2785, inf) and is
+            # NON-monotonic near zero, so gamma=0 is reachable only through a
+            # -0.2785 detour -- the branch cannot cleanly learn to shut off.
+            self.ttt_gate = getattr(config, 'ttt_gate', 'silu')
+            # Below lact_chunk_size the operator's loop never executes, so the
+            # readout is a fixed function of q with zero context in it; zeroing
+            # it there discards nothing. Prefill only -- after a prefill that
+            # DID update the memory, decode steps have q_len 1 but a written one.
+            self.ttt_idle_zero = getattr(config, 'ttt_idle_zero', False)
             self.fw_init_gain = gain
 
         # Incremental decode cache: the converged fast weights plus a rolling
@@ -394,6 +404,11 @@ class LinearTTTAttention(nn.Module):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
                               self.ttt_retention_init_bias)
+
+    def _ttt_gate(self, hidden_states):
+        """Output gate. sigmoid -> gamma in [0,1]; silu -> the legacy range."""
+        z = self.ttt_scale_proj(hidden_states)
+        return torch.sigmoid(z) if self.ttt_gate == 'sigmoid' else F.silu(z)
 
     def _align_ttt_readout(self, readout):
         if self.ttt_reader_alignment is None or self._identity_reader_alignment:
@@ -498,7 +513,7 @@ class LinearTTTAttention(nn.Module):
 
         ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out.to(hidden_states.dtype)))
         ttt_scale = rearrange(
-            F.silu(self.ttt_scale_proj(hidden_states)),
+            self._ttt_gate(hidden_states),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
         )
         ttt_out = ttt_out * ttt_scale.to(ttt_out.dtype)
@@ -793,7 +808,7 @@ class LinearTTTAttention(nn.Module):
         """
         ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out))
         ttt_scale = rearrange(
-            F.silu(self.ttt_scale_proj(hidden_states)),
+            self._ttt_gate(hidden_states),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
         )
         ttt_out = ttt_out * ttt_scale.to(ttt_out.dtype)
@@ -801,6 +816,10 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        # The inner loop runs only for q_len > lact_chunk_size, so below that the
+        # memory was never written and the readout carries no context at all.
+        if self.ttt_idle_zero and ttt_out.shape[1] <= self.lact_chunk_size:
+            ttt_out = torch.zeros_like(ttt_out)
         if self._ablate_ttt:
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out

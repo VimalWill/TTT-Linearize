@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import math
+
 from typing import Dict, Optional
 
 from transformers.configuration_utils import PretrainedConfig
@@ -51,6 +53,8 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         ttt_share_groups=None,
         ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
         ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
+        ttt_gate='silu',          # output gate: 'silu' (legacy) or 'sigmoid' (gamma in [0,1])
+        ttt_idle_zero=False,      # zero the readout when the inner loop never ran
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -93,6 +97,8 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_share_groups = ttt_share_groups
         self.ttt_layer_indices = ttt_layer_indices
         self.ttt_reader_alignment = ttt_reader_alignment
+        self.ttt_gate = ttt_gate
+        self.ttt_idle_zero = ttt_idle_zero
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm
@@ -111,6 +117,17 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
             raise ValueError('ttt_layer_indices must contain valid layer indices')
         if self.ttt_reader_alignment not in ('none', 'linear'):
             raise ValueError('ttt_reader_alignment must be "none" or "linear"')
+        if self.ttt_gate not in ('silu', 'sigmoid'):
+            raise ValueError('ttt_gate must be "silu" or "sigmoid"')
+        # silu(0.1)=0.052 leaves the branch nearly shut so the pretrained residual
+        # stream survives step 0. sigmoid(0.1)=0.525 would open it halfway and
+        # wreck the model at init; sigmoid(-3.0)=0.047 matches the silu default.
+        if self.ttt_gate == 'sigmoid' and self.ttt_scale_init_bias > -1.0:
+            raise ValueError(
+                f'ttt_gate="sigmoid" with ttt_scale_init_bias='
+                f'{self.ttt_scale_init_bias} opens the gate to '
+                f'{1/(1+math.exp(-self.ttt_scale_init_bias)):.3f} at init. '
+                'Use about -3.0 (sigmoid -> 0.047, matching silu(0.1)=0.052).')
         if not isinstance(groups, (list, tuple)):
             raise ValueError('ttt_share_groups must be a list of layer groups')
         if groups and self.ttt_inner_loss != 'l2':
