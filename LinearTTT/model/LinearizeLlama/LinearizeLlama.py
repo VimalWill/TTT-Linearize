@@ -522,6 +522,12 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        # A decode step always has q_len 1, so the prefill test in _merge_ttt
+        # cannot be reused here. Without this, a prompt shorter than one chunk
+        # is zeroed during prefill and then, from the very first generated
+        # token, reads fast weights the inner loop never touched.
+        if self.ttt_idle_zero and not src.get('written', True):
+            ttt_out = torch.zeros_like(ttt_out)
         if self._ablate_ttt:
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
@@ -583,6 +589,7 @@ class LinearTTTAttention(nn.Module):
             init_momentum=st['mom_state'], return_momentum=True,
         )
         st['w0'], st['w1'], st['w2'] = w0.detach(), w1.detach(), w2.detach()
+        st['written'] = True
         st['mom_state'] = None if mom is None else tuple(x.detach() for x in mom)
         keep = lambda x: None if x is None else x[:, C:]
         st['k_buf'], st['v_buf'] = keep(st['k_buf']), keep(st['v_buf'])
@@ -787,6 +794,9 @@ class LinearTTTAttention(nn.Module):
             r = q_len - C * n_upd
             tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
             past_key_value.states[self.layer_idx] = {
+                # Decode cannot recover this from q_len: every decode step has
+                # q_len 1 whether or not prefill actually ran the inner loop.
+                'written': n_upd > 0,
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
                 'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
                 'k_buf': tail(ttt_k), 'v_buf': tail(ttt_v),

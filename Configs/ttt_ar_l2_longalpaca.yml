@@ -18,6 +18,13 @@ model:
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
+  ttt_gate: 'sigmoid'            # MUST match stage 1. A sigmoid-trained gate goes
+                                 # negative, and silu(negative) is negative while
+                                 # sigmoid(negative) is positive -- a mismatch here
+                                 # flips the sign of the whole TTT contribution.
+  ttt_scale_init_bias: -3.0      # unused here (the gate loads trained), but the
+                                 # validator rejects sigmoid above -1.0, so stage 2
+                                 # will not even construct without it.
   fw_init_gain: 1.0
   ttt_use_momentum: True
   ttt_use_muon: True
