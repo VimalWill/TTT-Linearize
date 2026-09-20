@@ -186,6 +186,11 @@ def train(config):
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=0,
             num_train_epochs=config.train.epochs,
+            # Without this the LR schedule is sized to a FULL epoch (~2.2k
+            # steps here) and every run we have killed at 400 stopped at 81%
+            # of peak LR, never annealed. max_steps overrides epochs and makes
+            # the linear decay match the budget actually spent.
+            max_steps=int(config.train.get('max_steps', -1)),
             learning_rate=config.train.lr,
             bf16=True,
             max_grad_norm=config.train.max_grad_norm,

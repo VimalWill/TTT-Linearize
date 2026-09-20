@@ -26,6 +26,8 @@ train:
   optim: 'adamw_torch'
   lr: 0.0002
   epochs: 1
+  max_steps: ${oc.env:TTT_MAX_STEPS,400}   # the budget, AND the LR decays to 0
+                                  # over exactly these steps. Overrides epochs.
   max_grad_norm: 1.0
   mse_factor: 1000
   lm_loss_weight: 1.0
