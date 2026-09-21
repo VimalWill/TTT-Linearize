@@ -34,8 +34,9 @@ train:
   optim: 'adamw_torch'
   lr: 0.0001
   epochs: 1            # matched to the anchor arm
-  max_steps: ${oc.env:TTT_MAX_STEPS,200}   # the budget, AND the LR decays to 0
-                                  # over exactly these steps. Overrides epochs.
+  max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
+                   # and stage 2 was still falling -0.052/100 when it hit that wall.
+                   # The LR also decays to 0 across exactly these steps.
   max_grad_norm: 1.0
   gradient_checkpointing: True
   eval_steps: 100   # 25 spent ~15-20% of compute on eval; best_ckpt still

@@ -10,7 +10,7 @@ and eta is reapplied afterwards, so lr alone sets how hard each chunk is written
 LR miscalibration is one hypothesis for degradation after chunk updates;
 these statistics alone do not establish its effect on language-model loss.
 
-    python diag_lr.py --cfg configs/ttt_ar_unified.yml --ckpt BASE --adapter ADAPTER
+    python diag_lr.py --cfg Configs/ttt_ar_unified_longalpaca.yml --ckpt BASE --adapter ADAPTER
 
 Prints per-layer lr and retention stats on the training corpus vs wikitext.
 Shared writers and private-memory layers update memory. Reader projections are

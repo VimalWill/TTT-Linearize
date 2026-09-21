@@ -393,7 +393,7 @@ def resolve(tasks):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cfg', default='Configs/ttt_ar_l2.yml')
+    ap.add_argument('--cfg', default='Configs/ttt_ar_l2_longalpaca.yml')
     ap.add_argument('--ckpt', default=None,
                     help='checkpoint to evaluate; omit only with --baseline')
     ap.add_argument('--baseline', action='store_true',

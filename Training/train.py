@@ -191,7 +191,7 @@ def train(config):
             # of peak LR, never annealed. max_steps overrides epochs and makes
             # the linear decay match the budget actually spent.
             max_steps=int(config.train.get('max_steps', -1)),
-            learning_rate=config.train.lr,
+            learning_rate=float(config.train.lr),   # may arrive as str via oc.env
             bf16=True,
             max_grad_norm=config.train.max_grad_norm,
             logging_steps=1,
