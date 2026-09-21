@@ -432,6 +432,14 @@ def main():
                          'Retrieval: run at the TRAINED length -- past it both '
                          'shared and per-layer decay, so a longer sweep measures '
                          'extrapolation, not retrieval')
+    ap.add_argument('--chunk', type=int, default=None,
+                    help='override lact_chunk_size. Not a learned parameter -- it only '
+                         'slices the inner loop -- so it can be changed without '
+                         'retraining. Caveat: retention_proj and lr_proj were FIT at the '
+                         'trained chunk, so a smaller one fires them more often and '
+                         'shortens the effective horizon. An improvement is therefore '
+                         'strong evidence and a regression is ambiguous. Must stay <= '
+                         'window_size.')
     ap.add_argument('--data-path', default=None,
                     help='retrieval: override corpus (default is the TRAINING corpus)')
     ap.add_argument('--data-name', default=None)
@@ -492,6 +500,15 @@ def main():
     else:
         cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
         cfg.model.pretrained_model_name_or_path = args.ckpt
+        if args.chunk:
+            win = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
+            if args.chunk > win:
+                raise SystemExit(
+                    f'--chunk {args.chunk} exceeds window_size {win}; the model '
+                    'requires window_size >= lact_chunk_size')
+            print(f'chunk override: {cfg.model.lact_chunk_size} -> {args.chunk} '
+                  f'(window {win} unchanged, so the attention path is identical)')
+            cfg.model.lact_chunk_size = args.chunk
         model_config = build_model_config(cfg)
         model = load_model(args.ckpt, model_config, args.adapter)
         mods = ttt_layers(model)
