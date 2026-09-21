@@ -60,6 +60,51 @@ def load_model(path, model_config, adapter=None, verbose=True):
     return model.eval()
 
 
+def shrink_memories(mods, frac, select='norm', seed=0):
+    """Zero all but `frac` of each memory's hidden channels, in place.
+
+    w0/w2 are [heads, d_h, d_in] and w1 is [heads, d_out, d_h], so hidden
+    channel j is row j of w0 and w2 and column j of w1. Killing all three is
+    equivalent to building the layer with a smaller d_h: the channel cannot
+    come back, because the inner loop's gradient into it is gated by exactly
+    the weights that were zeroed.
+    """
+    if not 0 < frac <= 1:
+        raise SystemExit(f'--keep-frac must be in (0, 1], got {frac}')
+    g = torch.Generator().manual_seed(seed)
+    total = kept_total = 0
+    with torch.no_grad():
+        for m in mods:
+            if not getattr(m, '_ttt_enabled', False) or not hasattr(m, 'w0'):
+                continue
+            h, d_h, _ = m.w0.shape
+            keep = max(1, int(round(d_h * frac)))
+            for i in range(h):
+                if select == 'norm':
+                    # rank by the channel's total footprint across all three
+                    sc = (m.w0[i].norm(dim=1) ** 2 + m.w2[i].norm(dim=1) ** 2
+                          + m.w1[i].norm(dim=0) ** 2)
+                    idx = torch.topk(sc, keep).indices
+                elif select == 'random':
+                    idx = torch.randperm(d_h, generator=g)[:keep]
+                else:
+                    idx = torch.arange(keep)
+                mask = torch.zeros(d_h, dtype=torch.bool)
+                mask[idx] = True
+                dead = ~mask
+                m.w0[i][dead] = 0
+                m.w2[i][dead] = 0
+                m.w1[i][:, dead] = 0
+            total += h * d_h
+            kept_total += h * keep
+    if not total:
+        raise SystemExit('--keep-frac given but no layer has fast weights')
+    # fp32 state: 3 matrices per head, each keep x 128
+    print(f'capacity: kept {kept_total}/{total} hidden channels '
+          f'({100 * kept_total / total:.1f}%), select={select}')
+    return kept_total / total
+
+
 def ttt_layers(model):
     base = getattr(model, 'model', model)
     base = getattr(base, 'model', base)
@@ -512,6 +557,8 @@ def main():
         model_config = build_model_config(cfg)
         model = load_model(args.ckpt, model_config, args.adapter)
         mods = ttt_layers(model)
+        if args.keep_frac is not None:
+            shrink_memories(mods, args.keep_frac, args.keep_select, args.keep_seed)
         if args.identity_readers:
             aligned = [m for m in mods if m.ttt_reader_alignment is not None]
             if not aligned:
