@@ -20,7 +20,11 @@ model:
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0
   ttt_layer_indices: [0, 1, 28, 29, 30, 31]   # DEPLOY: interior TTT not built
-  ttt_idle_zero: True    # loop never runs below chunk -> readout has no context
+  # ttt_idle_zero: True   # REMOVED 2026-09-21. It zeroes the readout whenever
+  #   q_len <= lact_chunk_size, which on commonsense (all prompts < 512) makes
+  #   this config identical to --ablate ttt. It was a hack for the silu
+  #   checkpoint; anchor_v2 trains a sigmoid gate on the short mixture, so
+  #   whether the gate closes by itself IS the measurement.
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
   ttt_gate: 'sigmoid'            # MUST match stage 1 (ttt_at_anchor_gate). A
