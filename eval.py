@@ -462,6 +462,20 @@ def main():
     ap.add_argument('--layers', type=int, nargs='+', default=None,
                     help='layers to ablate; omit with --ablate for whole-branch')
     ap.add_argument('--out', default='eval')
+    ap.add_argument('--keep-frac', type=float, default=None,
+                    help='CAPACITY SWEEP: keep this fraction of each memory\'s d_h '
+                         'SwiGLU hidden channels and zero the rest. Verified '
+                         'equivalent to a smaller d_h -- a dead channel gets exactly '
+                         'zero gradient through the inner loop. Zero-shot.')
+    ap.add_argument('--keep-select', choices=['norm', 'random', 'last'], default='norm',
+                    help="which channels survive: 'norm' keeps the largest-norm per "
+                         "head (kindest cut), 'random' the average case, 'last' a "
+                         "fixed arbitrary control")
+    ap.add_argument('--keep-seed', type=int, default=0)
+    ap.add_argument('--log-samples', action='store_true',
+                    help='also write <out>.samples.json with per-document prompt, '
+                         'target, output and per-sample metric -- needed for error '
+                         'bars and for bucketing by answer position')
     # ---- AR-slice retrieval sweep (does not use lm_eval) ----
     ap.add_argument('--retrieval', action='store_true',
                     help='per-layer x retrieval-distance ablation sweep -> CSV')
@@ -606,6 +620,8 @@ def main():
               batch_size=args.batch_size, max_length=eval_len)
 
     kwargs = dict(model=lm, tasks=tasks, task_manager=tm, limit=args.limit)
+    if args.log_samples:
+        kwargs['log_samples'] = True
     if args.num_fewshot is not None:
         kwargs['num_fewshot'] = args.num_fewshot
 
@@ -638,6 +654,13 @@ def main():
                    'identity_readers': args.identity_readers,
                    'results': flat}, f, indent=2)
     print(f'\nwrote {path}')
+
+    if args.log_samples and res.get('samples'):
+        spath = f'{args.out}{tag}.samples.json'
+        with open(spath, 'w') as f:
+            json.dump(res['samples'], f)
+        n = sum(len(v) for v in res['samples'].values())
+        print(f'wrote {spath} ({n} samples)')
 
 
 if __name__ == '__main__':
