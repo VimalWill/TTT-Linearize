@@ -1,0 +1,57 @@
+# DEPLOYMENT config -- same checkpoint as ttt_ar_unified_longalpaca.yml, but the
+# interior TTT memories are never constructed. 2 memories, 12.6 MB of state.
+# Interior TTT keys in the checkpoint load as unexpected and are discarded.
+data:
+  name: "longalpaca"
+  path: "Yukang/LongAlpaca-12k"
+  num_train_docs: 12000
+  num_val_docs: 200
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_ar'
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_gate/best_ckpt}
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0
+  ttt_layer_indices: [0, 1, 28, 29, 30, 31]   # DEPLOY: interior TTT not built
+  # ttt_idle_zero: True   # REMOVED 2026-09-21. It zeroes the readout whenever
+  #   q_len <= lact_chunk_size, which on commonsense (all prompts < 512) makes
+  #   this config identical to --ablate ttt. It was a hack for the silu
+  #   checkpoint; anchor_v2 trains a sigmoid gate on the short mixture, so
+  #   whether the gate closes by itself IS the measurement.
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  ttt_gate: 'sigmoid'            # MUST match stage 1 (ttt_at_anchor_gate). A
+                                 # sigmoid-trained gate goes negative, and
+                                 # silu(negative) is negative while sigmoid(negative)
+                                 # is positive -- a mismatch flips the sign of the
+                                 # whole TTT contribution.
+  ttt_scale_init_bias: -3.0      # unused (gate loads trained), but the validator
+                                 # rejects sigmoid above -1.0, so it will not build.
+  fw_init_gain: 1.0
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0001
+  epochs: 1
+  max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
+                   # and stage 2 was still falling -0.052/100 when it hit that wall.
+                   # The LR also decays to 0 across exactly these steps.
+  max_grad_norm: 1.0
+  gradient_checkpointing: True
+  eval_steps: 100
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
+  train_qk: True
+  train_qk_lora: True
+  train_v: True
+  train_v_lora: True

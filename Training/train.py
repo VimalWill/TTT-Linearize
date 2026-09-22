@@ -26,6 +26,7 @@ TTT_PARAM_KEYS = (
     '.w0', '.w1', '.w2',
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
     'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj', 'retention_proj',
+    'ttt_reader_alignment',
 )
 
 # yml `model:` keys consumed by the harness rather than by the model config
@@ -63,6 +64,19 @@ def build_model_config(config):
 def set_trainable_params(model, config):
     """Decide the trainable set. Must run *after* get_peft_model, which marks
     every non-adapter parameter frozen."""
+    if config.train.get('reader_alignment_only', False):
+        count = 0
+        for name, param in model.named_parameters():
+            param.requires_grad = 'ttt_reader_alignment.weight' in name
+            if param.requires_grad:
+                # FP32 optimizer parameters preserve small steps near I even
+                # when the model/readout matmul uses BF16.
+                param.data = param.data.float()
+                count += param.numel()
+        if not count:
+            raise ValueError('reader_alignment_only requires enabled reader maps')
+        print(f'-> Training only {count:,} reader-alignment parameters')
+        return model
     train_ttt = config.model.get('attn_varient', None) == 'ttt' or \
         config.model.get('attn_variant', None) == 'ttt'
     for name, param in model.named_parameters():
@@ -73,12 +87,29 @@ def set_trainable_params(model, config):
     return model
 
 
+def resume_stage2(model, adapter):
+    """Merge an existing stage-2 adapter plus ALL its saved TTT tensors."""
+    from eval import load_ttt_params
+    path = os.path.join(adapter, 'ttt_params.pt')
+    if not os.path.isfile(path):
+        raise ValueError(f'Alignment continuation requires stage-2 TTT weights: {path}')
+    saved_count = len(torch.load(path, map_location='cpu', weights_only=True))
+    if load_ttt_params(model, adapter) != saved_count:
+        raise ValueError('Not all stage-2 TTT weights matched; check the model config')
+    return PeftModel.from_pretrained(model, adapter).merge_and_unload()
+
+
 def train(config):
     from Training.dataloader import load_data
 
     # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
     #        'ttt_ar' = autoregressive finetune on the LM loss
     stage = config.model.name
+    alignment_only = config.train.get('reader_alignment_only', False)
+    if alignment_only and stage != 'ttt_ar':
+        raise ValueError('The alignment-only study uses autoregressive CE training')
+    if alignment_only and os.path.isdir(config.train.output_dir) and os.listdir(config.train.output_dir):
+        raise ValueError('Use a fresh output directory for the alignment study')
     trainer = DefaultTrainer if stage.endswith('_at') else FinetuneTrainer
     if stage not in ('liger_gla', 'ttt_at', 'ttt_ar'):
         raise NotImplementedError(stage)
@@ -89,6 +120,9 @@ def train(config):
         config=model_config,
         device_map=config.model.get('device_map', 'auto'),
     ).to(torch.bfloat16)
+
+    if config.train.get('resume_adapter'):
+        model = resume_stage2(model, config.train.resume_adapter)
 
 
     print("Model config:")
@@ -104,7 +138,7 @@ def train(config):
     # pretrained projections have to stay exactly as the teacher sees them, or
     # the regression target moves with the student.
     target_modules = []
-    if stage != 'ttt_at':
+    if stage != 'ttt_at' and not alignment_only:
         if "train_qk" in config.train and config.train.train_qk and config.train.train_qk_lora:
             target_modules.append("self_attn.q_proj")
             target_modules.append("self_attn.k_proj")
@@ -117,6 +151,9 @@ def train(config):
         model = get_peft_model(model, peft_config=lora_config)
 
     set_trainable_params(model, config)
+    if alignment_only:
+        os.makedirs(config.train.output_dir, exist_ok=True)
+        OmegaConf.save(config, os.path.join(config.train.output_dir, 'study_config.yaml'), resolve=True)
 
     # Without this every one of the 32 layers keeps its activations for backward.
     # At 8192 tokens that alone is ~40GB, on top of 16GB of weights and the
@@ -149,7 +186,12 @@ def train(config):
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=0,
             num_train_epochs=config.train.epochs,
-            learning_rate=config.train.lr,
+            # Without this the LR schedule is sized to a FULL epoch (~2.2k
+            # steps here) and every run we have killed at 400 stopped at 81%
+            # of peak LR, never annealed. max_steps overrides epochs and makes
+            # the linear decay match the budget actually spent.
+            max_steps=int(config.train.get('max_steps', -1)),
+            learning_rate=float(config.train.lr),   # may arrive as str via oc.env
             bf16=True,
             max_grad_norm=config.train.max_grad_norm,
             logging_steps=1,

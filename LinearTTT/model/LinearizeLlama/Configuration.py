@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import math
+
 from typing import Dict, Optional
 
 from transformers.configuration_utils import PretrainedConfig
@@ -49,6 +51,10 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         # the lowest index writes, the rest read its per-chunk trajectory with
         # their own q. One parameter set and one live state per group.
         ttt_share_groups=None,
+        ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
+        ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
+        ttt_gate='silu',          # output gate: 'silu' (legacy) or 'sigmoid' (gamma in [0,1])
+        ttt_idle_zero=False,      # zero the readout when the inner loop never ran
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
         ttt_prenorm=False,        # use the prenorm variant of the TTT operator
@@ -89,6 +95,10 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_inner_loss = ttt_inner_loss
         self.ttt_retention_init_bias = ttt_retention_init_bias
         self.ttt_share_groups = ttt_share_groups
+        self.ttt_layer_indices = ttt_layer_indices
+        self.ttt_reader_alignment = ttt_reader_alignment
+        self.ttt_gate = ttt_gate
+        self.ttt_idle_zero = ttt_idle_zero
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
         self.ttt_prenorm = ttt_prenorm
@@ -101,6 +111,23 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
             raise ValueError('lact_chunk_size must be a positive integer')
         groups = self.ttt_share_groups or []
+        active = (set(range(self.num_hidden_layers)) if self.ttt_layer_indices is None
+                  else set(self.ttt_layer_indices))
+        if self.ttt_layer_indices is not None and any(type(i) is not int or not 0 <= i < self.num_hidden_layers for i in active):
+            raise ValueError('ttt_layer_indices must contain valid layer indices')
+        if self.ttt_reader_alignment not in ('none', 'linear'):
+            raise ValueError('ttt_reader_alignment must be "none" or "linear"')
+        if self.ttt_gate not in ('silu', 'sigmoid'):
+            raise ValueError('ttt_gate must be "silu" or "sigmoid"')
+        # silu(0.1)=0.052 leaves the branch nearly shut so the pretrained residual
+        # stream survives step 0. sigmoid(0.1)=0.525 would open it halfway and
+        # wreck the model at init; sigmoid(-3.0)=0.047 matches the silu default.
+        if self.ttt_gate == 'sigmoid' and self.ttt_scale_init_bias > -1.0:
+            raise ValueError(
+                f'ttt_gate="sigmoid" with ttt_scale_init_bias='
+                f'{self.ttt_scale_init_bias} opens the gate to '
+                f'{1/(1+math.exp(-self.ttt_scale_init_bias)):.3f} at init. '
+                'Use about -3.0 (sigmoid -> 0.047, matching silu(0.1)=0.052).')
         if not isinstance(groups, (list, tuple)):
             raise ValueError('ttt_share_groups must be a list of layer groups')
         if groups and self.ttt_inner_loss != 'l2':
@@ -115,8 +142,12 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
                 if index in seen:
                     raise ValueError(f'Layer {index} occurs more than once in ttt_share_groups')
                 seen.add(index)
+                if index not in active:
+                    raise ValueError('Every shared-memory layer must retain the TTT branch')
             if isinstance(self.ttt_inter_multi, (list, tuple)):
                 if len(self.ttt_inter_multi) != self.num_hidden_layers:
                     raise ValueError('ttt_inter_multi must contain one value per layer')
                 if len({self.ttt_inter_multi[i] for i in group}) != 1:
                     raise ValueError('ttt_inter_multi must match within each shared group')
+        if self.ttt_reader_alignment != 'none' and not any(len(g) > 1 for g in groups):
+            raise ValueError('Reader alignment requires at least one shared-memory reader')

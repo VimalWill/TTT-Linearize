@@ -10,7 +10,7 @@ and eta is reapplied afterwards, so lr alone sets how hard each chunk is written
 LR miscalibration is one hypothesis for degradation after chunk updates;
 these statistics alone do not establish its effect on language-model loss.
 
-    python diag_lr.py --cfg configs/ttt_ar_unified.yml --ckpt BASE --adapter ADAPTER
+    python diag_lr.py --cfg Configs/ttt_ar_unified_longalpaca.yml --ckpt BASE --adapter ADAPTER
 
 Prints per-layer lr and retention stats on the training corpus vs wikitext.
 Shared writers and private-memory layers update memory. Reader projections are
@@ -86,6 +86,12 @@ def main():
     ap.add_argument('--adapter', default=None)
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--seq-len', type=int, default=8192)
+    ap.add_argument('--ood', default='wikitext',
+                    help="out-of-domain corpus: 'wikitext' (default), or an lm_eval "
+                         "task id such as 'swde'/'fda' to probe the ACTUAL eval "
+                         "distribution. lr_proj was fit on the training corpus; if "
+                         "token LR runs hot on HTML, every chunk overwrites the "
+                         "memory harder than it was calibrated for.")
     args = ap.parse_args()
 
     config = OmegaConf.create(OmegaConf.to_container(OmegaConf.load(args.cfg), resolve=True))
@@ -106,19 +112,32 @@ def main():
     from Training.dataloader import load_data
     pg = next(iter(load_data(config)['validation']))['input_ids'][:1]
 
-    # ---- out-of-domain batch: wikitext, same length ----
-    from datasets import load_dataset
+    # ---- out-of-domain batch, same length ----
     tok = AutoTokenizer.from_pretrained(args.base)
-    txt = '\n\n'.join(load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')['text'])
+    if args.ood == 'wikitext':
+        from datasets import load_dataset
+        txt = '\n\n'.join(load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')['text'])
+    else:
+        # Concatenate the task's own prompts. This probes the exact distribution
+        # the recall evals run on, which is the point: SWDE is HTML and the
+        # memory's lr_proj/retention_proj only ever saw the training prose.
+        from lm_eval.tasks import TaskManager, get_task_dict
+        td = get_task_dict([args.ood], TaskManager())
+        task = next(iter(td.values()))
+        while isinstance(task, dict):
+            task = next(iter(task.values()))
+        docs = list(task.eval_docs)
+        txt = '\n\n'.join(task.doc_to_text(d) for d in docs)
+        print(f'ood task {args.ood}: {len(docs)} docs')
     wt = tok(txt, return_tensors='pt').input_ids[:, :args.seq_len]
     if wt.shape[1] < args.seq_len:
-        raise SystemExit(f'wikitext gave only {wt.shape[1]} tokens')
-    print(f'pg19 {tuple(pg.shape)}, wikitext {tuple(wt.shape)}')
+        raise SystemExit(f'{args.ood} gave only {wt.shape[1]} tokens')
+    print(f'in-domain {tuple(pg.shape)}, {args.ood} {tuple(wt.shape)}')
 
     a, b = probe(model, mods, pg), probe(model, mods, wt)
 
     print(f'\n{"":6}{"":9}{"--------- in-domain ---------":>30}'
-          f'{"--------- wikitext ----------":>30}{"":>10}')
+          f'{"--------- " + args.ood + " ":->29}-{"":>10}')
     print(f'{"layer":>6} {"role":>13}' + ''.join(f'{h:>7}' for h in
           ('mean', 'p50', 'p99', 'max')) * 2 + f'{"p99 x":>10}')
     worst = []
@@ -135,7 +154,7 @@ def main():
                   + ''.join(f'{v:>7.3f}' for v in y) + f'{ratio:>10.2f}')
             if kind == 'lr' and role != 'reader':
                 worst.append((ratio, i, role))
-    print('\np99 x = wikitext p99 / in-domain p99. For lr, >1 means higher '
+    print(f'\np99 x = {args.ood} p99 / in-domain p99. For lr, >1 means higher '
           'token LR p99; for ret, >1 means higher retention p99. '
           'Neither alone establishes the cause of degradation.')
     worst.sort(reverse=True)

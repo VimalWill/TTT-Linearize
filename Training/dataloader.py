@@ -46,7 +46,7 @@ def load_data(config):
         'datasets'
     )
     input_len = config.model.max_length
-    concat_data = True
+    concat_data = bool(config.data.get('concat_data', True))
 
     tokenizer_path = config.model.pretrained_model_name_or_path
     tokenizer_name = tokenizer_path.split('/')[-1]
@@ -86,6 +86,52 @@ def load_data(config):
         val_set = _take("validation", n_val_docs)
         test_set = _take("test", n_val_docs)
         cols = list(train_set.features)
+    elif "longalpaca" in data_name.lower().replace("-", "").replace("_", "").replace(" ", ""):
+        # LongAlpaca: long instruction/answer pairs, one DOCUMENT per row, so
+        # unlike wikitext the per-row BOS/EOS from the LM formatter is correct --
+        # it marks real document boundaries. The Alpaca prompt template is NOT
+        # used: it masks the instruction to -100, and ConcatDataset then drops
+        # any packed chunk that is all prompt, which at 8k-32k silently discards
+        # most of the corpus. Every token is supervised instead.
+        # Matched on "longalpaca" specifically -- the default data_name is
+        # "alpaca_cleand", which a bare "alpaca" test would hijack.
+        formatter = partial(template_and_tokenize_lm, tokenizer=tokenizer)
+        min_chars = int(config.data.get("min_doc_chars", 0))
+        # eval.py sets num_val_seqs; training configs do not. Under eval we need
+        # enough TOKENS to fill --seqs windows, so budget by characters. Under
+        # training we want a sample COUNT, so honour num_{train,val}_docs.
+        eval_budget = config.data.get("num_val_seqs", None)
+
+        def _docs(skip, n_rows, n_chars=None):
+            rows, total = [], 0
+            it = load_dataset(data_path, split="train", streaming=True)
+            for row in itertools.islice(it, skip, None):
+                text = "\n\n".join(
+                    str(row[k]) for k in ("instruction", "input", "output")
+                    if row.get(k)
+                ) or str(row.get("text", ""))
+                if len(text) < min_chars:
+                    continue
+                rows.append({"text": text})
+                total += len(text)
+                if n_chars is not None and total >= n_chars:
+                    break
+                if n_chars is None and len(rows) >= n_rows:
+                    break
+            return convert_to_hf_dataset(rows, cache_dir), len(rows)
+
+        if eval_budget is not None:
+            # ~4.5 chars/token for Llama-3 on English; 5 leaves headroom
+            chars = int(input_len) * int(eval_budget) * 5
+            val_set, n_val_rows = _docs(0, 0, chars)
+            train_set, _ = _docs(n_val_rows, 0, chars)
+        else:
+            n_val = int(config.data.get("num_val_docs", 200))
+            n_train = int(config.data.get("num_train_docs", 12000))
+            val_set, n_val_rows = _docs(0, n_val)
+            train_set, _ = _docs(n_val_rows, n_train)
+        test_set = val_set
+        cols = list(val_set.features)
     elif "wikitext" in data_name.lower():
         # WikiText rows are single LINES, not documents, so the pg19 branch is
         # wrong for it three ways: it shuffles rows (scrambling articles, which
@@ -173,6 +219,32 @@ def load_data(config):
     if concat_data:
         train_set = ConcatDataset(train_set, chunk_size=input_len)
         val_set = ConcatDataset(val_set, chunk_size=input_len)
+
+    # Optional short-example mixture. Packed training gives the output gate only
+    # sequences where the memory is written and informative; it never sees the
+    # regime it has to shut off in. These stay UNPACKED at natural length.
+    short_path = config.data.get('short_mix_path', None)
+    if short_path:
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError(
+                'short_mix_path requires micro_batch_size 1: the collator pads to '
+                'the batch maximum, which would stretch short examples back over '
+                'lact_chunk_size and defeat the mixture')
+        n_short = int(config.data.get('short_mix_docs', 4000))
+        short_name = config.data.get('short_mix_name', None)
+        args = (short_path, short_name) if short_name else (short_path,)
+        rows = []
+        for row in itertools.islice(load_dataset(*args, split='train', streaming=True), n_short):
+            text = "\n\n".join(str(row[k]) for k in ('instruction', 'input', 'output')
+                                if row.get(k)) or str(row.get('text', ''))
+            if text.strip():
+                rows.append({'text': text})
+        short_set = convert_to_hf_dataset(rows, cache_dir).map(
+            partial(template_and_tokenize_lm, tokenizer=tokenizer, include_label=True),
+            remove_columns=['text'])
+        train_set = MixedDataset(train_set, short_set)
+        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path} '
+              f'({len(train_set)} training samples total)')
 
     loader_kwargs = {
         "batch_size": config.data.micro_batch_size,
@@ -330,6 +402,33 @@ def download_metric():
     )
     shutil.copy(scrolls_metric_path, updated_scrolls_metric_path)
     return updated_scrolls_metric_path
+
+class MixedDataset(Dataset):
+    """Two datasets end to end, each keeping its own sample lengths.
+
+    Used to put SHORT examples (under lact_chunk_size, where the TTT inner loop
+    never runs) next to packed long ones, so the output gate gets gradient in
+    both regimes. Holds references rather than copying -- the packed side is
+    already hundreds of MB of python lists.
+
+    Requires micro_batch_size 1: the collator pads to the batch maximum, so a
+    batch mixing a 200-token example with an 8192-token one would pad the short
+    one up to 8192 and the inner loop would fire on padding.
+    """
+    def __init__(self, *parts):
+        self.parts = [p for p in parts if len(p)]
+        self.lens = [len(p) for p in self.parts]
+
+    def __len__(self):
+        return sum(self.lens)
+
+    def __getitem__(self, idx):
+        for part, n in zip(self.parts, self.lens):
+            if idx < n:
+                return part[idx]
+            idx -= n
+        raise IndexError(idx)
+
 
 class ConcatDataset(Dataset):
     """

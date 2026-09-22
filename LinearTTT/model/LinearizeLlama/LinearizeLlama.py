@@ -162,6 +162,32 @@ def sliding_window_attention(
     output = _compiled_flex_attention()(q, k, v, block_mask=block_mask, scale=scale)
     return output
 
+class ReaderOutputAlignment(nn.Module):
+    """Head-wise A_h y_h, initialized to I; unconstrained, not a rotation.
+
+    Kept as a separate module so missing weights in an older checkpoint are
+    explicitly identity-initialized by the Hugging Face loading path.
+    """
+    def __init__(self, heads, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(dim).repeat(heads, 1, 1))
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.weight.copy_(torch.eye(self.weight.shape[-1], device=self.weight.device,
+                                        dtype=self.weight.dtype).expand_as(self.weight))
+
+    def forward(self, readout):
+        heads, dim = self.weight.shape[:2]
+        batch_heads, tokens, width = readout.shape
+        if width != dim or batch_heads % heads:
+            raise ValueError('Readout shape does not match reader alignment heads/dim')
+        batch = batch_heads // heads
+        weights = self.weight.to(readout.dtype).unsqueeze(0).expand(batch, -1, -1, -1)
+        return torch.matmul(readout.reshape(batch, heads, tokens, dim),
+                            weights.transpose(-1, -2)).reshape_as(readout)
+
+
 class LinearTTTAttention(nn.Module):
 
     def __init__(
@@ -246,38 +272,57 @@ class LinearTTTAttention(nn.Module):
                 f'ttt_head_dim={self.ttt_head_dim}'
             )
         gain = getattr(config, 'fw_init_gain', 0.5)
+
+        # Layers outside ttt_layer_indices keep the sliding-window branch and
+        # the pretrained block but carry NO test-time memory: no fast weights,
+        # no inner loop, no per-sequence state. Handled here rather than with a
+        # separate layer class, because a class built on LlamaDecoderLayer
+        # inherits FULL softmax attention and silently de-linearises the model.
+        _active = getattr(config, 'ttt_layer_indices', None)
+        self._ttt_enabled = _active is None or layer_idx in set(_active)
+
+        if self._ttt_enabled:
+            self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+            self.w1 = nn.Parameter(torch.randn(self.num_ttt_heads, d_out, d_h) / math.sqrt(d_h) * gain)
+            self.w2 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+
+            # per-token, per-head inner-loop learning rate (one scalar per fast weight)
+            self.lr_proj = nn.Linear(self.hidden_size, 3 * self.num_ttt_heads)
+            self.base_lr_inv = inv_softplus(getattr(config, 'ttt_base_lr', 1e-2))
+
+            if self.ttt_use_momentum:
+                self.momentum_proj = nn.Sequential(
+                    nn.Linear(self.hidden_size, self.num_ttt_heads),
+                    nn.Sigmoid(),
+                )
+
+            # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
+            # Eq. 8's renormalisation, which this would double up on.
+            self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
+            if self.ttt_inner_loss == 'l2':
+                self.retention_proj = nn.Sequential(
+                    nn.Linear(self.hidden_size, self.num_ttt_heads),
+                    nn.Sigmoid(),
+                )
+
        
-        self.w0 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
-        self.w1 = nn.Parameter(torch.randn(self.num_ttt_heads, d_out, d_h) / math.sqrt(d_h) * gain)
-        self.w2 = nn.Parameter(torch.randn(self.num_ttt_heads, d_h, d_in) / math.sqrt(d_in) * gain)
+            self.ttt_qk_scale = nn.Parameter(torch.ones(2, self.inner_dim))
+            self.ttt_qk_offset = nn.Parameter(torch.zeros(2, self.inner_dim))
 
-        # per-token, per-head inner-loop learning rate (one scalar per fast weight)
-        self.lr_proj = nn.Linear(self.hidden_size, 3 * self.num_ttt_heads)
-        self.base_lr_inv = inv_softplus(getattr(config, 'ttt_base_lr', 1e-2))
-
-        if self.ttt_use_momentum:
-            self.momentum_proj = nn.Sequential(
-                nn.Linear(self.hidden_size, self.num_ttt_heads),
-                nn.Sigmoid(),
-            )
-
-        # Atlas Eq. 32's alpha_t. Only the l2 path uses it; the dot path keeps
-        # Eq. 8's renormalisation, which this would double up on.
-        self.ttt_retention_init_bias = getattr(config, 'ttt_retention_init_bias', 4.0)
-        if self.ttt_inner_loss == 'l2':
-            self.retention_proj = nn.Sequential(
-                nn.Linear(self.hidden_size, self.num_ttt_heads),
-                nn.Sigmoid(),
-            )
-
-       
-        self.ttt_qk_scale = nn.Parameter(torch.ones(2, self.inner_dim))
-        self.ttt_qk_offset = nn.Parameter(torch.zeros(2, self.inner_dim))
-
-        self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
-        self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
-        self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
-        self.fw_init_gain = gain
+            self.ttt_norm = LlamaRMSNorm(self.ttt_head_dim, eps=config.rms_norm_eps)
+            self.ttt_scale_proj = nn.Linear(self.hidden_size, self.num_ttt_heads)
+            self.ttt_scale_init_bias = getattr(config, 'ttt_scale_init_bias', 0.1)
+            # 'sigmoid' makes the gate a true mixing weight gamma in [0,1]:
+            # o = gamma * o_ttt + o_swa. 'silu' spans (-0.2785, inf) and is
+            # NON-monotonic near zero, so gamma=0 is reachable only through a
+            # -0.2785 detour -- the branch cannot cleanly learn to shut off.
+            self.ttt_gate = getattr(config, 'ttt_gate', 'silu')
+            # Below lact_chunk_size the operator's loop never executes, so the
+            # readout is a fixed function of q with zero context in it; zeroing
+            # it there discards nothing. Prefill only -- after a prefill that
+            # DID update the memory, decode steps have q_len 1 but a written one.
+            self.ttt_idle_zero = getattr(config, 'ttt_idle_zero', False)
+            self.fw_init_gain = gain
 
         # Incremental decode cache: the converged fast weights plus a rolling
         # k/v window, set at the end of prefill. None means "not decoding".
@@ -308,6 +353,13 @@ class LinearTTTAttention(nn.Module):
                 self._share_size = len(g)
                 break
 
+        self.ttt_reader_alignment = (
+            ReaderOutputAlignment(self.num_ttt_heads, self.ttt_head_dim)
+            if getattr(config, 'ttt_reader_alignment', 'none') == 'linear'
+            and self._share_gid is not None and not self._share_leader else None
+        )
+        self._identity_reader_alignment = False
+
         # reset_ttt_parameters reads _share_gid/_share_leader, so the share
         # group must be resolved BEFORE it runs.
         self.reset_ttt_parameters()
@@ -325,6 +377,8 @@ class LinearTTTAttention(nn.Module):
         Re-run from _init_weights: post_init() re-randomises every nn.Linear,
         including the output gate that must start nearly closed.
         """
+        if not self._ttt_enabled:
+            return
         d_in, d_h = self.ttt_head_dim, self.w0.shape[1]
         # A non-leader's w0/w1/w2 alias its leader's, and follower keys come
         # back missing from a shared checkpoint so _init_weights runs on them.
@@ -350,6 +404,16 @@ class LinearTTTAttention(nn.Module):
             nn.init.zeros_(self.retention_proj[0].weight)
             nn.init.constant_(self.retention_proj[0].bias,
                               self.ttt_retention_init_bias)
+
+    def _ttt_gate(self, hidden_states):
+        """Output gate. sigmoid -> gamma in [0,1]; silu -> the legacy range."""
+        z = self.ttt_scale_proj(hidden_states)
+        return torch.sigmoid(z) if self.ttt_gate == 'sigmoid' else F.silu(z)
+
+    def _align_ttt_readout(self, readout):
+        if self.ttt_reader_alignment is None or self._identity_reader_alignment:
+            return readout
+        return self.ttt_reader_alignment(readout)
 
     def _ttt_features(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """[b, n, inner_dim] -> [b * num_ttt_heads, n, ttt_head_dim]."""
@@ -383,8 +447,10 @@ class LinearTTTAttention(nn.Module):
         # decode-time equivalent of reading its trajectory. The leader is the
         # lowest index in the group, so it has already stepped this token --
         # including any deferred chunk update -- by the time we get here.
-        reader = self._share_gid is not None and not self._share_leader
-        if reader:
+        reader = self._ttt_enabled and self._share_gid is not None and not self._share_leader
+        if not self._ttt_enabled:
+            src = None
+        elif reader:
             src = past_key_value.states.get(self._share_leader_idx)
             if src is None:
                 raise RuntimeError(
@@ -428,6 +494,10 @@ class LinearTTTAttention(nn.Module):
         attn_out = F.scaled_dot_product_attention(aq, st['k'], st['v'])
         attn_out = rearrange(attn_out, 'b h n d -> b n (h d)')
 
+        if not self._ttt_enabled:
+            return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
+                    None, past_key_value, None)
+
         # ---- global branch: read the frozen memory ----
         # ttt_l2's tail-chunk readout: w1 @ (silu(w0 @ q) * (w2 @ q)).
         ttt_q, _, _ = self._ttt_features(
@@ -441,9 +511,9 @@ class LinearTTTAttention(nn.Module):
             gate = F.silu(torch.bmm(w0, qi))
             ttt_out = torch.bmm(w1, gate * torch.bmm(w2, qi)).transpose(1, 2)
 
-        ttt_out = self.ttt_norm(ttt_out.to(hidden_states.dtype))
+        ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out.to(hidden_states.dtype)))
         ttt_scale = rearrange(
-            F.silu(self.ttt_scale_proj(hidden_states)),
+            self._ttt_gate(hidden_states),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
         )
         ttt_out = ttt_out * ttt_scale.to(ttt_out.dtype)
@@ -452,6 +522,12 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        # A decode step always has q_len 1, so the prefill test in _merge_ttt
+        # cannot be reused here. Without this, a prompt shorter than one chunk
+        # is zeroed during prefill and then, from the very first generated
+        # token, reads fast weights the inner loop never touched.
+        if self.ttt_idle_zero and not src.get('written', True):
+            ttt_out = torch.zeros_like(ttt_out)
         if self._ablate_ttt:
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
@@ -513,6 +589,7 @@ class LinearTTTAttention(nn.Module):
             init_momentum=st['mom_state'], return_momentum=True,
         )
         st['w0'], st['w1'], st['w2'] = w0.detach(), w1.detach(), w2.detach()
+        st['written'] = True
         st['mom_state'] = None if mom is None else tuple(x.detach() for x in mom)
         keep = lambda x: None if x is None else x[:, C:]
         st['k_buf'], st['v_buf'] = keep(st['k_buf']), keep(st['v_buf'])
@@ -568,6 +645,15 @@ class LinearTTTAttention(nn.Module):
             block_mask_cache=self._block_mask_cache,
         )
         attn_out = rearrange(attn_out, 'b h n d -> b n (h d)')
+
+        if not self._ttt_enabled:
+            if use_cache:
+                keep = self.window_size + 1
+                past_key_value.states[self.layer_idx] = {
+                    'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
+                }
+            return (self.o_proj(attn_out.to(self.o_proj.weight.dtype)),
+                    None, past_key_value, None)
 
         # ---------------- global branch: test-time training ----------------
         if q_len <= self.lact_chunk_size:
@@ -648,8 +734,18 @@ class LinearTTTAttention(nn.Module):
         else:
             ttt_op = block_causal_lact_swiglu
 
-        if shared:
+        # Optional inference diagnostic: expose the actual per-chunk states
+        # for private memories as well. The callback runs outside the compiled
+        # operator and is never saved in a checkpoint/config.
+        observer = getattr(self, '_ttt_state_observer', None)
+        collect_trajectory = shared or observer is not None
+        if observer is not None and (self.training or self.ttt_inner_loss != 'l2'):
+            raise RuntimeError('TTT state observation requires eval mode and l2 memory')
+        if collect_trajectory:
             ttt_kwargs['return_trajectory'] = True
+        capture_decay = observer is not None and getattr(observer, 'capture_decay', False)
+        if capture_decay:
+            ttt_kwargs['return_decay'] = True
 
         if use_cache:
             if self.ttt_inner_loss != 'l2':
@@ -671,14 +767,26 @@ class LinearTTTAttention(nn.Module):
             momentum=momentum,
             **ttt_kwargs,
         )
+        if capture_decay:
+            # The diagnostic receives the multipliers actually applied inside
+            # the operator, including its reduction dtype and rounding.
+            decay = ttt_out[-1]
+            ttt_out = ttt_out[:-1]
         nmom = None
         traj = None
-        if use_cache and shared:
+        if use_cache and collect_trajectory:
             ttt_out, nw0, nw1, nw2, nmom, traj = ttt_out
         elif use_cache:
             ttt_out, nw0, nw1, nw2, nmom = ttt_out
-        elif shared:
+        elif collect_trajectory:
             ttt_out, nw0, nw1, nw2, traj = ttt_out
+        if observer is not None:
+            if capture_decay:
+                observer(self, traj, decay)
+            else:
+                observer(self, traj)
+        if not shared:
+            traj = None
         if use_cache:
             keep = self.window_size + 1
             C = self.lact_chunk_size
@@ -686,6 +794,9 @@ class LinearTTTAttention(nn.Module):
             r = q_len - C * n_upd
             tail = (lambda x: None if x is None or r == 0 else x[:, -r:].detach())
             past_key_value.states[self.layer_idx] = {
+                # Decode cannot recover this from q_len: every decode step has
+                # q_len 1 whether or not prefill actually ran the inner loop.
+                'written': n_upd > 0,
                 'w0': nw0.detach(), 'w1': nw1.detach(), 'w2': nw2.detach(),
                 'k': ak[:, :, -keep:].detach(), 'v': v[:, :, -keep:].detach(),
                 'k_buf': tail(ttt_k), 'v_buf': tail(ttt_v),
@@ -705,9 +816,9 @@ class LinearTTTAttention(nn.Module):
         Shared by the writer and reader paths of forward() so the two cannot
         drift; `ttt_out` arrives as [b*h, n, d] from either.
         """
-        ttt_out = self.ttt_norm(ttt_out)
+        ttt_out = self.ttt_norm(self._align_ttt_readout(ttt_out))
         ttt_scale = rearrange(
-            F.silu(self.ttt_scale_proj(hidden_states)),
+            self._ttt_gate(hidden_states),
             'b n (h d) -> (b h) n d', h=self.num_ttt_heads,
         )
         ttt_out = ttt_out * ttt_scale.to(ttt_out.dtype)
@@ -715,6 +826,10 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        # The inner loop runs only for q_len > lact_chunk_size, so below that the
+        # memory was never written and the readout carries no context at all.
+        if self.ttt_idle_zero and ttt_out.shape[1] <= self.lact_chunk_size:
+            ttt_out = torch.zeros_like(ttt_out)
         if self._ablate_ttt:
             ttt_out = torch.zeros_like(ttt_out)
         o = attn_out.to(ttt_out.dtype) + ttt_out
@@ -791,6 +906,8 @@ class LigerGLAPreTrainedModel(LlamaPreTrainedModel):
         # attention module its Linears have already been re-randomised.
         if isinstance(module, LinearTTTAttention):
             module.reset_ttt_parameters()
+        elif isinstance(module, ReaderOutputAlignment):
+            module.reset_parameters()
 
 class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
 
@@ -928,7 +1045,7 @@ class LigerGLAModel(LlamaModel, LigerGLAPreTrainedModel):
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
-            gid = decoder_layer.self_attn._share_gid
+            gid = getattr(decoder_layer.self_attn, '_share_gid', None)
             trajectory = trajectories.get(gid)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
