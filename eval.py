@@ -462,6 +462,13 @@ def main():
     ap.add_argument('--layers', type=int, nargs='+', default=None,
                     help='layers to ablate; omit with --ablate for whole-branch')
     ap.add_argument('--out', default='eval')
+    ap.add_argument('--window', type=int, default=None,
+                    help='override window_size. The model requires window_size >= '
+                         'lact_chunk_size, because apply-then-update means tokens '
+                         'in the CURRENT chunk are not in the memory yet and '
+                         'attention must cover them -- a smaller window leaves a '
+                         'blind spot. So shrinking the window normally means '
+                         'passing --chunk to match.')
     ap.add_argument('--keep-frac', type=float, default=None,
                     help='CAPACITY SWEEP: keep this fraction of each memory\'s d_h '
                          'SwiGLU hidden channels and zero the rest. Verified '
@@ -522,6 +529,13 @@ def main():
             raise SystemExit('--baseline has no TTT branch to sweep; drop --retrieval')
         if args.ablate or args.identity_readers:
             raise SystemExit('--baseline has no TTT branch to ablate')
+        if args.keep_frac is not None:
+            raise SystemExit('--baseline has no fast weights to shrink; drop --keep-frac')
+        if args.window or args.chunk:
+            raise SystemExit(
+                '--baseline is full attention with no sliding window or chunked '
+                'memory, so --window/--chunk would be silently ignored and the '
+                'output would be mislabelled. Drop them.')
     elif not args.ckpt:
         raise SystemExit('--ckpt is required unless --baseline is given')
 
@@ -559,15 +573,24 @@ def main():
     else:
         cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
         cfg.model.pretrained_model_name_or_path = args.ckpt
-        if args.chunk:
-            win = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
-            if args.chunk > win:
+        if args.window or args.chunk:
+            old_w = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
+            old_c = int(cfg.model.lact_chunk_size)
+            new_w = args.window or old_w
+            new_c = args.chunk or old_c
+            if new_c > new_w:
                 raise SystemExit(
-                    f'--chunk {args.chunk} exceeds window_size {win}; the model '
-                    'requires window_size >= lact_chunk_size')
-            print(f'chunk override: {cfg.model.lact_chunk_size} -> {args.chunk} '
-                  f'(window {win} unchanged, so the attention path is identical)')
-            cfg.model.lact_chunk_size = args.chunk
+                    f'lact_chunk_size {new_c} exceeds window_size {new_w}. '
+                    'Apply-then-update leaves the current chunk out of the memory, '
+                    'so attention must cover it; pass --chunk to match --window.')
+            if new_w != old_w:
+                print(f'window override: {old_w} -> {new_w}')
+            if new_c != old_c:
+                print(f'chunk override: {old_c} -> {new_c}'
+                      + ('' if new_w != old_w else
+                         f' (window {new_w} unchanged, attention path identical)'))
+            cfg.model.window_size = new_w
+            cfg.model.lact_chunk_size = new_c
         model_config = build_model_config(cfg)
         model = load_model(args.ckpt, model_config, args.adapter)
         mods = ttt_layers(model)
