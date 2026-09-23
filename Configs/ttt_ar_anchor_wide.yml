@@ -1,0 +1,61 @@
+# Stage 2 (AR finetune) on LongAlpaca -- must mirror ttt_at_anchor_gate.yml.
+data:
+  name: "longalpaca"
+  path: "Yukang/LongAlpaca-12k"
+  num_train_docs: 12000
+  num_val_docs: 200
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_ar'
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_wide/best_ckpt}
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0
+  ttt_layer_indices: null  # all layers, including when loading a restricted config
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  # WIDTH-MATCHED CONTROL for the lift arm. d_h = 128 * 5.84 = 747 at the
+  # anchor layers, so 3*128*747 = 286,848 params per head against the lift's
+  # 286,976 -- matched to 0.04%. Lift vs this isolates the quadratic
+  # REPRESENTATION from the extra state it comes with; this vs anchor_v2
+  # (d_h=128) answers whether trained width helps, which the zero-shot
+  # pruning sweep structurally could not.
+  ttt_inter_multi: [
+     5.84, 5.84, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 5.84, 5.84, 5.84, 5.84]
+  ttt_gate: 'sigmoid'            # MUST match stage 1 (ttt_at_anchor_gate). A
+                                 # sigmoid-trained gate goes negative, and
+                                 # silu(negative) is negative while sigmoid(negative)
+                                 # is positive -- a mismatch flips the sign of the
+                                 # whole TTT contribution.
+  ttt_scale_init_bias: -3.0      # unused (gate loads trained), but the validator
+                                 # rejects sigmoid above -1.0, so it will not build.
+  fw_init_gain: 1.0
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0001
+  epochs: 1
+  max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
+                   # and stage 2 was still falling -0.052/100 when it hit that wall.
+                   # The LR also decays to 0 across exactly these steps.
+  max_grad_norm: 1.0
+  gradient_checkpointing: True
+  eval_steps: 100
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
+  train_qk: True
+  train_qk_lora: True
+  train_v: True
+  train_v_lora: True
