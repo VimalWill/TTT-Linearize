@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import pandas as pd
 
 from tqdm import tqdm
@@ -232,7 +233,11 @@ class DefaultTrainer():
         if self.initial_eval:
             print('')
             print('-> Initial eval')
-            self.compute_eval_metrics(model, step=self.grad_step)
+            # Register and save the starting model too. Logging alone leaves
+            # best_val_metric at its sentinel, so the first trained checkpoint
+            # is called "best" even when it is worse than initialization.
+            self.eval_step(model, step=self.grad_step)
+            self.initial_eval = False
             # compute_eval_metrics sets model.eval() and does not restore it.
             # Without this the whole training loop runs in eval mode, which
             # disables the `self.gradient_checkpointing and self.training`
@@ -318,6 +323,7 @@ class DefaultTrainer():
         """
         Evaluation loop over one epoch
         """
+        step = self.grad_step if step is None else step
         with torch.no_grad():
             self.eval_metrics = self.compute_eval_metrics(model, step=step, **kwargs)
             if self.metric_for_best_model not in self.eval_metrics:
@@ -326,6 +332,11 @@ class DefaultTrainer():
                     f'eval metrics {sorted(self.eval_metrics)}'
                 )
             val_metric = self.eval_metrics[self.metric_for_best_model]
+            if not math.isfinite(val_metric):
+                raise ValueError(
+                    f'Nonfinite checkpoint metric {self.metric_for_best_model}: '
+                    f'{val_metric} at step {step}'
+                )
 
             # Save results
             if self.wandb is not None:  # log to WandB
@@ -342,23 +353,21 @@ class DefaultTrainer():
                 pd.DataFrame(self.eval_metrics_by_step).to_csv(self.results_path)
 
             # Save best metric and checkpoint
-            if self.grad_step % self.eval_steps == 0 and step > 0:
-                if self.is_better(val_metric, self.best_val_metric):
-                    self.best_val_metric = val_metric
-                    self.best_val_metric_step = self.grad_step
-
-                    # overwrite one directory instead of accumulating an
-                    # iter_<step> dir per improvement: each is ~16GB and only
-                    # ~0.6% of it differs from the base checkpoint
-                    save_path = self.save_path + '/best_ckpt'
-                    self.best_val_checkpoint_path = save_path
-                    save_checkpoint(model, self.tokenizer, save_path)
-                    print(f'\n-> Saved best model checkpoint to: {save_path}!')
+            # Every evaluation is eligible, including step 0 and epoch-end
+            # evaluations that do not coincide with eval_steps.
+            if self.is_better(val_metric, self.best_val_metric):
+                # Reuse one directory: full checkpoints are large.
+                save_path = self.save_path + '/best_ckpt'
+                save_checkpoint(model, self.tokenizer, save_path)
+                self.best_val_checkpoint_path = save_path
+                self.best_val_metric = val_metric
+                self.best_val_metric_step = step
+                print(f'\n-> Saved best model checkpoint to: {save_path} '
+                      f'({self.metric_for_best_model}={val_metric:.6f}, step {step})!')
 
             if self.grad_step % self.save_steps == 0 and step > 0:
 
                 save_path = self.save_path + '/' + self.type + '_' + str(step)
-                self.best_val_checkpoint_path = save_path
                 save_checkpoint(model, self.tokenizer, save_path)
                 print(f'\n-> Saved model checkpoint to: {save_path}!')
             
