@@ -300,7 +300,17 @@ class LinearTTTAttention(nn.Module):
         if self._lift:
             self.ttt_feature_dim = int(getattr(config, 'ttt_feature_dim', 32))
             dp = self.ttt_feature_dim
-            d_feat = 1 + dp + dp * dp
+            # NO CONSTANT TERM. The Taylor form [1, x, x(x)x]/||c|| puts an
+            # IDENTICAL 1/sqrt(2.5)=0.632 in every key, so phi(k).phi(k') >= 0.4
+            # for every pair -- measured mean cosine 0.414 against 0.001 for the
+            # unlifted keys, with a MINIMUM of 0.210. An l2-regression memory
+            # fitted by gradient descent cannot separate keys that all overlap
+            # that much, and the first attempt diverged (MSE 218 vs 0.43, CE
+            # worse than uniform). Based tolerates the constant because its
+            # readout is an attention-like weighted sum where a shared component
+            # is a harmless bias; fitted by descent it is not. Dropping it gives
+            # mean cosine 0.023, close to the unlifted 0.001.
+            d_feat = dp + dp * dp
             self.ttt_feat_proj = nn.Parameter(
                 torch.randn(self.num_ttt_heads, dp, self.ttt_head_dim)
                 / math.sqrt(self.ttt_head_dim))
@@ -308,7 +318,7 @@ class LinearTTTAttention(nn.Module):
             # c2 -> 0 recovers plain linear features, so the model can switch the
             # lift off and the learned value is the diagnostic.
             self.ttt_feat_coef = nn.Parameter(
-                torch.tensor([1.0, 1.0, 1.0 / math.sqrt(2.0)]).repeat(
+                torch.tensor([1.0, 1.0 / math.sqrt(2.0)]).repeat(
                     self.num_ttt_heads, 1))
         d_in = d_feat
 
@@ -434,7 +444,7 @@ class LinearTTTAttention(nn.Module):
             if self._lift:
                 self.ttt_feat_proj.normal_(0, 1 / math.sqrt(self.ttt_head_dim))
                 self.ttt_feat_coef.copy_(
-                    torch.tensor([1.0, 1.0, 1.0 / math.sqrt(2.0)],
+                    torch.tensor([1.0, 1.0 / math.sqrt(2.0)],
                                  device=self.ttt_feat_coef.device)
                     .repeat(self.num_ttt_heads, 1))
         # Nearly closed so the host's residual stream survives step 0, but not
@@ -478,7 +488,7 @@ class LinearTTTAttention(nn.Module):
         return q, k, v
 
     def _taylor2(self, x):
-        """[(b h), n, d_head] -> [(b h), n, 1 + d' + d'^2].
+        """[(b h), n, d_head] -> [(b h), n, d' + d'^2].
 
         x arrives l2-normalised, which is load-bearing: on the unit sphere
         (q.k) is in [-1, 1] and the truncated series tracks exp(q.k). Off it the
@@ -488,14 +498,12 @@ class LinearTTTAttention(nn.Module):
         bh, n, _ = x.shape
         xh = x.view(bh // h, h, n, -1)
         xp = l2_norm(torch.einsum('bhnd,hpd->bhnp', xh, self.ttt_feat_proj))
-        c = self.ttt_feat_coef                                    # [h, 3]
+        c = self.ttt_feat_coef                                    # [h, 2]
         quad = torch.einsum('bhnp,bhnq->bhnpq', xp, xp).flatten(-2)
-        ones = xp.new_ones(*xp.shape[:-1], 1)
-        phi = torch.cat([c[:, 0, None, None] * ones,
-                         c[:, 1, None, None] * xp,
-                         c[:, 2, None, None] * quad], dim=-1)
-        # ||phi||^2 = c0^2 + c1^2 + c2^2 exactly, since ||x||=||x kron x||=1.
-        # Dividing by that CONSTANT keeps unit-norm features as c is learned, so
+        phi = torch.cat([c[:, 0, None, None] * xp,
+                         c[:, 1, None, None] * quad], dim=-1)
+        # ||phi||^2 = c1^2 + c2^2 exactly, since ||x||=||x kron x||=1. Dividing
+        # by that CONSTANT keeps unit-norm features as c is learned, so
         # ttt_base_lr stays calibrated. Per-sample normalisation would instead
         # rescale the blocks unevenly and destroy the kernel's shape.
         phi = phi / c.pow(2).sum(-1).sqrt()[:, None, None]
