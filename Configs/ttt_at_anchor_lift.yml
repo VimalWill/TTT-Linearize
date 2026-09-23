@@ -59,14 +59,14 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
-  lr: 0.01   # matches OpenSparseLLMs/Linearization lolcats_at; was 0.0002,
-           # 50x below it. Stage 1 trains only freshly-initialised TTT
-           # params (no LoRA), the same regime the reference runs at 0.01.
+  lr: 0.0002   # MATCHES anchor_v2, which is the control for this arm. It was
+               # trained from commit 8fec6dc at lr 0.0002, NOT the LoLCATs
+               # reference 0.01. Running the lift at 0.01 both broke the
+               # comparison and diverged: MSE 30.3 -> 9.5 while CE went
+               # 6.83 -> 9.51, the MSE-down/CE-up failure mode.
   epochs: 1
-  max_steps: 500   # ~26M tokens, matching lolcats_at's 2 epochs of alpaca-cleaned.
-                   # 400 would be 26.2M, but the short mixture makes 23% of samples
-                   # ~250 tokens rather than 8192, pulling the real total to ~20.4M.
-                   # The LR also decays to 0 across exactly these steps.
+  max_steps: 400   # matches anchor_v2's stage 1, not the 500 used for token
+                   # parity with LoLCATs -- the control is what matters here.
   max_grad_norm: 1.0
   mse_factor: 1000
   lm_loss_weight: 1.0
