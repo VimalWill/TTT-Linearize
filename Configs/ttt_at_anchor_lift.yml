@@ -1,0 +1,70 @@
+# Stage 1 (LIFT ARM) -- anchor groups [0,1] and [28,29,30,31] share memories, L2-L27
+# private. Adds the LEARNED gate: sigmoid gives gamma in [0,1] so the branch
+# can actually shut off, and the short-example mixture gives it gradient in
+# the regime where the inner loop never runs. Gate must be sigmoid from stage
+# 1: silu-trained gates go negative, and sigmoid(negative) is positive, so
+# switching mid-pipeline flips the sign of the TTT contribution.
+data:
+  name: "longalpaca"
+  path: "Yukang/LongAlpaca-12k"
+  num_train_docs: 12000
+  num_val_docs: 100
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+  short_mix_path: "yahma/alpaca-cleaned"
+  short_mix_docs: 4000        # unpacked, ~100-400 tokens each
+model:
+  name: 'ttt_at'
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,meta-llama/Llama-3.1-8B}
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
+  ttt_layer_indices: null
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  ttt_feature_map: 'taylor2'     # degree-2 lift of q and k: phi(x) = [c0, c1 x,
+                                 # c2 x(x)x], so phi(q).phi(k) = c0^2 + c1^2(q.k)
+                                 # + c2^2(q.k)^2, a learnable truncation of
+                                 # exp(q.k). Targets SEPARABILITY, not capacity:
+                                 # the capacity sweep showed width saturates, but
+                                 # FDA's near-identical keys blend in the readout
+                                 # and a lift spreads them apart.
+  ttt_feature_dim: 32            # project to 32 BEFORE lifting -> 1+32+1024=1057.
+                                 # SCIENTIFIC arm. Based uses 16 (273 dims); at 16
+                                 # a null result cannot be told apart from the
+                                 # projection having thrown too much away, so run
+                                 # 32 first and drop to 16 only if it helps.
+  ttt_feature_layers: [0, 1, 28, 29, 30, 31]   # anchor layers only. These are the
+                                 # ones that survive deploy, and front-loading puts
+                                 # 95% of the long-range contribution at L0/L1.
+                                 # ~36.7 MB per lifted memory, so deploy is 73 MB.
+  ttt_gate: 'sigmoid'
+  ttt_scale_init_bias: -3.0   # sigmoid -> 0.047, matching silu(0.1)=0.052
+  fw_init_gain: 1.0              # gain 2.0 diverged by chunk 2
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.01   # matches OpenSparseLLMs/Linearization lolcats_at; was 0.0002,
+           # 50x below it. Stage 1 trains only freshly-initialised TTT
+           # params (no LoRA), the same regime the reference runs at 0.01.
+  epochs: 1
+  max_steps: 500   # ~26M tokens, matching lolcats_at's 2 epochs of alpaca-cleaned.
+                   # 400 would be 26.2M, but the short mixture makes 23% of samples
+                   # ~250 tokens rather than 8192, pulling the real total to ~20.4M.
+                   # The LR also decays to 0 across exactly these steps.
+  max_grad_norm: 1.0
+  mse_factor: 1000
+  lm_loss_weight: 1.0
+  metric_for_best_model: 'eval/loss_ce'
+  gradient_checkpointing: True
+  eval_steps: 25
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}

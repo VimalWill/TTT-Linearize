@@ -54,6 +54,9 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
         ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
         ttt_gate='silu',          # output gate: 'silu' (legacy) or 'sigmoid' (gamma in [0,1])
+        ttt_feature_map='none',   # 'taylor2': degree-2 polynomial lift of q and k
+        ttt_feature_dim=32,       # project to this BEFORE lifting; d' -> 1+d'+d'^2
+        ttt_feature_layers=None,  # layers that get the lift; None means all TTT layers
         ttt_idle_zero=False,      # zero the readout when the inner loop never ran
         ttt_use_muon=False,       # Newton-Schulz orthogonalisation of the fast-weight update
         ttt_use_momentum=True,
@@ -98,6 +101,9 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_layer_indices = ttt_layer_indices
         self.ttt_reader_alignment = ttt_reader_alignment
         self.ttt_gate = ttt_gate
+        self.ttt_feature_map = ttt_feature_map
+        self.ttt_feature_dim = ttt_feature_dim
+        self.ttt_feature_layers = ttt_feature_layers
         self.ttt_idle_zero = ttt_idle_zero
         self.ttt_use_muon = ttt_use_muon
         self.ttt_use_momentum = ttt_use_momentum
@@ -119,6 +125,28 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
             raise ValueError('ttt_reader_alignment must be "none" or "linear"')
         if self.ttt_gate not in ('silu', 'sigmoid'):
             raise ValueError('ttt_gate must be "silu" or "sigmoid"')
+        if self.ttt_feature_map not in ('none', 'taylor2'):
+            raise ValueError('ttt_feature_map must be "none" or "taylor2"')
+        if self.ttt_feature_map == 'taylor2':
+            if not isinstance(self.ttt_feature_dim, int) or self.ttt_feature_dim < 1:
+                raise ValueError('ttt_feature_dim must be a positive integer')
+            # 1 + d' + d'^2 replaces ttt_head_dim in w0/w2, so the state grows by
+            # roughly (1+d'+d'^2)/ttt_head_dim on those two matrices.
+            if self.ttt_feature_dim > 64:
+                raise ValueError(
+                    f'ttt_feature_dim={self.ttt_feature_dim} lifts to '
+                    f'{1 + self.ttt_feature_dim + self.ttt_feature_dim**2} dims; '
+                    'Based uses 16 and this project sizes for 16-32')
+            if self.ttt_feature_layers is not None:
+                bad = [i for i in self.ttt_feature_layers
+                       if type(i) is not int or not 0 <= i < self.num_hidden_layers]
+                if bad:
+                    raise ValueError(f'ttt_feature_layers out of range: {bad}')
+                if active and not set(self.ttt_feature_layers) <= active:
+                    raise ValueError(
+                        'ttt_feature_layers must be a subset of the layers that '
+                        'have a TTT branch; lifting a layer with no memory does '
+                        'nothing and silently misreports the state size')
         # silu(0.1)=0.052 leaves the branch nearly shut so the pretrained residual
         # stream survives step 0. sigmoid(0.1)=0.525 would open it halfway and
         # wreck the model at init; sigmoid(-3.0)=0.047 matches the silu default.

@@ -27,6 +27,7 @@ TTT_PARAM_KEYS = (
     'lr_proj', 'ttt_scale_proj', 'ttt_norm',
     'ttt_qk_scale', 'ttt_qk_offset', 'momentum_proj', 'retention_proj',
     'ttt_reader_alignment',
+    'ttt_feat_proj', 'ttt_feat_coef',
 )
 
 # yml `model:` keys consumed by the harness rather than by the model config
