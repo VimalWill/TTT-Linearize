@@ -27,6 +27,17 @@ model:
   ttt_layer_indices: null
   ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
   ttt_reader_alignment: linear
+  # STATE-NEUTRAL against anchor_v2. At d'=16 the lifted input is 273 wide, so
+  # a memory costs 2*d_h*273 + 128*d_h = 674*d_h per head. d_h = 73 gives
+  # 49,202 against the baseline's 3*128^2 = 49,152 -- matched to 0.1%, and
+  # deploy stays at 12.6 MB. So anchor_v2 IS the control and no separate
+  # width-matched arm is needed: the comparison is quadratic representation
+  # vs linear width at fixed state.
+  ttt_inter_multi: [
+     0.5703125, 0.5703125, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 0.5703125, 0.5703125, 0.5703125, 0.5703125]
   ttt_feature_map: 'taylor2'     # degree-2 lift of q and k: phi(x) = [c0, c1 x,
                                  # c2 x(x)x], so phi(q).phi(k) = c0^2 + c1^2(q.k)
                                  # + c2^2(q.k)^2, a learnable truncation of
@@ -34,11 +45,7 @@ model:
                                  # the capacity sweep showed width saturates, but
                                  # FDA's near-identical keys blend in the readout
                                  # and a lift spreads them apart.
-  ttt_feature_dim: 32            # project to 32 BEFORE lifting -> 1+32+1024=1057.
-                                 # SCIENTIFIC arm. Based uses 16 (273 dims); at 16
-                                 # a null result cannot be told apart from the
-                                 # projection having thrown too much away, so run
-                                 # 32 first and drop to 16 only if it helps.
+  ttt_feature_dim: 16            # 1+16+256 = 273. Based uses 16.
   ttt_feature_layers: [0, 1, 28, 29, 30, 31]   # anchor layers only. These are the
                                  # ones that survive deploy, and front-loading puts
                                  # 95% of the long-range contribution at L0/L1.
