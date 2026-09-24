@@ -1,0 +1,77 @@
+# DEPLOY eval for the LIFT ARM -- identical to ttt_ar_anchor_lift.yml
+# except the interior TTT memories are never constructed. The lift is
+# applied only at [0,1,28-31], which are exactly the layers that survive
+# here, so deploy state is 2 x 6.30 = 12.6 MB, matching ttt_deploy_anchor.
+# Stage 2 (LIFT ARM) on LongAlpaca -- must mirror ttt_at_anchor_gate.yml.
+data:
+  name: "longalpaca"
+  path: "Yukang/LongAlpaca-12k"
+  num_train_docs: 12000
+  num_val_docs: 200
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+model:
+  name: 'ttt_ar'
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_lift/best_ckpt}
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  window_size: 512        # must be >= lact_chunk_size
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0
+  ttt_layer_indices: [0, 1, 28, 29, 30, 31]   # DEPLOY: interior not built
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  # STATE-NEUTRAL against anchor_v2. At d'=16 the lifted input is 273 wide, so
+  # a memory costs 2*d_h*273 + 128*d_h = 674*d_h per head. d_h = 73 gives
+  # 49,202 against the baseline's 3*128^2 = 49,152 -- matched to 0.1%, and
+  # deploy stays at 12.6 MB. So anchor_v2 IS the control and no separate
+  # width-matched arm is needed: the comparison is quadratic representation
+  # vs linear width at fixed state.
+  ttt_inter_multi: [
+     0.5703125, 0.5703125, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 0.5703125, 0.5703125, 0.5703125, 0.5703125]
+  ttt_feature_map: 'taylor2'     # degree-2 lift of q and k: phi(x) = [c0, c1 x,
+                                 # c2 x(x)x], so phi(q).phi(k) = c0^2 + c1^2(q.k)
+                                 # + c2^2(q.k)^2, a learnable truncation of
+                                 # exp(q.k). Targets SEPARABILITY, not capacity:
+                                 # the capacity sweep showed width saturates, but
+                                 # FDA's near-identical keys blend in the readout
+                                 # and a lift spreads them apart.
+  ttt_feature_dim: 16            # 1+16+256 = 273. Based uses 16.
+  ttt_feature_layers: [0, 1, 28, 29, 30, 31]   # anchor layers only. These are the
+                                 # ones that survive deploy, and front-loading puts
+                                 # 95% of the long-range contribution at L0/L1.
+                                 # ~36.7 MB per lifted memory, so deploy is 73 MB.
+  ttt_gate: 'sigmoid'            # MUST match stage 1 (ttt_at_anchor_gate). A
+                                 # sigmoid-trained gate goes negative, and
+                                 # silu(negative) is negative while sigmoid(negative)
+                                 # is positive -- a mismatch flips the sign of the
+                                 # whole TTT contribution.
+  ttt_scale_init_bias: -3.0      # unused (gate loads trained), but the validator
+                                 # rejects sigmoid above -1.0, so it will not build.
+  fw_init_gain: 1.0
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0001
+  epochs: 1
+  max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
+                   # and stage 2 was still falling -0.052/100 when it hit that wall.
+                   # The LR also decays to 0 across exactly these steps.
+  max_grad_norm: 1.0
+  gradient_checkpointing: True
+  eval_steps: 100
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
+  train_qk: True
+  train_qk_lora: True
+  train_v: True
+  train_v_lora: True
