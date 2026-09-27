@@ -654,8 +654,14 @@ def main():
         if 'metadata' not in inspect.signature(lm_eval.simple_evaluate).parameters:
             raise SystemExit('this lm_eval has no simple_evaluate(metadata=...); '
                              'set max_seq_lengths in the task YAML instead')
-        kwargs['metadata'] = {'max_seq_lengths': args.ruler_lengths}
-        print(f'RULER context lengths: {args.ruler_lengths}')
+        # RULER builds its haystacks by tokenising to the target length, and
+        # reads the tokenizer from metadata.pretrained. lm_eval normally fills
+        # that from --model_args, but we hand simple_evaluate an already-built
+        # model object, so it never sees a name and get_tokenizer() asserts.
+        kwargs['metadata'] = {'max_seq_lengths': args.ruler_lengths,
+                              'pretrained': args.base, 'tokenizer': args.base}
+        print(f'RULER context lengths: {args.ruler_lengths} '
+              f'(tokenizer {args.base})')
         longest = max(args.ruler_lengths)
         if eval_len < longest + 256:
             raise SystemExit(
