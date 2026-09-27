@@ -469,6 +469,12 @@ def main():
                          'attention must cover them -- a smaller window leaves a '
                          'blind spot. So shrinking the window normally means '
                          'passing --chunk to match.')
+    ap.add_argument('--ruler-lengths', type=int, nargs='+', default=None,
+                    help='RULER context lengths, passed as metadata.max_seq_lengths. '
+                         'lm_eval otherwise defaults to a ladder reaching 32k-128k, '
+                         'far past the 8192 these models were trained at, which '
+                         'measures extrapolation and takes hours. --seq-len must '
+                         'leave room for the longest one plus generation.')
     ap.add_argument('--keep-frac', type=float, default=None,
                     help='CAPACITY SWEEP: keep this fraction of each memory\'s d_h '
                          'SwiGLU hidden channels and zero the rest. Verified '
@@ -643,6 +649,19 @@ def main():
               batch_size=args.batch_size, max_length=eval_len)
 
     kwargs = dict(model=lm, tasks=tasks, task_manager=tm, limit=args.limit)
+    if args.ruler_lengths:
+        import inspect
+        if 'metadata' not in inspect.signature(lm_eval.simple_evaluate).parameters:
+            raise SystemExit('this lm_eval has no simple_evaluate(metadata=...); '
+                             'set max_seq_lengths in the task YAML instead')
+        kwargs['metadata'] = {'max_seq_lengths': args.ruler_lengths}
+        print(f'RULER context lengths: {args.ruler_lengths}')
+        longest = max(args.ruler_lengths)
+        if eval_len < longest + 256:
+            raise SystemExit(
+                f'--seq-len {eval_len} leaves no room for a {longest}-token RULER '
+                f'context plus generation; the needle would be truncated away. '
+                f'Use --seq-len {longest + 512} or more.')
     if args.log_samples:
         kwargs['log_samples'] = True
     if args.num_fewshot is not None:
