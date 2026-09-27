@@ -419,10 +419,17 @@ SUITES = {
 }
 
 
-def resolve(tasks):
-    """Check task names against the installed registry before spending a load."""
+def resolve(tasks, metadata=None):
+    """Check task names against the installed registry before spending a load.
+
+    `metadata` must reach the TaskManager, not simple_evaluate: RULER builds its
+    haystacks inside ConfigurableTask.__init__, which runs during
+    task_manager.load_task_or_group(), long before simple_evaluate looks at its
+    own metadata argument. Passing it only downstream leaves get_tokenizer()
+    with nothing and it asserts.
+    """
     from lm_eval.tasks import TaskManager
-    tm = TaskManager()
+    tm = TaskManager(metadata=metadata) if metadata else TaskManager()
     have = set(getattr(tm, 'all_tasks', None) or tm.task_index.keys())
     missing = [t for t in tasks if t not in have]
     if missing:
@@ -553,7 +560,11 @@ def main():
     tasks, tm = None, None
     if not args.retrieval:
         tasks = args.tasks or [t for s in args.suite for t in SUITES[s]]
-        tm = resolve(tasks)
+        meta = None
+        if args.ruler_lengths:
+            meta = {'max_seq_lengths': args.ruler_lengths,
+                    'pretrained': args.base, 'tokenizer': args.base}
+        tm = resolve(tasks, meta)
 
     # lm-eval sends a different sequence length for nearly every request, while
     # sliding_window_attention compiles flex_attention with dynamic=False. Past
@@ -660,6 +671,7 @@ def main():
         # model object, so it never sees a name and get_tokenizer() asserts.
         kwargs['metadata'] = {'max_seq_lengths': args.ruler_lengths,
                               'pretrained': args.base, 'tokenizer': args.base}
+        # also on the TaskManager above -- that is the one RULER actually reads
         print(f'RULER context lengths: {args.ruler_lengths} '
               f'(tokenizer {args.base})')
         longest = max(args.ruler_lengths)
