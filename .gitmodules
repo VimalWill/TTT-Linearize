@@ -1,3 +1,7 @@
 [submodule "third_party/LaCT"]
 	path = third_party/LaCT
 	url = https://github.com/a1600012888/LaCT.git
+
+[submodule "third_party/Liger"]
+	path = third_party/Liger
+	url = https://github.com/OpenSparseLLMs/Linearization.git
