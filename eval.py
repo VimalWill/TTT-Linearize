@@ -14,6 +14,9 @@ from omegaconf import OmegaConf
 import LinearTTT  # noqa: F401
 from Training.train import build_model_config
 from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
+from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
+    use_sdpa_sliding_window as use_mistral_sdpa_sliding_window,
+)
 
 _PEFT_PREFIX = re.compile(r'^base_model\.model\.')
 
@@ -630,6 +633,7 @@ def main():
     for prm in model.parameters():
         prm.requires_grad_(False)
     use_sdpa_sliding_window(True)
+    use_mistral_sdpa_sliding_window(True)
 
     causality = None
     if getattr(model.config, 'ttt_share_groups', None):

@@ -42,9 +42,16 @@ def build_model_config(config):
     32 kv heads, rope_theta 10000), which silently mismatch a Llama-3 checkpoint.
     """
     from LinearTTT.model.LinearizeLlama import LigerGLAConfig
-    model_config = LigerGLAConfig.from_pretrained(
-        config.model.pretrained_model_name_or_path
-    )
+    from LinearTTT.model.LinearizeMistral import LigerMistralGLAConfig
+    path = config.model.pretrained_model_name_or_path
+    source = AutoConfig.from_pretrained(path)
+    if source.model_type in ('mistral', 'liger_mistral_gla'):
+        config_class = LigerMistralGLAConfig
+    elif source.model_type in ('llama', 'liger_gla'):
+        config_class = LigerGLAConfig
+    else:
+        raise ValueError(f'Unsupported backbone: {source.model_type}')
+    model_config = config_class.from_pretrained(path)
     for k, v in config.model.items():
         if k in _HARNESS_ONLY:
             continue

@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
 
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+from .Configuration import LigerMistralGLAConfig
 from .LinearizeMistral import (
-    LigerMistralGLAConfig,
     LigerMistralGLADecoderLayer,
     LigerMistralGLAForCausalLM,
     LigerMistralGLAModel,
     LigerMistralGLAPreTrainedModel,
 )
 
-from .LinearizeLlama import (
-    LigerGLAConfig,
-    LigerGLADecoderLayer,
-    LigerGLAForCausalLM,
-    LigerGLAModel,
-    LigerGLAPreTrainedModel,
-)
+AutoConfig.register(LigerMistralGLAConfig.model_type, LigerMistralGLAConfig)
+AutoModel.register(LigerMistralGLAConfig, LigerMistralGLAModel)
+AutoModelForCausalLM.register(LigerMistralGLAConfig, LigerMistralGLAForCausalLM)
 
 __all__ = [
     'LigerMistralGLAConfig',
@@ -22,9 +20,4 @@ __all__ = [
     'LigerMistralGLAForCausalLM',
     'LigerMistralGLAModel',
     'LigerMistralGLAPreTrainedModel',
-    'LigerGLAConfig',
-    'LigerGLADecoderLayer',
-    'LigerGLAForCausalLM',
-    'LigerGLAModel',
-    'LigerGLAPreTrainedModel',
 ]
