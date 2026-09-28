@@ -223,6 +223,7 @@ def load_data(config):
     # Optional short-example mixture. Packed training gives the output gate only
     # sequences where the memory is written and informative; it never sees the
     # regime it has to shut off in. These stay UNPACKED at natural length.
+    mix_parts = []
     short_path = config.data.get('short_mix_path', None)
     if short_path:
         if int(config.data.micro_batch_size) != 1:
@@ -242,9 +243,41 @@ def load_data(config):
         short_set = convert_to_hf_dataset(rows, cache_dir).map(
             partial(template_and_tokenize_lm, tokenizer=tokenizer, include_label=True),
             remove_columns=['text'])
-        train_set = MixedDataset(train_set, short_set)
-        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path} '
-              f'({len(train_set)} training samples total)')
+        mix_parts.append(short_set)
+        print(f'-> mixed in {len(short_set)} unpacked short examples from {short_path}')
+
+    # Optional passkey-retrieval mixture. See template_and_tokenize_passkey:
+    # this is the only part of the corpus that requires storing an arbitrary
+    # token rather than its gist. Kept UNPACKED -- packing would splice two
+    # haystacks into one window and break the single-answer supervision.
+    pk_path = config.data.get('passkey_mix_path', None)
+    if pk_path:
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError('passkey_mix_path requires micro_batch_size 1')
+        n_pk = int(config.data.get('passkey_mix_docs', 10000))
+        # leave room for BOS/EOS and the tokeniser disagreeing with num_tokens
+        pk_max = int(config.data.get('passkey_max_tokens', input_len - 64))
+        rows, skipped = [], 0
+        for row in load_dataset(pk_path, split='train', streaming=True):
+            if row.get('num_tokens', 0) > pk_max:
+                skipped += 1
+                continue
+            rows.append({'prompt': row['prompt'], 'answer': row['answer'],
+                         'depth_percent': row.get('depth_percent', -1)})
+            if len(rows) >= n_pk:
+                break
+        if not rows:
+            raise ValueError(f'{pk_path}: no examples under {pk_max} tokens')
+        pk_set = convert_to_hf_dataset(rows, cache_dir).map(
+            partial(template_and_tokenize_passkey, tokenizer=tokenizer),
+            remove_columns=['prompt', 'answer', 'depth_percent'])
+        mix_parts.append(pk_set)
+        print(f'-> mixed in {len(pk_set)} passkey examples from {pk_path} '
+              f'(<= {pk_max} tokens, skipped {skipped} longer)')
+
+    if mix_parts:
+        train_set = MixedDataset(train_set, *mix_parts)
+        print(f'-> {len(train_set)} training samples total')
 
     loader_kwargs = {
         "batch_size": config.data.micro_batch_size,
@@ -331,6 +364,41 @@ def template_and_tokenize_lm(sample, tokenizer, include_label: bool = True,
         "input_ids": input_ids,
         "attention_mask": [1] * len(input_ids),
         "labels": list(input_ids),
+    }
+
+
+PASSKEY_MARKER = "The pass key is "
+
+
+def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True):
+    """Synthetic passkey retrieval, with the loss masked to the answer alone.
+
+    The corpus is the reason the TTT memory never learned to store token
+    identity: LongAlpaca only ever asks for paraphrase, so a memory that keeps
+    the gist scores perfectly. Measured on this checkpoint -- ablating every TTT
+    memory moved RULER niah_single by +0.006/-0.002/+0.010 against a stderr of
+    ~0.02, i.e. the whole 25% was the 512-token window (512/2048). SWDE over the
+    same contexts moves +22.78, so the memory works; it just holds gist.
+
+    nanotron's prompt already ends `... The pass key is 425.`, so the answer has
+    to be split back off and everything before it masked to -100. Supervising
+    the whole sequence would put ~99.9% of the loss on filler ("The grass is
+    green. The sky is blue.") and teach the marginal, not the retrieval.
+    """
+    text = sample["prompt"]
+    prefix, answer = text.rsplit(PASSKEY_MARKER, 1)
+    prefix += PASSKEY_MARKER
+    if answer.strip().rstrip('.') != str(sample["answer"]):
+        raise ValueError(f'passkey suffix {answer!r} != answer {sample["answer"]!r}')
+
+    prompt_ids = tokenizer.encode(prefix, add_special_tokens=True)
+    answer_ids = tokenizer.encode(answer, add_special_tokens=False)
+    answer_ids = answer_ids + [tokenizer.eos_token_id]
+    input_ids = prompt_ids + answer_ids
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": [-100] * len(prompt_ids) + answer_ids,
     }
 
 
