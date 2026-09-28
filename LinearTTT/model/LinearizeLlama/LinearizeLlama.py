@@ -358,6 +358,9 @@ class LinearTTTAttention(nn.Module):
             # NON-monotonic near zero, so gamma=0 is reachable only through a
             # -0.2785 detour -- the branch cannot cleanly learn to shut off.
             self.ttt_gate = getattr(config, 'ttt_gate', 'silu')
+            # Probability of zeroing the SWA branch for a sequence during
+            # training. Recipe-only: nothing about the deployed model changes.
+            self.ttt_swa_dropout = float(getattr(config, 'ttt_swa_dropout', 0.0))
             # Below lact_chunk_size the operator's loop never executes, so the
             # readout is a fixed function of q with zero context in it; zeroing
             # it there discards nothing. Prefill only -- after a prefill that
@@ -905,6 +908,26 @@ class LinearTTTAttention(nn.Module):
 
         if self._ablate_attn:
             attn_out = torch.zeros_like(attn_out)
+        elif self.training and self.ttt_swa_dropout > 0:
+            # Force the memory to carry the whole teacher signal on a fraction
+            # of sequences, so it sees gradient beyond the weak residual past
+            # window_size. Dropped per SEQUENCE, so some batches stay in the
+            # deployment regime; inference is untouched (self.training is
+            # False), so the deployed model and its state size are unchanged.
+            #
+            # OFF BY DEFAULT, and the obvious motivation for it does not hold
+            # here. Lizard (arXiv 2507.09025) reports "Local Attention
+            # Dominance" -- a wide window starving the recurrent module, MMLU
+            # 61.2 -> 44.6 going w=128 -> 256. This model does not show it: a
+            # trained SWA-512-only arm scores 29.60 recall average against the
+            # anchor's 42.24 (SWDE 27.72 -> 50.50), so the memory is already
+            # carrying load at window 512, and the same sweep found 512 -> 128
+            # free on commonsense (72.38 vs 72.35). Kept as an ablation knob,
+            # not as a fix: the measured deficit is that the memory stores gist
+            # and not token identity, which no amount of dropout teaches.
+            keep = (torch.rand(bsz, device=attn_out.device)
+                    >= self.ttt_swa_dropout).to(attn_out.dtype)
+            attn_out = attn_out * keep[:, None, None]
         # The inner loop runs only for q_len > lact_chunk_size, so below that the
         # memory was never written and the readout carries no context at all.
         if self.ttt_idle_zero and ttt_out.shape[1] <= self.lact_chunk_size:

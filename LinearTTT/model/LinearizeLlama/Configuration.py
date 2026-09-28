@@ -54,6 +54,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         ttt_layer_indices=None,    # layers retaining the TTT branch; None means all
         ttt_reader_alignment='none',  # 'linear': per-reader, per-head output map
         ttt_gate='silu',          # output gate: 'silu' (legacy) or 'sigmoid' (gamma in [0,1])
+        ttt_swa_dropout=0.0,      # p(zero the SWA branch per sequence) at TRAIN time
         ttt_feature_map='none',   # 'taylor2': degree-2 polynomial lift of q and k
         ttt_feature_dim=32,       # project to this BEFORE lifting; d' -> 1+d'+d'^2
         ttt_feature_layers=None,  # layers that get the lift; None means all TTT layers
@@ -101,6 +102,7 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
         self.ttt_layer_indices = ttt_layer_indices
         self.ttt_reader_alignment = ttt_reader_alignment
         self.ttt_gate = ttt_gate
+        self.ttt_swa_dropout = ttt_swa_dropout
         self.ttt_feature_map = ttt_feature_map
         self.ttt_feature_dim = ttt_feature_dim
         self.ttt_feature_layers = ttt_feature_layers
@@ -125,6 +127,9 @@ class LigerGLAConfig(LlamaConfig, PretrainedConfig):
             raise ValueError('ttt_reader_alignment must be "none" or "linear"')
         if self.ttt_gate not in ('silu', 'sigmoid'):
             raise ValueError('ttt_gate must be "silu" or "sigmoid"')
+        if not 0.0 <= float(self.ttt_swa_dropout) < 1.0:
+            raise ValueError('ttt_swa_dropout must be in [0, 1); 1.0 would remove\n'
+                             'the attention branch entirely rather than drop it')
         if self.ttt_feature_map not in ('none', 'taylor2'):
             raise ValueError('ttt_feature_map must be "none" or "taylor2"')
         if self.ttt_feature_map == 'taylor2':
