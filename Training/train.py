@@ -92,6 +92,11 @@ def set_trainable_params(model, config):
             'lora_' in name
             or (train_ttt and any(k in name for k in TTT_PARAM_KEYS))
         )
+        if param.requires_grad and 'ttt_reader_alignment.weight' in name:
+            # Identity diagonals cannot accumulate AdamW steps of order 1e-4
+            # in BF16. ReaderOutputAlignment casts only for its forward matmul,
+            # so keep optimizer parameters/moments in FP32 in joint training too.
+            param.data = param.data.float()
     return model
 
 
@@ -110,7 +115,7 @@ def resume_stage2(model, adapter):
 def train(config):
     from Training.dataloader import load_data
 
-    # stage: 'ttt_at' = attention transfer (per-layer distillation, no LM loss)
+    # stage: 'ttt_at' = attention transfer with an optional student LM loss
     #        'ttt_ar' = autoregressive finetune on the LM loss
     stage = config.model.name
     alignment_only = config.train.get('reader_alignment_only', False)
@@ -194,10 +199,8 @@ def train(config):
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=0,
             num_train_epochs=config.train.epochs,
-            # Without this the LR schedule is sized to a FULL epoch (~2.2k
-            # steps here) and every run we have killed at 400 stopped at 81%
-            # of peak LR, never annealed. max_steps overrides epochs and makes
-            # the linear decay match the budget actually spent.
+            # The custom optimizer builder uses this same budget when the
+            # config explicitly selects lr_scheduler: linear.
             max_steps=int(config.train.get('max_steps', -1)),
             learning_rate=float(config.train.lr),   # may arrive as str via oc.env
             bf16=True,

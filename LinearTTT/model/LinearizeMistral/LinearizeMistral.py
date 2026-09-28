@@ -749,8 +749,9 @@ class LinearTTTAttention(nn.Module):
             # The operator's loop is empty here: no update, so the branch
             # degenerates to a static MLP over the whole sequence.
             logger.warning_once(
-                f'seq_len ({q_len}) <= lact_chunk_size ({self.lact_chunk_size}): '
-                'the TTT fast weights receive zero updates for this batch.'
+                'Sequences at or below lact_chunk_size perform no inner-loop '
+                'memory updates. During training, outer-loop gradients can '
+                'still update the initial memory, gates, and reader maps.'
             )
 
         ttt_q, ttt_k, ttt_v = self._ttt_features(

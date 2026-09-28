@@ -7,13 +7,23 @@ def get_optimizer_and_scheduler(model, config):
     optimizer = torch.optim.AdamW(params, lr=config.train.lr,
                                  weight_decay=config.train.get('weight_decay', 0.01),
                                  fused=torch.cuda.is_available())
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer=optimizer, 
-        mode='min',
-        factor=0.1,
-        patience=10,
-        min_lr=0.00001
-    )
+    schedule = config.train.get('lr_scheduler', 'plateau')
+    if schedule == 'linear':
+        max_steps = int(config.train.get('max_steps', -1))
+        if max_steps <= 0:
+            raise ValueError('lr_scheduler: linear requires positive max_steps')
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: max(0.0, 1.0 - step / max_steps))
+    elif schedule == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=optimizer,
+            mode='min',
+            factor=0.1,
+            patience=10,
+            min_lr=0.00001
+        )
+    else:
+        raise ValueError(f'Unknown lr_scheduler: {schedule!r}')
     return optimizer, scheduler
 
 def count_model_params(model, requires_grad: bool = True):

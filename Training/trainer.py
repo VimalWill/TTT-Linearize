@@ -78,7 +78,10 @@ class DefaultTrainer():
         self.compute_loss_backprop = False  # Whether we backprop in self.compute_loss
 
         self.optimizer, self.scheduler = optimizers
-        self.scheduler_step_after_epoch = True
+        # Plateau schedules consume validation metrics; step schedules advance
+        # only after a successful optimizer update, never on evaluation.
+        self.scheduler_step_after_epoch = isinstance(
+            self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
         # Dataloaders
         self.train_loader = train_loader
         self.eval_loader = eval_loader
@@ -227,6 +230,7 @@ class DefaultTrainer():
         num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, leave=False, colour='blue', desc=f'-> Training (epoch {epoch} / {self.args.num_train_epochs})')
         total_loss = 0
+        successful_batches = 0
         eval_for_step = False
 
         # Initial eval
@@ -253,6 +257,7 @@ class DefaultTrainer():
                 accumulated_batches = 0
                 self.step += 1
                 continue
+            raw_loss = loss.detach().item()
             loss = loss / accum_iter
             if not self.compute_loss_backprop:
                 # loss.backward() did not occur in compute_loss
@@ -265,26 +270,25 @@ class DefaultTrainer():
                     self.step += 1
                     continue
             accumulated_batches += 1
+            optimizer_stepped = False
             if accumulated_batches == accum_iter or ix + 1 == num_batches:
-                self._optimizer_step(accumulated_batches, accum_iter)
+                optimizer_stepped = self._optimizer_step(accumulated_batches, accum_iter)
                 accumulated_batches = 0
-                if not self.compute_loss_backprop:
-                    loss = loss.detach().cpu().item()
             
             self.step += 1
-            if not isinstance(loss, float):
-                total_loss += loss.item()
-            else:
-                total_loss += loss
-            desc = f"Training epoch {epoch} | loss: {total_loss / (ix + 1):.3f} | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
+            total_loss += raw_loss
+            successful_batches += 1
+            mean_loss = total_loss / successful_batches
+            desc = f"Training epoch {epoch} | loss_mean: {mean_loss:.3f} | loss_total: {raw_loss:.3f} | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
             desc += f' | gradient step: {self.grad_step}'
             for k, v in train_metrics.items():
                 desc += f' | {k}: {v:.3f}'
             pbar.set_description(desc)
 
             # Logging
-            if (self.grad_step) % (self.logging_steps):
-                self.train_metrics['train/loss'] = loss.item() if not isinstance(loss, float) else loss
+            if optimizer_stepped and self.grad_step % self.logging_steps == 0:
+                self.train_metrics['train/loss'] = raw_loss
+                self.train_metrics['train/loss_mean'] = mean_loss
                 self.train_metrics['train/epoch'] = epoch
                 self.train_metrics['train/step'] = self.grad_step
                 self.train_metrics['train/lr'] = self.optimizer.param_groups[0]['lr']

@@ -37,6 +37,7 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
+  lr_scheduler: linear
   lr: 0.0001
   epochs: 1            # matched to the anchor arm
   max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,

@@ -8,7 +8,7 @@ data:
   name: "longalpaca"
   path: "Yukang/LongAlpaca-12k"
   num_train_docs: 12000
-  num_val_docs: 200
+  num_val_docs: 100   # same held-out documents as stage 1 and the L2 arm
   batch_size: 8
   micro_batch_size: 1
   val_set_size: 200
@@ -39,6 +39,7 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
+  lr_scheduler: linear
   lr: 0.0001
   epochs: 1
   max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,

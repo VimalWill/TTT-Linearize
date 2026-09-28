@@ -41,6 +41,7 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
+  lr_scheduler: linear
   lr: 0.0002   # 0.01 (the lolcats_at reference) was measured to diverge on
                # this architecture: MSE 30.3 -> 9.5 while CE went 6.83 -> 9.51.
   epochs: 1
