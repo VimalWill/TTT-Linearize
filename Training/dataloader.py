@@ -132,6 +132,39 @@ def load_data(config):
             train_set, _ = _docs(n_val_rows, n_train)
         test_set = val_set
         cols = list(val_set.features)
+    elif "passkey" in data_name.lower():
+        # Passkey retrieval as the WHOLE corpus, train and validation both.
+        # This is the long-context arm: no LongAlpaca, no mixture ratio to
+        # justify, and eval/loss measures retrieval rather than prose
+        # modelling -- so metric_for_best_model actually tracks the thing being
+        # taught. The mixture version (passkey_mix_path) could not: passkey
+        # training RAISES LongAlpaca CE, so best_ckpt stuck at step 0.
+        #
+        # NOT packed. ConcatDataset would splice two haystacks into one window
+        # and leave a sequence with two answers and one question.
+        concat_data = False
+        n_docs = int(config.data.get("num_train_docs", 10000))
+        n_val = int(config.data.get("num_val_docs", 200))
+        # leave room for BOS/EOS and the tokeniser disagreeing with num_tokens
+        pk_max = int(config.data.get("passkey_max_tokens", input_len - 64))
+        rows, skipped = [], 0
+        for row in load_dataset(data_path, split="train", streaming=True):
+            if row.get("num_tokens", 0) > pk_max:
+                skipped += 1
+                continue
+            rows.append({"prompt": row["prompt"], "answer": row["answer"]})
+            if len(rows) >= n_docs + n_val:
+                break
+        if len(rows) < n_val + 1:
+            raise ValueError(f"{data_path}: only {len(rows)} examples under {pk_max} tokens")
+        random.Random(42).shuffle(rows)
+        formatter = partial(template_and_tokenize_passkey, tokenizer=tokenizer)
+        val_set = convert_to_hf_dataset(rows[:n_val], cache_dir)
+        train_set = convert_to_hf_dataset(rows[n_val:], cache_dir)
+        test_set = val_set
+        cols = list(val_set.features)
+        print(f"-> passkey corpus: {len(rows) - n_val} train / {n_val} val "
+              f"(<= {pk_max} tokens, skipped {skipped} longer)")
     elif "wikitext" in data_name.lower():
         # WikiText rows are single LINES, not documents, so the pg19 branch is
         # wrong for it three ways: it shuffles rows (scrambling articles, which
