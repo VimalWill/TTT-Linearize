@@ -32,11 +32,12 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
-  lr_scheduler: linear   # get_optimizer_and_scheduler returned ReduceLROnPlateau
-                         # and this custom trainer ignores TrainingArguments for
-                         # scheduling, so with eval_steps 25 and patience 10 no
-                         # Llama run ever annealed -- LR sat at peak the whole
-                         # budget. Matches the Mistral arms.
+  # NO explicit schedule here: Anchor-F is NOT being retrained, so its
+  # checkpoint keeps the ReduceLROnPlateau default. Anchor-I must match it or
+  # the Anchor-F vs Anchor-I contrast -- the headline, 12.6 MB against 201 MB
+  # -- confounds the read-map fix with a schedule change. The ONLY intended
+  # difference in this re-run is the fp32 ReaderOutputAlignment. The Mistral
+  # arms do select linear; that cross-backbone difference is stated, not hidden.
   lr: 0.0001
   epochs: 1            # matched to the anchor arm
   max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
