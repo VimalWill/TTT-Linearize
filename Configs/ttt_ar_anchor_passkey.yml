@@ -1,4 +1,15 @@
-# Auto-derived from ttt_ar_unified_longalpaca.yml: identical except for the passkey mixture.
+# Auto-derived from ttt_ar_unified_longalpaca.yml: identical except for the
+# passkey mixture. Inits from the CLEAN anchor stage 1 (ttt_at_anchor_gate),
+# NOT from a passkey stage 1. Two reasons:
+#   1. Stage 1 cannot teach retrieval. A passkey example there contributes MSE
+#      over all 8192 positions (matching attention on repetitive filler) and CE
+#      on ~5 answer tokens, with mse_factor 1000 making MSE dominant and no
+#      LoRA to adapt q/k/v. Measured cost of mixing it into stage 1 anyway:
+#      CE 4.99 at step 250 against the clean run's ~2.85 (Fig. 1).
+#   2. Sharing stage 1 with the anchor arm makes this a controlled comparison,
+#      so any recall change is attributable to the passkey data alone.
+# Matches Lizard (arXiv 2507.09025) and Glide, which both put passkey in an AR
+# stage rather than in attention transfer.
 # Stage 2 (AR finetune) on LongAlpaca -- must mirror ttt_at_anchor_gate.yml.
 data:
   name: "longalpaca"
@@ -23,7 +34,7 @@ data:
   passkey_max_tokens: 8128    # max_length 8192 less BOS/EOS headroom
 model:
   name: 'ttt_ar'
-  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_passkey/best_ckpt}
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_gate/best_ckpt}
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
