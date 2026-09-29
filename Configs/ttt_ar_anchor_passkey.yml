@@ -67,7 +67,14 @@ train:
   max_grad_norm: 1.0
   gradient_checkpointing: True
   eval_steps: 100
-  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  save_steps: 100   # NOT off for this arm. eval/loss is LongAlpaca-only (the
+                    # passkey rows go to train_set; val is untouched), and
+                    # passkey training RAISES it -- 2.85 -> 4.99 measured in
+                    # stage 1. So best_ckpt sticks at step 0 and, with periodic
+                    # saves off, the run would end by restoring step 0 and
+                    # producing nothing. Periodic checkpoints at 100/200/300/400
+                    # mean the last one is always usable. Selection is still on
+                    # the wrong metric; take ttt_ar_400, not best_ckpt.
   output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
   train_qk: True
   train_qk_lora: True
