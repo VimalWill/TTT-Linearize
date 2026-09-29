@@ -34,9 +34,15 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
-  lr: 0.01   # matches OpenSparseLLMs/Linearization lolcats_at; was 0.0002,
-           # 50x below it. Stage 1 trains only freshly-initialised TTT
-           # params (no LoRA), the same regime the reference runs at 0.01.
+  lr_scheduler: linear   # get_optimizer_and_scheduler returned ReduceLROnPlateau
+                         # and this custom trainer ignores TrainingArguments for
+                         # scheduling, so with eval_steps 25 and patience 10 no
+                         # Llama run ever annealed -- LR sat at peak the whole
+                         # budget. Matches the Mistral arms.
+  lr: 0.0002   # NOT 0.01. The file previously said 0.01 (the lolcats_at
+               # reference) but anchor_v2 was trained at 0.0002 and 0.01 was
+               # measured to diverge here: MSE 30.3 -> 9.5 while CE went
+               # 6.83 -> 9.51. The repo did not reproduce its own results.
   epochs: 1
   max_steps: 500   # ~26M tokens, matching lolcats_at's 2 epochs of alpaca-cleaned.
                    # 400 would be 26.2M, but the short mixture makes 23% of samples

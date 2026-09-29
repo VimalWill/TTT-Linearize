@@ -32,6 +32,11 @@ model:
   device_map: 'auto'
 train:
   optim: 'adamw_torch'
+  lr_scheduler: linear   # get_optimizer_and_scheduler returned ReduceLROnPlateau
+                         # and this custom trainer ignores TrainingArguments for
+                         # scheduling, so with eval_steps 25 and patience 10 no
+                         # Llama run ever annealed -- LR sat at peak the whole
+                         # budget. Matches the Mistral arms.
   lr: 0.0001
   epochs: 1            # matched to the anchor arm
   max_steps: 400   # ~26M tokens, matching lolcats_ar. 200 was 13.1M, about 2x short,
