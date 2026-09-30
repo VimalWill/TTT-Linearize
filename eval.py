@@ -755,6 +755,10 @@ def main():
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
                    'seed': args.seed, 'ruler_lengths': args.ruler_lengths,
+                   # MMLU is meaningless without it: 5-shot and 0-shot differ
+                   # by ~2 points on Llama-3.1-8B, and None means the task's
+                   # own default rather than zero.
+                   'num_fewshot': args.num_fewshot,
                    'tokenizer': args.base, 'eval_context_length': eval_len,
                    'window_size': getattr(model_config, 'window_size', None),
                    'ttt_layer_indices': getattr(model_config, 'ttt_layer_indices', None),
