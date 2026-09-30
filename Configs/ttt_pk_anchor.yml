@@ -1,6 +1,25 @@
-# Stage 2 (LONG-CONTEXT ARM) -- AR finetune on passkey data only.
-# Identical to ttt_ar_unified_longalpaca.yml except for the corpus and
-# the stage-1 checkpoint it loads.
+# STAGE 3 (LONG-CONTEXT ARM) -- teach retrieval at 2K on top of the trained
+# anchor. There is no passkey stage 1: the mechanism for long context already
+# exists, what is missing is learning to retain and retrieve. So this resumes
+# the finished anchor (stage-1 base + merged stage-2 adapter) and trains a
+# fresh LoRA on passkey alone.
+#
+# Why this shape:
+#   - Starting from the trained anchor keeps general ability and makes the
+#     before/after an exact one-variable comparison against Table 1.
+#   - 2048, not 8192. Retrieval is the lesson; length extrapolation is a
+#     separate question tested WITHOUT further training at 4K/8K. Passkey
+#     training teaches retention, it does not guarantee extrapolation.
+#   - window_size stays 512. At 2048 that leaves 1536 tokens the local branch
+#     cannot see, so any needle below depth 75% is memory-only. That is the
+#     cell the step-2 eval reads.
+#   - lact_chunk_size 512 -> 4 inner-loop updates per sequence.
+#
+# The motivating measurement (anchor_v2, 2026-09-28): ablating all 32 TTT
+# memories moved RULER niah_single by +0.006/-0.002/+0.010 against stderr
+# ~0.02, so the whole 25% score was the window (512/2048 = 0.250). The same
+# memory moves SWDE +22.78 over a trained SWA-only arm, so it is not inert --
+# it holds gist and drops token identity.
 data:
   # Passkey retrieval as the WHOLE corpus -- train AND validation. This is the
   # dedicated long-context arm, separate from the anchor pipeline. Established
@@ -17,7 +36,7 @@ data:
   path: "nanotron/llama3-16k-passkey-retrieval-finetuning"
   num_train_docs: 10000
   num_val_docs: 200
-  passkey_max_tokens: 8128   # max_length 8192 less BOS/EOS headroom
+  passkey_max_tokens: 1984   # max_length 2048 less BOS/EOS headroom
   passkey_mask_prompt: True    # STAGE 2 SUPERVISES THE ANSWER SPAN ONLY. This
                                # is where retrieval is taught; loss on filler
                                # would put ~99.9% of it on "The grass is green."
@@ -26,8 +45,11 @@ data:
   val_set_size: 200
 model:
   name: 'ttt_ar'
-  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_passkey/best_ckpt}
-  max_length: 8192
+  # stage-1 BASE of the trained anchor; the stage-2 adapter is merged via
+  # train.resume_adapter below (resume_stage2 -> merge_and_unload, then a
+  # fresh LoRA attaches on top).
+  pretrained_model_name_or_path: ${oc.env:TTT_ANCHOR_S1,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_gate/best_ckpt}
+  max_length: 2048
   attn_varient: "ttt"
   lact_chunk_size: 512
   window_size: 512        # must be >= lact_chunk_size
@@ -50,6 +72,7 @@ model:
   add_eos_token: False
   device_map: 'auto'
 train:
+  resume_adapter: ${oc.env:TTT_ANCHOR_S2,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_ar_unified_longalpaca/best_ckpt}
   optim: 'adamw_torch'
   # NO explicit schedule here: Anchor-F is NOT being retrained, so its
   # checkpoint keeps the ReduceLROnPlateau default. Anchor-I must match it or
