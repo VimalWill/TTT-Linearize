@@ -22,6 +22,16 @@ data:
   num_train_docs: 10000
   num_val_docs: 200
   passkey_max_tokens: 8128   # max_length 8192 less BOS/EOS headroom
+  passkey_mask_prompt: False   # STAGE 1 SUPERVISES EVERY TOKEN. Attention
+                               # transfer needs its CE anchor: the teacher is
+                               # computed from the student's own hidden states,
+                               # so MSE alone is not well-posed (measured going
+                               # down 941x while CE went 6.4 -> 15.7). Masking
+                               # to ~5 of 8192 tokens would leave near-pure MSE
+                               # on a ~20-token repeating cycle, which a 512
+                               # window reproduces alone -- the TTT branch would
+                               # learn it is unnecessary and the gate would
+                               # never open. Stage 2 masks.
   batch_size: 8
   micro_batch_size: 1
   val_set_size: 200

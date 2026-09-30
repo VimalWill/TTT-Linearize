@@ -18,6 +18,9 @@ data:
   num_train_docs: 10000
   num_val_docs: 200
   passkey_max_tokens: 8128   # max_length 8192 less BOS/EOS headroom
+  passkey_mask_prompt: True    # STAGE 2 SUPERVISES THE ANSWER SPAN ONLY. This
+                               # is where retrieval is taught; loss on filler
+                               # would put ~99.9% of it on "The grass is green."
   batch_size: 8
   micro_batch_size: 1
   val_set_size: 200

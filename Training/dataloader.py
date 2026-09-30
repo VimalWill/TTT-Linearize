@@ -158,7 +158,12 @@ def load_data(config):
         if len(rows) < n_val + 1:
             raise ValueError(f"{data_path}: only {len(rows)} examples under {pk_max} tokens")
         random.Random(42).shuffle(rows)
-        formatter = partial(template_and_tokenize_passkey, tokenizer=tokenizer)
+        # Stage 1 needs the CE anchor, stage 2 needs answer-only loss. See
+        # template_and_tokenize_passkey.
+        mask_prompt = bool(config.data.get("passkey_mask_prompt", True))
+        formatter = partial(template_and_tokenize_passkey, tokenizer=tokenizer,
+                            mask_prompt=mask_prompt)
+        print(f"-> passkey loss on {'answer span only' if mask_prompt else 'ALL tokens'}")
         val_set = convert_to_hf_dataset(rows[:n_val], cache_dir)
         train_set = convert_to_hf_dataset(rows[n_val:], cache_dir)
         test_set = val_set
@@ -302,7 +307,9 @@ def load_data(config):
         if not rows:
             raise ValueError(f'{pk_path}: no examples under {pk_max} tokens')
         pk_set = convert_to_hf_dataset(rows, cache_dir).map(
-            partial(template_and_tokenize_passkey, tokenizer=tokenizer),
+            # always answer-only here: the mixture arm's LongAlpaca half
+            # already supplies the CE anchor
+            partial(template_and_tokenize_passkey, tokenizer=tokenizer, mask_prompt=True),
             remove_columns=['prompt', 'answer', 'depth_percent'])
         mix_parts.append(pk_set)
         print(f'-> mixed in {len(pk_set)} passkey examples from {pk_path} '
@@ -403,7 +410,8 @@ def template_and_tokenize_lm(sample, tokenizer, include_label: bool = True,
 PASSKEY_MARKER = "The pass key is "
 
 
-def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True):
+def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True,
+                                  mask_prompt: bool = True):
     """Synthetic passkey retrieval, with the loss masked to the answer alone.
 
     The corpus is the reason the TTT memory never learned to store token
@@ -414,9 +422,21 @@ def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True)
     same contexts moves +22.78, so the memory works; it just holds gist.
 
     nanotron's prompt already ends `... The pass key is 425.`, so the answer has
-    to be split back off and everything before it masked to -100. Supervising
-    the whole sequence would put ~99.9% of the loss on filler ("The grass is
-    green. The sky is blue.") and teach the marginal, not the retrieval.
+    to be split back off.
+
+    `mask_prompt` is stage-dependent and both settings are deliberate:
+
+    STAGE 2 (True, the default). Loss on the answer span alone. Supervising the
+    whole sequence would put ~99.9% of the loss on filler ("The grass is green.
+    The sky is blue.") and teach the marginal, not the retrieval.
+
+    STAGE 1 (False). Attention transfer needs its CE anchor. The trainer's
+    compute_loss documents why: the teacher is computed from the student's own
+    hidden states, so MSE alone is not well-posed and was measured going down
+    941x while CE went from 6.4 to 15.7. Masking to ~5 tokens out of 8192
+    removes that anchor almost entirely and leaves near-pure MSE on a ~20-token
+    repeating cycle -- which a 512 window reproduces on its own, so the TTT
+    branch would learn it is unnecessary and the gate would never open.
     """
     text = sample["prompt"]
     prefix, answer = text.rsplit(PASSKEY_MARKER, 1)
@@ -428,10 +448,11 @@ def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True)
     answer_ids = tokenizer.encode(answer, add_special_tokens=False)
     answer_ids = answer_ids + [tokenizer.eos_token_id]
     input_ids = prompt_ids + answer_ids
+    labels = ([-100] * len(prompt_ids) + answer_ids) if mask_prompt else list(input_ids)
     return {
         "input_ids": input_ids,
         "attention_mask": [1] * len(input_ids),
-        "labels": [-100] * len(prompt_ids) + answer_ids,
+        "labels": labels,
     }
 
 
