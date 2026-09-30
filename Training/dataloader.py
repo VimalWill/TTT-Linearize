@@ -1,6 +1,7 @@
 import os
 import shutil
 import random
+import re
 import itertools
 from tqdm import tqdm
 from functools import partial
@@ -8,7 +9,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import Dataset as HFDataset
 from datasets import load_dataset, load_from_disk
-import evaluate
 from huggingface_hub import hf_hub_download
 
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
@@ -143,18 +143,18 @@ def load_data(config):
         # NOT packed. ConcatDataset would splice two haystacks into one window
         # and leave a sequence with two answers and one question.
         concat_data = False
+        if int(config.data.micro_batch_size) != 1:
+            raise ValueError('Unpacked passkey training requires micro_batch_size 1')
         n_docs = int(config.data.get("num_train_docs", 10000))
         n_val = int(config.data.get("num_val_docs", 200))
-        # leave room for BOS/EOS and the tokeniser disagreeing with num_tokens
-        pk_max = int(config.data.get("passkey_max_tokens", input_len - 64))
-        rows, skipped = [], 0
-        for row in load_dataset(data_path, split="train", streaming=True):
-            if row.get("num_tokens", 0) > pk_max:
-                skipped += 1
-                continue
-            rows.append({"prompt": row["prompt"], "answer": row["answer"]})
-            if len(rows) >= n_docs + n_val:
-                break
+        # Count BOS/EOS and the completion with the active tokenizer.
+        pk_max = min(input_len, int(config.data.get("passkey_max_tokens", input_len - 64)))
+        rows, skipped = collect_passkey_rows(
+            load_dataset(data_path, split="train", streaming=True), tokenizer,
+            n_docs + n_val, pk_max,
+            min_tokens=int(config.data.get('passkey_min_tokens', 0)),
+            min_distance=int(config.data.get('passkey_min_distance', 0)),
+            unique_answers=bool(config.data.get('passkey_unique_answers', False)))
         if len(rows) < n_val + 1:
             raise ValueError(f"{data_path}: only {len(rows)} examples under {pk_max} tokens")
         random.Random(42).shuffle(rows)
@@ -169,7 +169,7 @@ def load_data(config):
         test_set = val_set
         cols = list(val_set.features)
         print(f"-> passkey corpus: {len(rows) - n_val} train / {n_val} val "
-              f"(<= {pk_max} tokens, skipped {skipped} longer)")
+              f"(<= {pk_max} actual tokens; rejected {skipped})")
     elif "wikitext" in data_name.lower():
         # WikiText rows are single LINES, not documents, so the pg19 branch is
         # wrong for it three ways: it shuffles rows (scrambling articles, which
@@ -334,6 +334,7 @@ def load_data(config):
     }
     # Evaluation metric
     try:
+        import evaluate
         # metric = load_metric(download_metric(), 'gov_report')  # hack but we want rouge
         metric = evaluate.load(download_metric(), 'gov_report') 
     except Exception as e:
@@ -410,50 +411,78 @@ def template_and_tokenize_lm(sample, tokenizer, include_label: bool = True,
 PASSKEY_MARKER = "The pass key is "
 
 
-def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True,
-                                  mask_prompt: bool = True):
-    """Synthetic passkey retrieval, with the loss masked to the answer alone.
-
-    The corpus is the reason the TTT memory never learned to store token
-    identity: LongAlpaca only ever asks for paraphrase, so a memory that keeps
-    the gist scores perfectly. Measured on this checkpoint -- ablating every TTT
-    memory moved RULER niah_single by +0.006/-0.002/+0.010 against a stderr of
-    ~0.02, i.e. the whole 25% was the 512-token window (512/2048). SWDE over the
-    same contexts moves +22.78, so the memory works; it just holds gist.
-
-    nanotron's prompt already ends `... The pass key is 425.`, so the answer has
-    to be split back off.
-
-    `mask_prompt` is stage-dependent and both settings are deliberate:
-
-    STAGE 2 (True, the default). Loss on the answer span alone. Supervising the
-    whole sequence would put ~99.9% of the loss on filler ("The grass is green.
-    The sky is blue.") and teach the marginal, not the retrieval.
-
-    STAGE 1 (False). Attention transfer needs its CE anchor. The trainer's
-    compute_loss documents why: the teacher is computed from the student's own
-    hidden states, so MSE alone is not well-posed and was measured going down
-    941x while CE went from 6.4 to 15.7. Masking to ~5 tokens out of 8192
-    removes that anchor almost entirely and leaves near-pure MSE on a ~20-token
-    repeating cycle -- which a 512 window reproduces on its own, so the TTT
-    branch would learn it is unnecessary and the gate would never open.
-    """
-    text = sample["prompt"]
-    prefix, answer = text.rsplit(PASSKEY_MARKER, 1)
+def passkey_parts(sample, tokenizer):
+    prefix, answer = sample["prompt"].rsplit(PASSKEY_MARKER, 1)
     prefix += PASSKEY_MARKER
     if answer.strip().rstrip('.') != str(sample["answer"]):
         raise ValueError(f'passkey suffix {answer!r} != answer {sample["answer"]!r}')
-
     prompt_ids = tokenizer.encode(prefix, add_special_tokens=True)
     answer_ids = tokenizer.encode(answer, add_special_tokens=False)
-    answer_ids = answer_ids + [tokenizer.eos_token_id]
-    input_ids = prompt_ids + answer_ids
-    labels = ([-100] * len(prompt_ids) + answer_ids) if mask_prompt else list(input_ids)
-    return {
-        "input_ids": input_ids,
-        "attention_mask": [1] * len(input_ids),
-        "labels": labels,
-    }
+    if tokenizer.eos_token_id is not None:
+        answer_ids.append(tokenizer.eos_token_id)
+    return prefix, prompt_ids, answer_ids
+
+
+def template_and_tokenize_passkey(sample, tokenizer, include_label: bool = True,
+                                  mask_prompt: bool = True):
+    """Answer-only teacher forcing, or prompt-only generation inputs.
+
+    The dataset's prompt includes a supplied completion, which must be removed
+    for generation. Answer-only CE averages over supervised tokens; masking a
+    long prompt does not divide the answer loss by the total sequence length.
+    mask_prompt=False retains the existing all-token training option.
+    """
+    _, prompt_ids, answer_ids = passkey_parts(sample, tokenizer)
+    if include_label:
+        input_ids = prompt_ids + answer_ids
+        labels = ([-100] * len(prompt_ids) + answer_ids) if mask_prompt else list(input_ids)
+    else:
+        input_ids, labels = prompt_ids, answer_ids
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
+            "labels": labels}
+
+
+def collect_passkey_rows(source, tokenizer, count, max_tokens, min_tokens=0,
+                         min_distance=0, unique_answers=False):
+    """Select intact examples using the active tokenizer, never truncation.
+
+    Distance is the separately tokenized suffix after the last numeric answer
+    occurrence in the prompt. Filtering removes a direct local-window shortcut;
+    it does not exclude information relay through stacked attention layers.
+    """
+    if count < 1 or not 0 <= min_tokens <= max_tokens or max_tokens < 1 or min_distance < 0:
+        raise ValueError('Invalid passkey count, token bounds, or distance')
+    rows, seen, answers = [], set(), set()
+    skipped = dict(too_long=0, too_short=0, too_close=0, duplicate=0)
+    for row in source:
+        prefix, prompt_ids, answer_ids = passkey_parts(row, tokenizer)
+        length = len(prompt_ids) + len(answer_ids)
+        if length > max_tokens:
+            skipped['too_long'] += 1
+            continue
+        if length < min_tokens:
+            skipped['too_short'] += 1
+            continue
+        if min_distance:
+            matches = list(re.finditer(r'(?<!\d)' + re.escape(str(row['answer']))
+                                       + r'(?!\d)', prefix))
+            if not matches:
+                raise ValueError('Passkey answer absent from prompt')
+            distance = len(tokenizer.encode(prefix[matches[-1].end():],
+                                            add_special_tokens=False))
+            if distance < min_distance:
+                skipped['too_close'] += 1
+                continue
+        answer = str(row['answer'])
+        if row['prompt'] in seen or (unique_answers and answer in answers):
+            skipped['duplicate'] += 1
+            continue
+        seen.add(row['prompt'])
+        answers.add(answer)
+        rows.append({'prompt': row['prompt'], 'answer': row['answer']})
+        if len(rows) == count:
+            break
+    return rows, skipped
 
 
 def template_and_tokenize_longbench(sample, tokenizer, include_label: bool = True):

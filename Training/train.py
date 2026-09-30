@@ -112,6 +112,22 @@ def resume_stage2(model, adapter):
     return PeftModel.from_pretrained(model, adapter).merge_and_unload()
 
 
+def continue_stage2(model, adapter):
+    """Continue the existing adapter and TTT weights with a fresh optimizer.
+
+    Keeping the original adapter (rather than merging it and adding a new one)
+    makes the result reloadable against the SAME full/base checkpoint.
+    """
+    from eval import load_ttt_params
+    path = os.path.join(adapter, 'ttt_params.pt')
+    if not os.path.isfile(path):
+        raise ValueError(f'Anchor continuation requires saved TTT weights: {path}')
+    saved_count = len(torch.load(path, map_location='cpu', weights_only=True))
+    if load_ttt_params(model, adapter) != saved_count:
+        raise ValueError('Not all TTT weights matched the continuation model')
+    return PeftModel.from_pretrained(model, adapter, is_trainable=True)
+
+
 def train(config):
     from Training.dataloader import load_data
 
@@ -128,6 +144,8 @@ def train(config):
         raise NotImplementedError(stage)
 
     model_config = build_model_config(config)
+    if config.train.get('continue_adapter') and config.train.get('resume_adapter'):
+        raise ValueError('Choose continue_adapter or resume_adapter, not both')
     model = AutoModelForCausalLM.from_pretrained(
         config.model.pretrained_model_name_or_path,
         config=model_config,
@@ -136,6 +154,10 @@ def train(config):
 
     if config.train.get('resume_adapter'):
         model = resume_stage2(model, config.train.resume_adapter)
+    if config.train.get('continue_adapter'):
+        if stage != 'ttt_ar' or alignment_only:
+            raise ValueError('continue_adapter requires joint autoregressive training')
+        model = continue_stage2(model, config.train.continue_adapter)
 
 
     print("Model config:")
@@ -159,7 +181,7 @@ def train(config):
             target_modules.append("self_attn.v_proj")
         if "train_o" in config.train and config.train.train_o and config.train.train_o_lora:
             target_modules.append("self_attn.o_proj")
-    if len(target_modules) != 0:
+    if len(target_modules) != 0 and not isinstance(model, PeftModel):
         lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=target_modules)
         model = get_peft_model(model, peft_config=lora_config)
 

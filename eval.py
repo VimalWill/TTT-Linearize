@@ -5,6 +5,9 @@ import json
 import math
 import os
 import re
+import random
+
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +40,12 @@ def load_ttt_params(model, adapter, verbose=True):
         return 0
     sd = torch.load(ttt, map_location='cpu')
     sd = {_PEFT_PREFIX.sub('', k): v for k, v in sd.items()}
+    # Training accumulates small reader updates in FP32. The base model was
+    # cast to BF16 before this overlay; promote BEFORE copying saved values,
+    # otherwise continuation irreversibly rounds away those updates.
+    for name, param in model.named_parameters():
+        if name.endswith('ttt_reader_alignment.weight') and name in sd:
+            param.data = param.data.to(dtype=sd[name].dtype)
     unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
     matched = len(sd) - len(unexpected)
     if matched == 0:
@@ -422,6 +431,25 @@ SUITES = {
 }
 
 
+def ruler_task_specs(tasks, lengths):
+    """Register custom NIAH lengths as metrics as well as dataset metadata.
+
+    Upstream NIAH YAMLs only register 4k through 128k. Requesting 2k data
+    without its aggregation can fail when the harness computes the scores.
+    Keep the standard lengths too: process_results can emit sentinel entries
+    for them, and the upstream aggregator discards those sentinel values.
+    """
+    if not lengths or not any(t.startswith('niah_') for t in tasks):
+        return list(tasks)
+    from lm_eval.tasks.ruler import common_utils
+    metric_lengths = sorted(set(lengths) | {4096, 8192, 16384, 32768, 65536, 131072}
+                            | set(getattr(common_utils, 'DEFAULT_SEQ_LENGTHS', [])))
+    return [dict(task=t, metric_list=[
+                dict(metric=str(length), aggregation=common_utils.aggregate_metrics,
+                     higher_is_better=True) for length in metric_lengths])
+            if t.startswith('niah_') else t for t in tasks]
+
+
 def resolve(tasks, metadata=None):
     """Check task names against the installed registry before spending a load.
 
@@ -467,6 +495,8 @@ def main():
     ap.add_argument('--limit', type=int, default=None,
                     help='cap examples per task -- required for a layer sweep')
     ap.add_argument('--num-fewshot', type=int, default=None)
+    ap.add_argument('--seed', type=int, default=0,
+                    help='seed task construction and inference for paired evaluations')
     ap.add_argument('--batch-size', default='4')
     ap.add_argument('--ablate', choices=['ttt', 'attn'], default=None)
     ap.add_argument('--layers', type=int, nargs='+', default=None,
@@ -538,6 +568,9 @@ def main():
                          'never the group. Only with every member off is the '
                          "group's contribution to the residual stream zero.")
     args = ap.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Fail before a multi-minute checkpoint load, not after.
     if args.baseline:
@@ -591,8 +624,10 @@ def main():
             args.base, device_map={'': 0}, torch_dtype=torch.bfloat16).eval()
         model_config, mods, sel, causality = model.config, [], [], None
     else:
+        # --ckpt supersedes the training initialization, including a required
+        # TTT_INIT environment interpolation in a continuation config.
+        config.model.pretrained_model_name_or_path = args.ckpt
         cfg = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
-        cfg.model.pretrained_model_name_or_path = args.ckpt
         if args.window or args.chunk:
             old_w = int(cfg.model.get('window_size', cfg.model.lact_chunk_size))
             old_c = int(cfg.model.lact_chunk_size)
@@ -663,7 +698,10 @@ def main():
     lm = HFLM(pretrained=model, tokenizer=args.base,
               batch_size=args.batch_size, max_length=eval_len)
 
-    kwargs = dict(model=lm, tasks=tasks, task_manager=tm, limit=args.limit)
+    kwargs = dict(model=lm, tasks=ruler_task_specs(tasks, args.ruler_lengths),
+                  task_manager=tm, limit=args.limit,
+                  random_seed=args.seed, numpy_random_seed=args.seed,
+                  torch_random_seed=args.seed, fewshot_random_seed=args.seed)
     if args.ruler_lengths:
         import inspect
         if 'metadata' not in inspect.signature(lm_eval.simple_evaluate).parameters:
@@ -716,6 +754,11 @@ def main():
                    'limit': args.limit, 'ablate': args.ablate,
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
+                   'seed': args.seed, 'ruler_lengths': args.ruler_lengths,
+                   'tokenizer': args.base, 'eval_context_length': eval_len,
+                   'window_size': getattr(model_config, 'window_size', None),
+                   'ttt_layer_indices': getattr(model_config, 'ttt_layer_indices', None),
+                   'ttt_share_groups': getattr(model_config, 'ttt_share_groups', None),
                    'results': flat}, f, indent=2)
     print(f'\nwrote {path}')
 
