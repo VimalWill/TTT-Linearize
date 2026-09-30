@@ -453,9 +453,16 @@ def collect_passkey_rows(source, tokenizer, count, max_tokens, min_tokens=0,
     if count < 1 or not 0 <= min_tokens <= max_tokens or max_tokens < 1 or min_distance < 0:
         raise ValueError('Invalid passkey count, token bounds, or distance')
     rows, seen, answers = [], set(), set()
-    skipped = dict(too_long=0, too_short=0, too_close=0, duplicate=0)
+    skipped = dict(invalid=0, too_long=0, too_short=0, too_close=0, duplicate=0)
     for row in source:
-        prefix, prompt_ids, answer_ids = passkey_parts(row, tokenizer)
+        try:
+            prefix, prompt_ids, answer_ids = passkey_parts(row, tokenizer)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A malformed streaming row should not terminate an otherwise
+            # usable corpus. Keep formatter validation strict for direct use;
+            # count and skip bad records at the dataset boundary.
+            skipped['invalid'] += 1
+            continue
         length = len(prompt_ids) + len(answer_ids)
         if length > max_tokens:
             skipped['too_long'] += 1
@@ -467,7 +474,8 @@ def collect_passkey_rows(source, tokenizer, count, max_tokens, min_tokens=0,
             matches = list(re.finditer(r'(?<!\d)' + re.escape(str(row['answer']))
                                        + r'(?!\d)', prefix))
             if not matches:
-                raise ValueError('Passkey answer absent from prompt')
+                skipped['invalid'] += 1
+                continue
             distance = len(tokenizer.encode(prefix[matches[-1].end():],
                                             add_special_tokens=False))
             if distance < min_distance:

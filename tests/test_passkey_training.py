@@ -59,16 +59,32 @@ class PasskeyDataTests(unittest.TestCase):
             [row, duplicate, too_close, too_long, sample('')], CharTokenizer(),
             count=10, max_tokens=200, min_tokens=80, min_distance=80)
         self.assertEqual(rows, [{'prompt': row['prompt'], 'answer': row['answer']}])
-        self.assertEqual(skipped, dict(too_long=1, too_short=1, too_close=1, duplicate=1))
+        self.assertEqual(skipped, dict(invalid=0, too_long=1, too_short=1,
+                                       too_close=1, duplicate=1))
 
     def test_inconsistent_or_missing_answer_is_rejected(self):
+        """Strict in the formatter, counted-and-skipped at the dataset boundary.
+
+        A malformed streaming row must not terminate an otherwise usable
+        corpus, but a bad row handed straight to the formatter is a caller bug
+        and still raises.
+        """
         row = sample()
         row['answer'] = '99999'
         with self.assertRaisesRegex(ValueError, 'suffix'):
             template_and_tokenize_passkey(row, CharTokenizer())
-        row = {'prompt': 'No needle. The pass key is 12345', 'answer': '12345'}
-        with self.assertRaisesRegex(ValueError, 'absent'):
-            collect_passkey_rows([row], CharTokenizer(), 1, 200, min_distance=10)
+
+        good = sample()
+        malformed = [
+            {'prompt': 'No needle. The pass key is 12345', 'answer': '12345'},
+            {'prompt': sample()['prompt']},                  # missing answer
+            {'prompt': None, 'answer': '12345'},             # not a string
+            {'prompt': 'no marker at all', 'answer': '12345'},
+        ]
+        rows, skipped = collect_passkey_rows(
+            malformed + [good], CharTokenizer(), 10, 200, min_distance=10)
+        self.assertEqual(rows, [{'prompt': good['prompt'], 'answer': good['answer']}])
+        self.assertEqual(skipped['invalid'], len(malformed))
 
     def test_unique_answers_prevents_key_overlap_across_the_split(self):
         rows, skipped = collect_passkey_rows(

@@ -47,8 +47,9 @@ prompt. This removes direct access through a 512-token local window; stacked loc
 layers can still relay information, which is why the ablation remains necessary.
 The filter also enforces unique answer strings before the deterministic split:
 200 validation examples, at most 10,000 training examples. The source may yield
-fewer after filtering; the loader prints actual counts and fails if the validation
-split leaves no training examples. Multiple epochs can repeat training examples.
+fewer after filtering; the loader prints actual counts, including malformed rows
+it skipped, and fails if the validation split leaves no training examples.
+Multiple epochs can repeat training examples.
 
 Only answer/completion tokens and EOS have training labels. Generation inputs
 exclude the supplied answer completion. The validation metric is teacher-forced
