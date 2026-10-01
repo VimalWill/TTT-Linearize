@@ -1,3 +1,5 @@
+import inspect
+
 from transformers.cache_utils import Cache
 
 
@@ -10,7 +12,12 @@ class TTTCache(Cache):
     """
 
     def __init__(self):
-        super().__init__()
+        # HF 4.45 has a parameterless Cache; newer releases require an
+        # explicit layer container. TTT state lives in states, not KV layers.
+        if 'layers' in inspect.signature(Cache.__init__).parameters:
+            super().__init__(layers=[])
+        else:
+            super().__init__()
         self.states = {}
         self._seen_tokens = 0
 

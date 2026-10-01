@@ -44,6 +44,8 @@ class CapacitySearchTests(unittest.TestCase):
 
     def test_load_failure_and_counter_failure_are_not_runtime_capacity(self):
         self.assertFalse(runtime_oom(dict(status='oom', phase='model_load')))
+        self.assertTrue(runtime_oom(dict(status='oom', phase='prefill')))
+        self.assertTrue(runtime_oom(dict(status='oom', phase='decode')))
         self.assertFalse(runtime_oom(dict(status='ok', phase='complete', flops_status='oom')))
         result = calibrate_batch(lambda length, batch: dict(
             status='oom', phase='model_load', error='weights do not fit'))
@@ -84,13 +86,16 @@ class WorkerStatusTests(unittest.TestCase):
             config = SimpleNamespace(vocab_size=32, window_size=8, lact_chunk_size=8,
                                      ttt_layer_indices=None, ttt_share_groups=None)
 
-            def forward(self, input_ids, use_cache):
-                return input_ids.float().sum()
+            def forward(self, input_ids, use_cache, past_key_values=None,
+                        logits_to_keep=0, return_dict=True):
+                self_cache = past_key_values if past_key_values is not None else {}
+                return SimpleNamespace(logits=torch.zeros(input_ids.shape[0], 1, 32),
+                                       past_key_values=self_cache)
 
         model = Model()
         args = SimpleNamespace(baseline=False, cfg='unused', ckpt='unused', adapter=None,
                                seq_len=32, batch=1, sdpa_window=False, seed=0, warmup=1,
-                               reps=1, skip_flops=False, depth=0)
+                               reps=1, skip_flops=False, depth=0, decode_tokens=2)
         record = {}
         with patch('Training.train.build_model_config', return_value=model.config), \
                 patch('measure_flops.load_benchmark_config'), \
@@ -101,7 +106,7 @@ class WorkerStatusTests(unittest.TestCase):
                 patch('torch.cuda.synchronize'), patch('torch.cuda.reset_peak_memory_stats'), \
                 patch('torch.cuda.memory_allocated', return_value=100), \
                 patch('torch.cuda.max_memory_allocated', return_value=200), \
-                patch('measure_flops.count_forward', side_effect=torch.cuda.OutOfMemoryError('CUDA out of memory')), \
+                patch('measure_flops.count_cached_inference', side_effect=torch.cuda.OutOfMemoryError('CUDA out of memory')), \
                 contextlib.redirect_stderr(io.StringIO()):
             measure_flops.run_benchmark(args, record)
         self.assertEqual(record['status'], 'ok')
@@ -126,7 +131,7 @@ a, _ = p.parse_known_args()
 status = 'oom' if a.baseline and a.batch*a.seq_len > 262144 else 'ok'
 if 'mistral_l2' in a.cfg and a.seq_len == 16384: status = 'error'
 result = dict(status=status, phase='complete' if status == 'ok' else 'timing',
-              seq_len=a.seq_len, batch=a.batch,
+              seq_len=a.seq_len, batch=a.batch, use_cache=True, decode_tokens=512,
               latency_seconds=(2. if a.baseline else 1.) if status == 'ok' else None)
 with open(a.out, 'w') as f: json.dump(result, f)
 sys.exit(0 if status == 'ok' else 2 if status == 'oom' else 1)
@@ -166,7 +171,7 @@ p.add_argument('--baseline', action='store_true')
 a, _ = p.parse_known_args()
 failed = a.baseline and a.seq_len >= 16384
 result = dict(status='oom' if failed else 'ok', phase='timing' if failed else 'complete',
-              seq_len=a.seq_len, batch=a.batch, latency_seconds=None if failed else .1)
+              seq_len=a.seq_len, batch=a.batch, use_cache=True, decode_tokens=512, latency_seconds=None if failed else .1)
 with open(a.out, 'w') as f: json.dump(result, f)
 sys.exit(2 if failed else 0)
 ''')

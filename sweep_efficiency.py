@@ -1,4 +1,14 @@
-"""OOM-safe context sweep; each GPU case runs in a fresh worker process."""
+"""Cached prefill/decode sweep; each GPU case runs in a fresh worker process.
+
+Default prompt lengths are 4K/8K/16K/32K, followed by 512 cached decode
+forwards. Baseline, Anchor-F, Anchor-I full, and Anchor (Anchor-I deployment)
+use identical batch sizes and decode lengths. Automatic stress-batch selection
+tries to bracket baseline runtime OOM between 8K and 16K prompt tokens.
+The JSON/CSV reports separate prefill/decode speedups and actual retained
+cache storage. Capacity includes prefill activations and decode state; an OOM
+is not necessarily caused by cache alone. Baseline cache policy is the native
+HF implementation and is recorded, never changed just to induce an OOM.
+"""
 import argparse
 import csv
 from dataclasses import dataclass
@@ -18,7 +28,7 @@ class Arm:
 
 
 def runtime_oom(result):
-    return result['status'] == 'oom' and result.get('phase') in ('inputs', 'warmup', 'timing')
+    return result['status'] == 'oom' and result.get('phase') in ('inputs', 'warmup', 'prefill', 'decode', 'timing')
 
 
 def calibrate_batch(probe, low=8192, high=16384, max_batch=128):
@@ -83,16 +93,18 @@ def find_oom_boundary(probe, batch, low=8192, high=16384, resolution=256):
                 min_tested_oom_tokens=high, interval_width_tokens=high - low,
                 max_tested_fit_total_tokens=batch * low,
                 min_tested_oom_total_tokens=batch * high,
-                scope='warm_forward_all_position_logits_cache_disabled')
+                token_unit='prompt tokens per sequence; fixed decode length recorded in config',
+                scope='cached_prefill_and_incremental_decode_last_position_logits')
 
 
 class CaseRunner:
     def __init__(self, directory, worker=None, python=sys.executable,
-                 warmup=2, reps=10, seed=0):
+                 warmup=2, reps=10, seed=0, decode_tokens=512):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.worker = Path(worker or Path(__file__).with_name('measure_flops.py'))
         self.python, self.warmup, self.reps, self.seed = python, warmup, reps, seed
+        self.decode_tokens = decode_tokens
 
     def run(self, arm, length, batch, skip_flops=False, reps=None):
         stem = f'{arm.name}_b{batch}_s{length}'
@@ -101,7 +113,8 @@ class CaseRunner:
         command = [self.python, str(self.worker), '--seq-len', str(length),
                    '--batch', str(batch), '--warmup', str(self.warmup),
                    '--reps', str(self.reps if reps is None else reps),
-                   '--seed', str(self.seed), '--out', str(output)]
+                   '--seed', str(self.seed), '--decode-tokens', str(self.decode_tokens),
+                   '--out', str(output)]
         if arm.cfg:
             command += ['--cfg', arm.cfg, '--ckpt', arm.ckpt]
             if arm.adapter:
@@ -122,6 +135,9 @@ class CaseRunner:
                 raise ValueError('Worker reported a different input shape')
             if result['status'] == 'ok' and not result.get('latency_seconds', 0) > 0:
                 raise ValueError('Successful worker report lacks a positive latency')
+            if result['status'] == 'ok' and (result.get('use_cache') is not True
+                    or result.get('decode_tokens') != self.decode_tokens):
+                raise ValueError('Worker did not report the requested cached inference workload')
             if completed.returncode != 0 and result['status'] == 'ok':
                 raise ValueError(f'Worker exited {completed.returncode} after reporting success')
         except (OSError, ValueError) as error:
@@ -130,7 +146,7 @@ class CaseRunner:
             result = dict(status='error', phase='subprocess',
                           error=f'Worker exit {completed.returncode}; {error}',
                           seq_len=length, batch=batch)
-        result.update(arm=arm.name, returncode=completed.returncode,
+        result.update(arm=arm.name, decode_tokens=self.decode_tokens, returncode=completed.returncode,
                       command=command, log=str(log), result_path=str(output))
         detail = (f" {result['latency_seconds'] * 1e3:.1f} ms"
                   if result['status'] == 'ok' else f" phase={result.get('phase')}")
@@ -143,9 +159,14 @@ def write_summary(directory, report):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
     temporary.replace(path)
-    fields = ['arm', 'batch', 'seq_len', 'status', 'phase', 'latency_seconds',
+    fields = ['arm', 'batch', 'seq_len', 'decode_tokens', 'use_cache', 'scope',
+              'status', 'phase', 'latency_seconds',
+              'prefill_latency_seconds', 'decode_latency_seconds', 'decode_seconds_per_step',
+              'prefill_tokens_per_second', 'decode_tokens_per_second',
+              'cache_class', 'prefill_cache_bytes', 'decode_cache_bytes',
               'tokens_per_second', 'peak_allocated_bytes', 'above_resident_bytes',
-              'counted_flops', 'flops_status', 'baseline_status',
+              'counted_flops', 'decode_counted_flops', 'flops_status', 'baseline_status',
+              'prefill_speedup_vs_baseline', 'decode_speedup_vs_baseline',
               'speedup_vs_baseline', 'error', 'log']
     with (Path(directory) / 'results.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
@@ -165,6 +186,8 @@ def main():
     parser.add_argument('--anchor-f-cfg', default='Configs/ttt_ar_mistral_l2.yml')
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--lengths', nargs='+', type=int, default=[4096, 8192, 16384, 32768])
+    parser.add_argument('--decode-tokens', type=int, default=512,
+                        help='incremental cached forwards after each prefill')
     parser.add_argument('--batch', type=int, help='fixed stress batch; otherwise calibrate it')
     parser.add_argument('--max-batch', type=int, default=128, help='automatic calibration upper bound')
     parser.add_argument('--oom-low', type=int, default=8192)
@@ -177,7 +200,7 @@ def main():
     parser.add_argument('--skip-flops', action='store_true', help='skip reference FLOPs in batch-1 cases too')
     args = parser.parse_args()
     if min(args.lengths + [args.max_batch, args.oom_low, args.oom_resolution,
-                           args.warmup, args.reps]) < 1 or args.oom_high <= args.oom_low:
+                           args.warmup, args.reps, args.decode_tokens]) < 1 or args.oom_high <= args.oom_low:
         parser.error('Lengths, batches, reps and resolution must be positive; oom-high must exceed oom-low')
     if args.batch is not None and args.batch < 1:
         parser.error('--batch must be positive')
@@ -192,7 +215,8 @@ def main():
             Arm('anchor_f', args.base, args.anchor_f_cfg, args.anchor_f_ckpt, args.anchor_f_adapter)]
     report = dict(config=vars(args), calibration=None, oom_boundary=None, probes=[], cases=[])
     write_summary(directory, report)
-    probe_runner = CaseRunner(directory / 'probes', warmup=args.warmup, reps=1, seed=args.seed)
+    probe_runner = CaseRunner(directory / 'probes', warmup=args.warmup, reps=1, seed=args.seed,
+                              decode_tokens=args.decode_tokens)
     cache = {}
 
     def probe(length, batch):
@@ -217,7 +241,8 @@ def main():
     print(f"\nSelected stress batch: {batch}; {report['calibration']['reason']}", flush=True)
     print(f"Baseline OOM boundary: {report['oom_boundary']}\n", flush=True)
 
-    runner = CaseRunner(directory / 'cases', warmup=args.warmup, reps=args.reps, seed=args.seed)
+    runner = CaseRunner(directory / 'cases', warmup=args.warmup, reps=args.reps, seed=args.seed,
+                        decode_tokens=args.decode_tokens)
     # Batch 1 shows context scaling. A second, fixed batch tests capacity; never
     # shrink it per arm or length, since that would invalidate the comparison.
     for current_batch in sorted({1, batch}):
@@ -232,6 +257,12 @@ def main():
                 result['speedup_vs_baseline'] = (
                     reference['latency_seconds'] / result['latency_seconds']
                     if reference['status'] == result['status'] == 'ok' else None)
+                for metric in ('prefill', 'decode'):
+                    field = f'{metric}_latency_seconds'
+                    result[f'{metric}_speedup_vs_baseline'] = (
+                        reference[field] / result[field]
+                        if reference['status'] == result['status'] == 'ok'
+                        and reference.get(field) and result.get(field) else None)
                 report['cases'].append(result)
                 write_summary(directory, report)
     print(f'\nWrote {directory / "summary.json"} and {directory / "results.csv"}', flush=True)
