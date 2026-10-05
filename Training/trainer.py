@@ -75,6 +75,21 @@ class DefaultTrainer():
 
         self.step = 0  # Total steps taken
         self.grad_step = 0  # Total gradient updates
+        train_options = getattr(config, 'train', {})
+        if not hasattr(train_options, 'get'):
+            train_options = vars(train_options)
+        self.train_options = train_options
+        self.input_tokens = 0
+        self.pending_input_tokens = 0
+        self.pending_exposure = {}
+        self.training_exposure = {}
+        self.max_input_tokens = int(train_options.get('max_input_tokens', 0))
+        self.phase_transition_tokens = int(train_options.get('phase_transition_tokens', 0))
+        self.final_max_length = int(train_options.get('final_max_length', 16384))
+        if self.max_input_tokens < 0 or self.phase_transition_tokens < 0:
+            raise ValueError('Token budgets must be nonnegative')
+        if self.max_input_tokens and self.phase_transition_tokens >= self.max_input_tokens:
+            raise ValueError('Phase transition must precede the total token budget')
         self.compute_loss_backprop = False  # Whether we backprop in self.compute_loss
 
         self.optimizer, self.scheduler = optimizers
@@ -124,7 +139,7 @@ class DefaultTrainer():
         
         self.save_results = save_results
         self.results_path = None
-        self.best_val_metric = 0 if self.greater_is_better else 1e10
+        self.best_val_metric = float('-inf') if self.greater_is_better else 1e10
         self.best_val_metric_epoch = 0
         self.best_val_metric_step = 0
         if save_checkpoints:  # Also initializes best_val_metrics
@@ -144,6 +159,17 @@ class DefaultTrainer():
             if early_stopping:
                 break
                 
+        if self.max_input_tokens:
+            if self.input_tokens < self.max_input_tokens:
+                raise RuntimeError(f'Training ended before token budget: {self.input_tokens}/{self.max_input_tokens}')
+            # The token limit rarely lands on an eval_steps boundary. Validate
+            # the final update before restoring the selected checkpoint.
+            if self.eval_metrics_by_step['eval_step'][-1:] != [self.grad_step]:
+                self.eval_step(model, step=self.grad_step)
+            # Keep the actual final state even if no checkpoint beat the
+            # initial retrieval score. It is never silently called the best.
+            save_checkpoint(model, self.tokenizer, self.save_path + '/last_ckpt')
+
         if self.load_best_model_at_end:  # Return best checkpoint
             try:
                 import os
@@ -185,6 +211,8 @@ class DefaultTrainer():
                     self.model = model
                 print(f'-> Loading best checkpoint from {ckpt_path}')
             except Exception as e:
+                if self.max_input_tokens:
+                    raise RuntimeError('Could not restore the selected long-context checkpoint') from e
                 print(e)
                 print('-> Returning most recent model instead')
         return model            
@@ -194,6 +222,8 @@ class DefaultTrainer():
         params = [p for group in self.optimizer.param_groups for p in group['params']
                   if p.grad is not None]
         if not params:
+            self.pending_input_tokens = 0
+            self.pending_exposure = {}
             return False
         # Each loss was divided by accumulation_steps before backward. A short
         # final window must instead average over the batches actually present.
@@ -206,12 +236,30 @@ class DefaultTrainer():
             params, max_norm if max_norm is not None and max_norm > 0 else float('inf'),
         )
         if not torch.isfinite(norm):
+            if self.train_options.get('fail_on_nonfinite', False):
+                raise FloatingPointError('Nonfinite gradient; stopping the matched-budget run')
             print('\n-> Nonfinite gradient norm, skipping accumulated update')
+            self.pending_input_tokens = 0
+            self.pending_exposure = {}
             self.optimizer.zero_grad()
             return False
         self.optimizer.step()
+        self.input_tokens += self.pending_input_tokens
+        for cell, exposure in self.pending_exposure.items():
+            total = self.training_exposure.setdefault(cell, dict(examples=0, tokens=0))
+            total['examples'] += exposure['examples']
+            total['tokens'] += exposure['tokens']
+        self.pending_exposure = {}
+        self.pending_input_tokens = 0
+        sampler = getattr(self.train_loader, 'sampler', None)
+        if self.phase_transition_tokens and self.input_tokens >= self.phase_transition_tokens:
+            if hasattr(sampler, 'set_max_length'):
+                sampler.set_max_length(self.final_max_length)
         if not self.scheduler_step_after_epoch and self.scheduler is not None:
-            self.scheduler.step()
+            if hasattr(self.scheduler, 'step_tokens'):
+                self.scheduler.step_tokens(self.input_tokens)
+            else:
+                self.scheduler.step()
         self.optimizer.zero_grad()
         self.grad_step += 1
         return True
@@ -227,6 +275,8 @@ class DefaultTrainer():
         model.train()
         model.zero_grad()        
         accumulated_batches = 0
+        self.pending_input_tokens = 0
+        self.pending_exposure = {}
         num_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, leave=False, colour='blue', desc=f'-> Training (epoch {epoch} / {self.args.num_train_epochs})')
         total_loss = 0
@@ -252,9 +302,13 @@ class DefaultTrainer():
         for ix, data in enumerate(pbar):
             loss, train_metrics = self.compute_loss(model, data, return_outputs=True)
             if torch.isnan(loss) or torch.isinf(loss):
+                if self.train_options.get('fail_on_nonfinite', False):
+                    raise FloatingPointError('Nonfinite training loss')
                 print(f'\n-> NaN/Inf loss at step {ix}, skipping batch')
                 self.optimizer.zero_grad()
                 accumulated_batches = 0
+                self.pending_input_tokens = 0
+                self.pending_exposure = {}
                 self.step += 1
                 continue
             raw_loss = loss.detach().item()
@@ -264,12 +318,25 @@ class DefaultTrainer():
                 try:
                     loss.backward()
                 except Exception as e:
+                    if self.train_options.get('fail_on_backward_error', False):
+                        raise
+                    self.pending_input_tokens = 0
+                    self.pending_exposure = {}
                     print(f'\n-> Backward error at step {ix}: {e}, skipping')
                     self.optimizer.zero_grad()
                     accumulated_batches = 0
                     self.step += 1
                     continue
             accumulated_batches += 1
+            if isinstance(data, dict) and 'input_ids' in data:
+                mask = data.get('attention_mask')
+                batch_tokens = int(mask.sum().item() if mask is not None else data['input_ids'].numel())
+                self.pending_input_tokens += batch_tokens
+                if 'context_tasks' in data:
+                    cell = f"{data['context_tasks'][0]}/{data['context_lengths'][0]}"
+                    exposure = self.pending_exposure.setdefault(cell, dict(examples=0, tokens=0))
+                    exposure['examples'] += 1
+                    exposure['tokens'] += batch_tokens
             optimizer_stepped = False
             if accumulated_batches == accum_iter or ix + 1 == num_batches:
                 optimizer_stepped = self._optimizer_step(accumulated_batches, accum_iter)
@@ -291,6 +358,7 @@ class DefaultTrainer():
                 self.train_metrics['train/loss_mean'] = mean_loss
                 self.train_metrics['train/epoch'] = epoch
                 self.train_metrics['train/step'] = self.grad_step
+                self.train_metrics['train/input_tokens'] = self.input_tokens
                 self.train_metrics['train/lr'] = self.optimizer.param_groups[0]['lr']
                 for k, v in train_metrics.items():
                     self.train_metrics[f'train/{k}'] = v
@@ -315,7 +383,8 @@ class DefaultTrainer():
                 else:
                     if self.grad_step > 0:
                         eval_for_step = False
-            if self.grad_step == self.max_steps:
+            if ((self.max_steps > 0 and self.grad_step >= self.max_steps)
+                    or (self.max_input_tokens and self.input_tokens >= self.max_input_tokens)):
                 early_stopping = True
                 return model, early_stopping
         
@@ -342,6 +411,14 @@ class DefaultTrainer():
                     f'{val_metric} at step {step}'
                 )
 
+            if self.max_input_tokens:
+                import json
+                from pathlib import Path
+                progress = dict(input_tokens=self.input_tokens, max_input_tokens=self.max_input_tokens,
+                                optimizer_steps=self.grad_step, exposure=self.training_exposure,
+                                phase_max_length=getattr(getattr(self.train_loader, 'sampler', None),
+                                                         'max_length', None))
+                Path(self.save_path, 'training_progress.json').write_text(json.dumps(progress, indent=2))
             # Save results
             if self.wandb is not None:  # log to WandB
                 self.wandb.log(self.eval_metrics, step=self.grad_step)
@@ -404,6 +481,8 @@ class DefaultTrainer():
                 # 'eval/loss_ce', averaging CE with (1000*MSE + CE).
                 for k, v in [('loss_total', loss), *eval_metrics.items()]:
                     step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
+                if data.get('context_tasks') == ['instruction'] and 'loss_ce' in eval_metrics:
+                    step_eval_metrics.setdefault('eval/instruction_loss_ce', []).append(eval_metrics['loss_ce'])
                 
                 step_loss += loss
                 desc = f"Evaluating at step {step} | loss: {step_loss / (ix + 1):.3f}"
@@ -413,6 +492,15 @@ class DefaultTrainer():
                 if ix == max_batches:
                     break
 
+            if self.train_options.get('generation_validation', False):
+                from Training.long_context import retrieval_validation
+                rows = dataloader.dataset.records
+                step_eval_metrics.update({k: [v] for k, v in retrieval_validation(
+                    model, self.tokenizer, rows,
+                    int(self.train_options.get('validation_per_cell', 4)),
+                    int(self.train_options.get('validation_max_new_tokens', 256))).items()})
+            if 'accuracy' in str(self.metric_for_best_model) and self.metric_for_best_model not in step_eval_metrics:
+                raise KeyError('Requested accuracy was not computed; refusing to select on a loss fallback')
             # Average over batches
             for k, v in step_eval_metrics.items():
                 step_eval_metrics[k] = sum(v) / len(v)
@@ -479,9 +567,12 @@ class DefaultTrainer():
     def init_checkpointing(self, config) -> None:
         self.save_path = config.train.output_dir
         self.best_val_checkpoint_path = config.train.output_dir
+        if self.max_input_tokens:
+            os.makedirs(self.save_path, exist_ok=True)
+            self.results_path = os.path.join(self.save_path, 'eval_metrics.csv')
 
         # Best metric setup
-        self.best_val_metric = 0 if self.greater_is_better else 1e10
+        self.best_val_metric = float('-inf') if self.greater_is_better else 1e10
         self.best_val_metric_epoch = 0
         self.best_val_metric_step = 0
         self.best_train_metric = 0 if self.greater_is_better else 1e10
@@ -500,20 +591,36 @@ class FinetuneTrainer(DefaultTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_keys = {'input_ids', 'attention_mask'}
         data = {k: v.to(model.device) for k, v in inputs.items() if k in input_keys}  
-        outputs = model(**data, output_attentions=False)
+        labels = inputs.get('labels')
+        if self.config.get('data', {}).get('name') == 'long_context':
+            import inspect
+            if labels.shape[0] != 1:
+                raise ValueError('Answer-only long-context loss requires micro_batch_size=1')
+            supervised = int((labels[0] != -100).sum())
+            if supervised < 1 or (labels[0, -supervised:] == -100).any():
+                raise ValueError('Expected one contiguous supervised answer suffix')
+            base = model.get_base_model() if hasattr(model, 'get_base_model') else model
+            parameters = inspect.signature(base.forward).parameters
+            key = next((k for k in ('logits_to_keep', 'num_logits_to_keep') if k in parameters), None)
+            if key is None:
+                raise ValueError('Model lacks suffix-only LM-head support')
+            outputs = model(**data, output_attentions=False, use_cache=False,
+                            **{key: supervised + 1})
+            targets = labels[..., -supervised:].contiguous()
+        else:
+            outputs = model(**data, output_attentions=False)
+            targets = labels[..., 1:].contiguous()
         outputs = outputs.get('logits')[..., :-1, :].contiguous()
-        targets = inputs.get('labels')[..., 1:].contiguous()
         # Flatten and compute cross-entropy loss
         outputs = outputs.view(-1, outputs.shape[-1])
         targets = targets.view(-1).to(outputs.device)
         loss = self.criterion(outputs, targets)
         
         targets = targets.cpu()
-        outputs = outputs.cpu()
         # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the
         # 'ppl' below is a mean of per-batch exp(CE), which Jensen-inflates above
         # exp(mean CE) -- and exp(mean CE) is what the eval reports, i.e. what
         # the recorded dot-path numbers (31, 18.1) are on.
         outputs = {'loss_ce': loss.item(), 'ppl': torch.exp(loss).item(),
-                   'seq_len': targets.shape[-1] + 1}
+                   'seq_len': data['input_ids'].shape[-1]}
         return (loss, outputs) if return_outputs else loss

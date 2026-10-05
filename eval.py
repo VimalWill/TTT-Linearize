@@ -432,14 +432,14 @@ SUITES = {
 
 
 def ruler_task_specs(tasks, lengths):
-    """Register custom NIAH lengths as metrics as well as dataset metadata.
+    """Register RULER lengths as metrics as well as dataset metadata.
 
     Upstream NIAH YAMLs only register 4k through 128k. Requesting 2k data
     without its aggregation can fail when the harness computes the scores.
     Keep the standard lengths too: process_results can emit sentinel entries
     for them, and the upstream aggregator discards those sentinel values.
     """
-    if not lengths or not any(t.startswith('niah_') for t in tasks):
+    if not lengths or not any(t.startswith(('niah_', 'ruler_')) for t in tasks):
         return list(tasks)
     from lm_eval.tasks.ruler import common_utils
     metric_lengths = sorted(set(lengths) | {4096, 8192, 16384, 32768, 65536, 131072}
@@ -447,7 +447,7 @@ def ruler_task_specs(tasks, lengths):
     return [dict(task=t, metric_list=[
                 dict(metric=str(length), aggregation=common_utils.aggregate_metrics,
                      higher_is_better=True) for length in metric_lengths])
-            if t.startswith('niah_') else t for t in tasks]
+            if t.startswith(('niah_', 'ruler_')) else t for t in tasks]
 
 
 def resolve(tasks, metadata=None):

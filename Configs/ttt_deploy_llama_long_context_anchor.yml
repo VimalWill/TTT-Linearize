@@ -1,0 +1,20 @@
+# Evaluate the continued Anchor-I with only its two edge memories.
+# Preserve the source checkpoint's inner optimizer, momentum, and feature map.
+data:
+  name: long_context
+  path: ${oc.env:LONG_CONTEXT_DATA}
+model:
+  name: ttt_ar
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT}
+  max_length: 16384
+  attn_varient: ttt
+  lact_chunk_size: 512
+  window_size: 512
+  ttt_inner_loss: l2
+  ttt_gate: sigmoid
+  ttt_scale_init_bias: -3.0
+  ttt_layer_indices: [0, 1, 28, 29, 30, 31]
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  use_cache: true
+  device_map: auto

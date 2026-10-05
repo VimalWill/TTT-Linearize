@@ -219,7 +219,7 @@ def train(config):
     training_args = TrainingArguments(
             per_device_train_batch_size=config.data.micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=0,
+            warmup_steps=int(config.train.get('warmup_steps', 0)),
             num_train_epochs=config.train.epochs,
             # The custom optimizer builder uses this same budget when the
             # config explicitly selects lr_scheduler: linear.
@@ -238,7 +238,7 @@ def train(config):
             save_total_limit=3,
             load_best_model_at_end=True if config.data.val_set_size > 0 else False,
             # default trainer args
-            greater_is_better = False,
+            greater_is_better = bool(config.train.get('greater_is_better', False)),
             # stage 1's composite loss is MSE-dominated early, so selecting on
             # it picks checkpoints with bad perplexity; select on CE instead
             metric_for_best_model = config.train.get('metric_for_best_model', 'eval/loss'),
