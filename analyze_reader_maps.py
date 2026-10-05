@@ -71,6 +71,15 @@ def main():
         print(f'{layer:>6} {h:>6} {f(disp):>22} {f(orth):>24} {f(sv):>22}')
         print(f'{"":>6} {"":>6} rotated {rot.mean():6.4f} of a Haar rotation; '
               f'worst-direction ||chi-I||_2 {op.mean():6.4f} [{op.min():.4f},{op.max():.4f}]')
+        # Diagonal and off-diagonal face different bf16 resolution: entries
+        # start at 1.0 on the diagonal, where the ULP is 2^-7 = 0.0078 and an
+        # AdamW step of 2e-4 rounds away, and at 0.0 off it, where bf16 is
+        # effectively exact. A map can rotate freely while its diagonal is
+        # pinned, so the two must be reported separately.
+        diag = torch.diagonal(delta, dim1=1, dim2=2).norm(dim=1)
+        off = (delta.flatten(1).norm(dim=1) ** 2 - diag ** 2).clamp(min=0).sqrt()
+        print(f'{"":>6} {"":>6} diagonal {diag.mean():7.4f} [{diag.min():.4f},{diag.max():.4f}]'
+              f'   off-diagonal {off.mean():7.4f} [{off.min():.4f},{off.max():.4f}]')
         summary[layer] = dict(
             heads=h, dim=d,
             displacement=dict(mean=disp.mean().item(), min=disp.min().item(), max=disp.max().item()),
@@ -78,7 +87,9 @@ def main():
             singular=dict(mean=sv.mean().item(), min=sv.min().item(), max=sv.max().item(),
                           spread=(sv.max(dim=1).values - sv.min(dim=1).values).mean().item()),
             rotated_fraction=dict(mean=rot.mean().item(), min=rot.min().item(), max=rot.max().item()),
-            operator=dict(mean=op.mean().item(), min=op.min().item(), max=op.max().item()))
+            operator=dict(mean=op.mean().item(), min=op.min().item(), max=op.max().item()),
+            diagonal=dict(mean=diag.mean().item(), min=diag.min().item(), max=diag.max().item()),
+            offdiagonal=dict(mean=off.mean().item(), min=off.min().item(), max=off.max().item()))
 
     moved = max(s['displacement']['max'] for s in summary.values())
     print(f'\nlargest ||chi - I||_F over all heads: {moved:.6f}')
