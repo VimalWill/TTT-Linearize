@@ -1,0 +1,54 @@
+# Reduced continuation: 40M tokens, 4K/8K only; 16K/32K are final test lengths.
+data:
+  name: long_context
+  path: ${oc.env:LONG_CONTEXT_DATA}
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+  initial_max_length: 8192
+  allowed_lengths: [4096, 8192]
+  seed: 2026
+model:
+  name: ttt_ar
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT}
+  max_length: 8192
+  attn_varient: ttt
+  lact_chunk_size: 512
+  window_size: 512
+  ttt_inner_loss: l2
+  ttt_gate: sigmoid
+  ttt_scale_init_bias: -3.0
+  ttt_layer_indices: null
+  ttt_share_groups: [[0, 1], [28, 29, 30, 31]]
+  ttt_reader_alignment: linear
+  use_cache: false
+  add_eos_token: false
+  device_map: auto
+train:
+  continue_adapter: ${oc.env:TTT_ADAPTER,null}
+  optim: adamw_torch
+  lr_scheduler: token_linear
+  lr: 0.0001
+  min_lr: 0.00001
+  warmup_tokens: 1200000
+  max_input_tokens: 40000000
+  phase_transition_tokens: 0
+  final_max_length: 8192
+  max_steps: -1
+  epochs: 10
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  generation_validation: true
+  validation_per_cell: 4
+  validation_max_new_tokens: 256
+  metric_for_best_model: eval/retrieval_accuracy
+  greater_is_better: true
+  eval_steps: 100
+  save_steps: 100000
+  fail_on_backward_error: true
+  fail_on_nonfinite: true
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
+  train_qk: true
+  train_qk_lora: true
+  train_v: true
+  train_v_lora: true

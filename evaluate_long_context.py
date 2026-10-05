@@ -1,4 +1,4 @@
-"""Evaluate all four Llama arms on a fixed NIAH grid and the full RULER suite.
+"""Evaluate selected Llama arms on a fixed NIAH grid and the full RULER suite.
 
 Each arm/length/ablation runs in a fresh process. OOMs and errors are recorded
 and do not prevent subsequent cases. Final test data never select checkpoints.
@@ -16,6 +16,22 @@ RULER_TASKS = ('niah_single_1', 'niah_single_2', 'niah_single_3',
                'niah_multikey_1', 'niah_multikey_2', 'niah_multikey_3',
                'niah_multiquery', 'niah_multivalue', 'ruler_vt', 'ruler_cwe',
                'ruler_fwe', 'ruler_qa_hotpot', 'ruler_qa_squad')
+ARM_NAMES = ('baseline', 'anchor_f', 'anchor_i', 'anchor')
+
+
+def selected_arms(args):
+    available = dict(baseline=('baseline', None, None, None),
+        anchor_f=('anchor_f', args.anchor_f_cfg, args.anchor_f_ckpt, args.anchor_f_adapter),
+        anchor_i=('anchor_i', args.anchor_i_cfg, args.anchor_i_ckpt, args.anchor_i_adapter),
+        anchor=('anchor', args.anchor_cfg, args.anchor_i_ckpt, args.anchor_i_adapter))
+    names = getattr(args, 'arms', ARM_NAMES)
+    if not names or len(set(names)) != len(names) or any(n not in available for n in names):
+        raise ValueError('Select distinct supported evaluation arms')
+    arms = [available[n] for n in names]
+    for name, cfg, ckpt, adapter in arms:
+        if name != 'baseline' and not ckpt:
+            raise ValueError(f'{name} requires its source checkpoint')
+    return arms
 
 
 def ruler_scores(record, length):
@@ -100,14 +116,11 @@ def niah_worker(args):
 
 
 def run_matrix(args):
+    arms = selected_arms(args)
     directory = Path(args.out_dir)
     if directory.exists() and any(directory.iterdir()):
         raise ValueError('--out-dir must be new or empty')
     directory.mkdir(parents=True, exist_ok=True)
-    arms = [('baseline', None, None, None),
-            ('anchor_f', args.anchor_f_cfg, args.anchor_f_ckpt, args.anchor_f_adapter),
-            ('anchor_i', args.anchor_i_cfg, args.anchor_i_ckpt, args.anchor_i_adapter),
-            ('anchor', args.anchor_cfg, args.anchor_i_ckpt, args.anchor_i_adapter)]
     versions = {}
     for package in ('torch', 'transformers', 'lm_eval'):
         try:
@@ -187,6 +200,8 @@ def main():
     parser.add_argument('--out-dir')
     parser.add_argument('--lengths', nargs='+', type=int, default=[4096, 8192, 16384, 32768])
     parser.add_argument('--benchmarks', nargs='+', choices=['niah', 'ruler'], default=['niah', 'ruler'])
+    parser.add_argument('--arms', nargs='+', choices=ARM_NAMES, default=list(ARM_NAMES),
+                        help='only selected arms need checkpoints; memory arms also run ablated')
     parser.add_argument('--anchor-i-ckpt')
     parser.add_argument('--anchor-i-adapter')
     parser.add_argument('--anchor-f-ckpt')
@@ -212,8 +227,12 @@ def main():
         if not args.length or not args.out or (not args.baseline and (not args.cfg or not args.ckpt)):
             parser.error('Worker needs length/output and a baseline or config/checkpoint')
         return niah_worker(args)
-    if not all((args.data_dir, args.out_dir, args.anchor_i_ckpt, args.anchor_f_ckpt)):
-        parser.error('Matrix requires --data-dir, --out-dir, --anchor-i-ckpt and --anchor-f-ckpt')
+    if not all((args.data_dir, args.out_dir)):
+        parser.error('Matrix requires --data-dir and --out-dir')
+    try:
+        selected_arms(args)
+    except ValueError as error:
+        parser.error(str(error))
     return run_matrix(args)
 
 

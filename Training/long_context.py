@@ -249,12 +249,19 @@ def load_context_data(config, tokenizer):
     if int(config.data.micro_batch_size) != 1:
         raise ValueError('Long-context examples require micro_batch_size=1; never pad mixed lengths')
     maximum = int(config.model.max_length)
+    allowed = config.data.get('allowed_lengths', None)
+    if allowed is not None and set(manifest['lengths']) != set(allowed):
+        raise ValueError('Prepared corpus lengths differ from allowed_lengths; use a separate reduced data directory')
     if maximum not in manifest['lengths']:
         raise ValueError('Prepared corpus lacks the configured final training length')
     datasets = {split: ContextDataset(read_jsonl(directory / f'{split}.jsonl'), tokenizer, maximum)
                 for split in ('train', 'validation', 'test')}
     if any(not len(dataset) for dataset in datasets.values()):
         raise ValueError('All data splits must be nonempty')
+    if allowed is not None and any(row['length_bucket'] not in allowed
+                                  or row['input_tokens'] > maximum
+                                  for dataset in datasets.values() for row in dataset.records):
+        raise ValueError('Prepared rows exceed the allowed training/validation lengths')
     sampler = BalancedContextSampler(datasets['train'].records,
                                      int(config.data.get('initial_max_length', 8192)),
                                      int(config.data.get('seed', 0)),

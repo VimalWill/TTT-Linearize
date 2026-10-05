@@ -1,9 +1,15 @@
 # Llama long-context continuation
 
-This pipeline continues trained Llama-3.1-8B Anchor-I and Anchor-F checkpoints,
-trains through 16K, then evaluates at 4K/8K/16K/32K. The fourth evaluation arm,
-`anchor`, is the two-memory deployment of the continued Anchor-I checkpoint.
-It is evaluated separately; pruning does not imply retained retrieval quality.
+The default run continues trained Llama-3.1-8B Anchor-F for 40M input tokens at
+4K/8K only, then evaluates at 4K/8K/16K/32K. It compares baseline, Anchor-F, and
+Anchor-F with all TTT memories ablated. The question is whether exact retrieval
+improves and the paired memory-on/off gap opens beyond the continuation lengths.
+16K/32K examples never train the model or select its checkpoint.
+
+This tests extrapolation beyond the **continuation training** length. Describe
+the base model's original pretraining/context support separately.
+Timing estimates need measurement on your GPU. A smaller grid does not guarantee
+that a few-point difference is statistically resolved; inspect paired intervals.
 
 ## Run on the GPU host
 
@@ -13,27 +19,52 @@ final evaluations and figures. Keep the harness installation fixed throughout
 an experiment; the evaluation summary records installed package versions.
 
 ```bash
-export ANCHOR_I_CKPT=/path/to/llama_anchor_i/full_base_checkpoint
-export ANCHOR_I_ADAPTER=/path/to/llama_anchor_i/stage2/best_ckpt
 export ANCHOR_F_CKPT=/path/to/llama_anchor_f/full_base_checkpoint
 export ANCHOR_F_ADAPTER=/path/to/llama_anchor_f/stage2/best_ckpt
-export LONG_CONTEXT_DATA=/work/nvme/bgly/vwilliam/long_context_data_v1
-export LONG_CONTEXT_OUTPUT=/work/nvme/bgly/vwilliam/long_context_llama_v1
+export LONG_CONTEXT_DATA=/work/nvme/bgly/vwilliam/long_context_data_8k_v1
+export LONG_CONTEXT_OUTPUT=/work/nvme/bgly/vwilliam/long_context_llama_reduced_v1
 bash scripts/long_context_llama.sh
 ```
 
 `LONG_CONTEXT_OUTPUT` must be new. The data directory is generated if it does
-not contain `manifest.json`; otherwise both training runs reuse it. The full/base
+not contain `manifest.json`; otherwise the run reuses it. Its manifest must
+contain exactly 4K/8K buckets. The reduced config also rejects longer rows in any
+split. Use a separate directory from the full recipe's 16K data. The full/base
 checkpoint and its stage-2 adapter are distinct inputs. Omit an adapter variable
 only when its trained adapter has already been merged into that full checkpoint.
 Do not use the original pretrained Llama weights as an Anchor checkpoint.
 
-The script prepares data, trains both arms sequentially, constructs the final
-NIAH grid, evaluates all arms and ablations, and exports PNG/PDF figures and CSV
+The script prepares data, trains Anchor-F, constructs the final
+NIAH grid, evaluates the three branches, and exports PNG/PDF figures and CSV
 results. Evaluation failures do not stop later cases; plots are still generated
 from completed cases, and the script exits nonzero if any case failed. Inspect
 `evaluation/summary.json` and the individual logs rather than treating missing
-cases as zero scores.
+cases as zero scores. No Anchor-I checkpoint is needed.
+
+Anchor-F keeps all 32 memories private (`ttt_share_groups: []`) and has no
+reader alignment maps (`ttt_reader_alignment: none`).
+
+The reduced config is `Configs/ttt_ar_llama_long_context_anchor_f_reduced.yml`:
+40M tokens, no length transition (`phase_transition_tokens: 0`), maximum 8K,
+and 1.2M-token warmup (the same 3% of budget as the full recipe). Initial and
+final sampler limits are both 8K. Checkpoint selection uses only 4K/8K validation.
+The NIAH grid has six depths (0/20/40/60/80/100%) and 25 samples per type/depth/length:
+1,200 examples per branch, 3,600 across baseline and memory-on/off.
+
+All 13 RULER tasks remain enabled, with 500 examples per task/length by default.
+That is up to 78,000 RULER examples across the three branches and four lengths,
+so the NIAH reduction alone does not bound total evaluation time.
+For a preliminary run, set `RULER_LIMIT` to a smaller positive count; report that
+count with the result. The summary records the actual commands and limits.
+
+## Optional full recipe
+
+The original 100M-token configs remain unchanged. To train both Anchor-I and
+Anchor-F through 16K, evaluate all four arms plus memory ablations, and use the
+4,400-example NIAH grid per branch, set both arms' checkpoint/adapter variables, choose
+separate data/output directories, and run `bash scripts/long_context_llama_full.sh`.
+The fourth arm, `anchor`, is the two-memory deployment of continued Anchor-I;
+pruning does not imply retained retrieval quality.
 
 ## Data and training recipe
 
@@ -47,6 +78,7 @@ There must be at least 30 distinct documents and usable instruction examples.
 python prepare_long_context.py \
   --out-dir "$LONG_CONTEXT_DATA" \
   --tokenizer meta-llama/Llama-3.1-8B \
+  --lengths 4096 8192 \
   --source-jsonl /path/to/source_documents.jsonl
 ```
 
@@ -76,7 +108,10 @@ of RULER, and reserved across the training, validation, and internal test splits
 This rules out a direct last-window shortcut, but not relay through stacked local
 attention layers. Final memory ablations are still needed.
 
-Both arms use the same sampler seed, data, and token schedule:
+For the reduced run, eligible synthetic length buckets are uniformly sampled
+between 4K and 8K throughout the 40M-token budget. Microbatch, task mixture,
+optimizer precision, and loss are the same as the full recipe below.
+The full recipe uses the same sampler seed, data, and token schedule for both arms:
 
 - First 20M successful-update input tokens: uniformly sampled eligible 4K/8K
   buckets within each synthetic task.
@@ -97,7 +132,8 @@ Both arms use the same sampler seed, data, and token schedule:
 The new configs stop on backward errors or nonfinite losses/gradients. They do
 not silently finish a nominal matched-budget run after skipping broken updates.
 An epoch/step limit reached before the token budget raises. To change the budget,
-edit **both** long-context configs consistently, including warmup and transition.
+edit the selected config's budget and warmup consistently; set a positive phase
+transition only when intentionally training at a longer length.
 
 ## Checkpoint selection
 
@@ -118,7 +154,8 @@ for saving, so failure to improve cannot erase the starting checkpoint.
 ## Evaluation protocol and outputs
 
 The final NIAH grid uses independent numeric and UUID values and held-out source
-documents. Default settings: 4K/8K/16K/32K prompt lengths, 11 insertion depths
+documents. The reduced runner uses 4K/8K/16K/32K, six depths and 25 samples per cell.
+The optional full runner uses these prompt lengths, 11 insertion depths
 (0% through 100%), and 50 examples per cell/type. That is 4,400 examples per arm
 or ablation. Prompts are sized to the target with at most 16 tokens of slack,
 and the actual length/distance are retained in the samples.
@@ -128,8 +165,10 @@ prompts, few-shot defaults, generation settings, and scoring are retained. Each
 length is evaluated separately with generation headroom. Requested-length metrics
 must exist for all 13 tasks, and `-1` sentinel metrics are never included in averages.
 
-Evaluate baseline Llama, continued Anchor-F, continued Anchor-I, and the two-memory
-Anchor deployment. Each memory arm also runs with the TTT branch ablated, using
+The reduced runner evaluates baseline Llama and continued Anchor-F. The full runner
+adds continued Anchor-I and the two-memory Anchor deployment. `--arms` can select
+these independently; only selected memory arms require checkpoints.
+Each selected memory arm also runs with the TTT branch ablated, using
 identical prompts. Accuracy uses the same reference window backend as `eval.py`;
 efficiency remains a separate measurement using `sweep_efficiency.py`.
 
@@ -154,8 +193,9 @@ python prepare_long_context.py --niah-from "$LONG_CONTEXT_DATA" \
   --depths 0 50 100 --samples-per-cell 1 --seed 271828
 python evaluate_long_context.py --data-dir "$LONG_CONTEXT_DATA" \
   --niah-data /path/to/new_smoke_niah/niah.jsonl \
-  --anchor-i-ckpt "$ANCHOR_I_CKPT" --anchor-i-adapter "$ANCHOR_I_ADAPTER" \
   --anchor-f-ckpt "$ANCHOR_F_CKPT" --anchor-f-adapter "$ANCHOR_F_ADAPTER" \
+  --anchor-f-cfg Configs/ttt_ar_llama_long_context_anchor_f_reduced.yml \
+  --arms baseline anchor_f \
   --out-dir /path/to/new_smoke_results --lengths 4096 \
   --ruler-limit 2 --no-ablation
 python plot_long_context.py --results /path/to/new_smoke_results

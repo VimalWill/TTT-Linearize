@@ -15,7 +15,7 @@ from Training.long_context import (BalancedContextSampler, SYNTHETIC_TASKS, Synt
     encode_record, generate_answer, load_context_data, read_jsonl, retrieval_validation, tokenizer_fingerprint)
 from Training.trainer import DefaultTrainer, FinetuneTrainer
 from Training.utils import TokenLinearScheduler, get_optimizer_and_scheduler
-from evaluate_long_context import RULER_TASKS, ruler_scores, run_matrix
+from evaluate_long_context import RULER_TASKS, ruler_scores, run_matrix, selected_arms
 from plot_long_context import summarize_niah, wilson_interval
 from prepare_long_context import build_niah, build_training, partition_sources
 
@@ -56,13 +56,29 @@ class LongContextDataTests(unittest.TestCase):
             build_training(train_dir, tokenizer, partition_sources(sources, 4), [4096, 8192],
                            dict(train=1, validation=1, test=1), 5)
             config = OmegaConf.create({'data': dict(path=str(train_dir), micro_batch_size=1,
-                                                   initial_max_length=8192),
+                                                   initial_max_length=8192, allowed_lengths=[4096, 8192]),
                                       'model': dict(max_length=8192)})
             loaders = load_context_data(config, tokenizer)
             batch = next(iter(loaders['train']))
             self.assertEqual(len(batch['context_tasks']), 1)
             self.assertEqual(batch['input_ids'].shape[0], 1)
             self.assertEqual(batch['input_ids'].shape, batch['labels'].shape)
+            manifest_path = train_dir / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['lengths'].append(16384)
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'allowed_lengths'):
+                load_context_data(config, tokenizer)
+            manifest['lengths'].remove(16384)
+            manifest_path.write_text(json.dumps(manifest))
+            validation_path = train_dir / 'validation.jsonl'
+            original = validation_path.read_text()
+            malformed = dict(loaders['validation'].dataset.records[0], length_bucket=16384,
+                             input_tokens=16384)
+            validation_path.write_text(original + json.dumps(malformed) + '\n')
+            with self.assertRaisesRegex(ValueError, 'allowed training/validation lengths'):
+                load_context_data(config, tokenizer)
+            validation_path.write_text(original)
             build_niah(niah_dir, tokenizer, train_dir, [4096], [0, 50, 100], 1, 10)
             rows = read_jsonl(niah_dir / 'niah.jsonl')
             forbidden = {r['value'] for r in read_jsonl(train_dir / 'forbidden_values.jsonl')}
@@ -128,6 +144,28 @@ class LongContextDataTests(unittest.TestCase):
 
 
 class LongContextTrainingTests(unittest.TestCase):
+    def test_reduced_recipe_cannot_enter_16k_phase_and_scales_warmup(self):
+        root = Path(__file__).resolve().parents[1]
+        cfg = OmegaConf.load(root / 'Configs/ttt_ar_llama_long_context_anchor_f_reduced.yml')
+        self.assertIsNone(cfg.model.ttt_layer_indices)
+        self.assertEqual(list(cfg.model.ttt_share_groups), [])
+        self.assertEqual(cfg.model.ttt_reader_alignment, 'none')
+        self.assertEqual(list(cfg.data.allowed_lengths), [4096, 8192])
+        self.assertEqual(cfg.model.max_length, 8192)
+        self.assertEqual(cfg.data.initial_max_length, 8192)
+        self.assertEqual(cfg.train.final_max_length, 8192)
+        self.assertEqual(cfg.train.phase_transition_tokens, 0)
+        self.assertEqual(cfg.train.max_input_tokens, 40000000)
+        self.assertEqual(cfg.train.warmup_tokens / cfg.train.max_input_tokens, .03)
+        optimizer, scheduler = get_optimizer_and_scheduler(torch.nn.Linear(1, 1), cfg)
+        scheduler.step_tokens(cfg.train.warmup_tokens)
+        self.assertAlmostEqual(scheduler.get_last_lr()[0], 1e-4)
+        scheduler.step_tokens(cfg.train.max_input_tokens)
+        self.assertAlmostEqual(scheduler.get_last_lr()[0], 1e-5)
+        full = OmegaConf.load(root / 'Configs/ttt_ar_llama_long_context_anchor_f.yml')
+        self.assertEqual(full.train.max_input_tokens, 100000000)
+        self.assertEqual(full.train.final_max_length, 16384)
+
     def test_training_stops_on_tokens_validates_final_update_and_rejects_underrun(self):
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             config = OmegaConf.create({'train': dict(lr=.1, lr_scheduler='token_linear',
@@ -244,6 +282,35 @@ class LongContextTrainingTests(unittest.TestCase):
 
 
 class LongContextReportingTests(unittest.TestCase):
+    def test_reduced_matrix_needs_no_anchor_i_and_keeps_paired_unseen_lengths(self):
+        with tempfile.TemporaryDirectory() as root:
+            args = SimpleNamespace(out_dir=str(Path(root) / 'results'), data_dir=root,
+                anchor_f_cfg='f_reduced.yml', anchor_i_cfg='i.yml', anchor_cfg='deploy.yml',
+                anchor_f_ckpt='f', anchor_i_ckpt=None, anchor_f_adapter='continued', anchor_i_adapter=None,
+                benchmarks=['niah'], lengths=[16384, 32768], no_ablation=False, niah_data='niah.jsonl',
+                base='base', seed=1, max_new_tokens=256, ruler_limit=500,
+                arms=['baseline', 'anchor_f'])
+            commands = []
+            def worker(command, **kwargs):
+                commands.append(command)
+                Path(command[command.index('--out') + 1]).write_text(json.dumps(dict(status='ok')))
+                return SimpleNamespace(returncode=0)
+            with patch('evaluate_long_context.subprocess.run', side_effect=worker), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run_matrix(args), 0)
+            report = json.loads((Path(args.out_dir) / 'summary.json').read_text())
+            self.assertEqual(len(commands), 6)
+            for length in args.lengths:
+                cases = [c for c in report['cases'] if c['length'] == length]
+                self.assertEqual([(c['arm'], c['ablate']) for c in cases],
+                                 [('baseline', None), ('anchor_f', None), ('anchor_f', 'ttt')])
+                paired = [c['command'] for c in cases if c['arm'] == 'anchor_f']
+                self.assertEqual(paired[0][paired[0].index('--niah-data') + 1],
+                                 paired[1][paired[1].index('--niah-data') + 1])
+            args.arms = ['anchor_i']
+            with self.assertRaisesRegex(ValueError, 'source checkpoint'):
+                selected_arms(args)
+
     def test_matrix_continues_after_oom_and_error_and_forwards_generation_limit(self):
         with tempfile.TemporaryDirectory() as root:
             args = SimpleNamespace(out_dir=str(Path(root) / 'results'), data_dir=root,
