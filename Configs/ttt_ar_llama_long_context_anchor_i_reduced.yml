@@ -30,14 +30,22 @@ train:
   lr_scheduler: token_linear
   lr: 0.0001
   min_lr: 0.00001
-  warmup_tokens: 1200000
+  warmup_tokens: 600000   # 3% of max_input_tokens; scale both together
   # Compiled FlexAttention, not the chunked reference path. sliding_window_
   # attention now routes Q_len <= window_size to plain causal SDPA, where the
   # mask is a no-op anyway, so the BlockMask recompile churn that crashed
   # stage 1 at seq_len 78 cannot happen -- and the 4K/8K training sequences all
   # take the fast path. On sdpa this budget does not fit a 12h allocation.
   window_backend: flex
-  max_input_tokens: 40000000
+  # 20M, not 40M. Measured 11.3 s/iteration on a GH200 at the 4K/8K mix, so
+  # 40M lands near 20 hours and does not fit a 12h allocation. Much of that
+  # cost is flex recompilation: block_mask_cache is keyed on Q_len, and the
+  # corpus has near-continuous lengths (4095, 4096, 7201, 8186, 8191, 8192),
+  # so most steps build a new BlockMask. Bucketing lengths at collation would
+  # fix it properly; until then the budget is sized to the measured rate.
+  # Reference: Lizard reached perfect passkey retrieval on 41M tokens trained
+  # entirely at 2048, so 20M of continuation is not obviously short.
+  max_input_tokens: 20000000
   phase_transition_tokens: 0
   final_max_length: 8192
   max_steps: -1
@@ -49,7 +57,9 @@ train:
   validation_max_new_tokens: 256
   metric_for_best_model: eval/retrieval_accuracy
   greater_is_better: true
-  eval_steps: 100
+  eval_steps: 50   # 20M tokens is ~420 optimizer updates, so 100 would give
+                   # only four validations of the retrieval accuracy that
+                   # selects the checkpoint.
   save_steps: 100000
   fail_on_backward_error: true
   fail_on_nonfinite: true

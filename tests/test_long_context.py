@@ -287,8 +287,15 @@ class LongContextTrainingTests(unittest.TestCase):
         self.assertEqual(cfg.data.initial_max_length, 8192)
         self.assertEqual(cfg.train.final_max_length, 8192)
         self.assertEqual(cfg.train.phase_transition_tokens, 0)
-        self.assertEqual(cfg.train.max_input_tokens, 40000000)
-        self.assertEqual(cfg.train.warmup_tokens / cfg.train.max_input_tokens, .03)
+        # Assert the invariant, not the budget. The budget is retuned against
+        # measured throughput -- it went 40M -> 20M when 11.3 s/iteration put
+        # 40M near 20 hours -- and warmup must scale with it rather than stay
+        # at a stale absolute value.
+        self.assertGreater(cfg.train.max_input_tokens, 0)
+        self.assertLess(cfg.train.max_input_tokens,
+                        OmegaConf.load(root / 'Configs/ttt_ar_llama_long_context_anchor_f.yml')
+                        .train.max_input_tokens)
+        self.assertAlmostEqual(cfg.train.warmup_tokens / cfg.train.max_input_tokens, .03)
         optimizer, scheduler = get_optimizer_and_scheduler(torch.nn.Linear(1, 1), cfg)
         scheduler.step_tokens(cfg.train.warmup_tokens)
         self.assertAlmostEqual(scheduler.get_last_lr()[0], 1e-4)
