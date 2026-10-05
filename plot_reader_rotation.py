@@ -73,6 +73,18 @@ def angles(chi):
     return lam.angle().abs().rad2deg().sort(dim=1, descending=True).values
 
 
+def planes(ang):
+    """Effective number of rotation planes, by participation ratio on angles.
+
+    (sum theta)^2 / sum theta^2 over the d/2 distinct planes. A map that turns
+    k planes equally and leaves the rest alone reads k; one that spreads the
+    same displacement over everything reads d/2. Reported against the null
+    rather than against d/2, since finite samples never reach the ceiling.
+    """
+    half = ang[:, ::2]                                   # drop the conjugate copy
+    return (half.sum(1) ** 2 / half.pow(2).sum(1)).mean()
+
+
 def probe_angles(chi, generator):
     """Angle between an isotropic unit probe v and its image chi v, in degrees.
 
@@ -190,12 +202,15 @@ def main():
     print(f'wrote {out}/reader_rotation.png and .pdf')
 
     print(f'\n{"run":>10} {"layer":>6} {"median probe angle":>20} {"null":>8} '
-          f'{"top-8 planes":>14} {"null":>8}')
+          f'{"top-8 planes":>14} {"null":>8} {"eff planes":>11} {"null":>7} {"ratio":>6}')
     for name, per_layer in runs.items():
         for layer, st in per_layer.items():
+            n, n0 = planes(st['ang']), planes(st['ang_null'])
             print(f'{name:>10} {layer:>6} {st["probe"].median():>19.2f}deg '
                   f'{st["probe_null"].median():>7.2f} '
-                  f'{st["ang"][:, :8].mean():>13.2f}deg {st["ang_null"][:, :8].mean():>7.2f}')
+                  f'{st["ang"][:, :8].mean():>13.2f}deg {st["ang_null"][:, :8].mean():>7.2f} '
+                  f'{n:>10.1f} {n0:>7.1f} {n / n0:>6.2f}')
+    print(f'{"":>10} eff planes counts distinct planes, out of d/2')
 
 
 if __name__ == '__main__':
