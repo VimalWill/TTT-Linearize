@@ -31,6 +31,12 @@ train:
   lr: 0.0001
   min_lr: 0.00001
   warmup_tokens: 1200000
+  # Compiled FlexAttention, not the chunked reference path. sliding_window_
+  # attention now routes Q_len <= window_size to plain causal SDPA, where the
+  # mask is a no-op anyway, so the BlockMask recompile churn that crashed
+  # stage 1 at seq_len 78 cannot happen -- and the 4K/8K training sequences all
+  # take the fast path. On sdpa this budget does not fit a 12h allocation.
+  window_backend: flex
   max_input_tokens: 40000000
   phase_transition_tokens: 0
   final_max_length: 8192
