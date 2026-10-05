@@ -399,6 +399,8 @@ def run_retrieval(args, model, model_config, config, mods):
                   + ''.join(f'{d[n]:>+13.4f}+-{se[n]:5.4f}' for n in names))
 
     identity_tag = '_identity_readers' if getattr(args, 'identity_readers', False) else ''
+    if getattr(args, 'reader_component', 'learned') != 'learned':
+        identity_tag += f'_readers_{args.reader_component}'
     path = f'{args.out}{identity_tag}_retrieval.csv'
     n_pair = {n: paired(base_ps[n], base_ps[n])[2] for n in names}
     with open(path, 'w') as f:
@@ -494,6 +496,9 @@ def main():
     ap.add_argument('--adapter', default=None)
     ap.add_argument('--identity-readers', action='store_true',
                     help='bypass learned reader alignment maps for the identity control')
+    ap.add_argument('--reader-component', choices=['learned', 'orthogonal', 'stretch'],
+                    default='learned', help='evaluate full readers, Q only, or P only from chi=Q P; '
+                    'Q may include reflections; changes in memory only')
     ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--suite', nargs='+', default=['recall'],
                     choices=sorted(SUITES), help='which predefined suites to run')
@@ -575,6 +580,8 @@ def main():
                          'never the group. Only with every member off is the '
                          "group's contribution to the residual stream zero.")
     args = ap.parse_args()
+    if args.identity_readers and args.reader_component != 'learned':
+        raise SystemExit('--identity-readers cannot be combined with --reader-component')
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -583,7 +590,7 @@ def main():
     if args.baseline:
         if args.retrieval:
             raise SystemExit('--baseline has no TTT branch to sweep; drop --retrieval')
-        if args.ablate or args.identity_readers:
+        if args.ablate or args.identity_readers or args.reader_component != 'learned':
             raise SystemExit('--baseline has no TTT branch to ablate')
         if args.keep_frac is not None:
             raise SystemExit('--baseline has no fast weights to shrink; drop --keep-frac')
@@ -666,6 +673,10 @@ def main():
             for m in aligned:
                 m._identity_reader_alignment = True
             print(f'Identity control: bypassing {len(aligned)} reader alignment maps')
+        if args.reader_component != 'learned':
+            from analyze_reader_maps import apply_reader_component
+            count = apply_reader_component(mods, args.reader_component)
+            print(f'Reader control: {args.reader_component} component only for {count} maps')
         if args.ablate:
             sel = mods if args.layers is None else [mods[i] for i in args.layers]
             which = 'all layers' if args.layers is None else f'layers {args.layers}'
@@ -755,6 +766,8 @@ def main():
                                '_L' + '-'.join(map(str, args.layers))) if args.ablate else ''
     if args.identity_readers:
         tag += '_identity_readers'
+    if args.reader_component != 'learned':
+        tag += f'_readers_{args.reader_component}'
     path = f'{args.out}{tag}.json'
     with open(path, 'w') as f:
         json.dump({'ckpt': args.base if args.baseline else args.ckpt,
@@ -762,6 +775,7 @@ def main():
                    'limit': args.limit, 'ablate': args.ablate,
                    'layers': args.layers, 'causality': causality,
                    'identity_readers': args.identity_readers,
+                   'reader_component': 'identity' if args.identity_readers else args.reader_component,
                    'seed': args.seed, 'ruler_lengths': args.ruler_lengths,
                    # MMLU is meaningless without it: 5-shot and 0-shot differ
                    # by ~2 points on Llama-3.1-8B, and None means the task's
