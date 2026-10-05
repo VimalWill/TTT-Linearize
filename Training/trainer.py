@@ -1,6 +1,7 @@
 import sys
 import os
 import math
+from collections.abc import Mapping
 import pandas as pd
 
 from tqdm import tqdm
@@ -25,6 +26,7 @@ from transformers import AutoModel, AutoModelForCausalLM
 from transformers import Trainer, TrainingArguments
 
 from peft import PeftModel
+from Training.utils import model_autocast
 
 def save_checkpoint(model, tokenizer, save_path):
     """Save a checkpoint, including TTT parameters under PEFT.
@@ -83,6 +85,7 @@ class DefaultTrainer():
         self.pending_input_tokens = 0
         self.pending_exposure = {}
         self.training_exposure = {}
+        self._last_saved_grad_step = None
         self.max_input_tokens = int(train_options.get('max_input_tokens', 0))
         self.phase_transition_tokens = int(train_options.get('phase_transition_tokens', 0))
         self.final_max_length = int(train_options.get('final_max_length', 16384))
@@ -168,7 +171,7 @@ class DefaultTrainer():
                 self.eval_step(model, step=self.grad_step)
             # Keep the actual final state even if no checkpoint beat the
             # initial retrieval score. It is never silently called the best.
-            save_checkpoint(model, self.tokenizer, self.save_path + '/last_ckpt')
+            self.save_latest_checkpoint(model)
 
         if self.load_best_model_at_end:  # Return best checkpoint
             try:
@@ -177,6 +180,7 @@ class DefaultTrainer():
                 if isinstance(model, PeftModel):
                     from peft import set_peft_model_state_dict
                     import torch
+                    adapter_loaded = False
                     for fname in ["adapter_model.safetensors", "adapter_model.bin"]:
                         fpath = os.path.join(ckpt_path, fname)
                         if os.path.exists(fpath):
@@ -185,8 +189,14 @@ class DefaultTrainer():
                                 weights = load_file(fpath, device="cpu")
                             else:
                                 weights = torch.load(fpath, map_location="cpu")
-                            set_peft_model_state_dict(model, weights)
+                            result = set_peft_model_state_dict(model, weights)
+                            if self.max_input_tokens and (result.unexpected_keys or
+                                    any('lora_' in key for key in result.missing_keys)):
+                                raise RuntimeError('Selected checkpoint has incomplete adapter weights')
+                            adapter_loaded = True
                             break
+                    if self.max_input_tokens and not adapter_loaded:
+                        raise FileNotFoundError(f'Missing selected adapter weights in {ckpt_path}')
                     # The adapters are only half the checkpoint -- the TTT
                     # tensors are saved separately by save_checkpoint. Without
                     # this the model carries the LAST step's memory with the
@@ -194,7 +204,14 @@ class DefaultTrainer():
                     ttt = os.path.join(ckpt_path, 'ttt_params.pt')
                     if os.path.exists(ttt):
                         sd = torch.load(ttt, map_location='cpu')
+                        if self.max_input_tokens:
+                            expected = {n for n, p in model.named_parameters()
+                                        if p.requires_grad and 'lora_' not in n}
+                            if expected - sd.keys():
+                                raise RuntimeError('Selected checkpoint has incomplete TTT weights')
                         unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
+                        if self.max_input_tokens and unexpected:
+                            raise RuntimeError('Selected checkpoint contains unmatched TTT weights')
                         matched = len(sd) - len(unexpected)
                         if matched == 0:
                             raise RuntimeError(
@@ -202,6 +219,8 @@ class DefaultTrainer():
                                 f'first key {next(iter(sd))}'
                             )
                         print(f'-> Restored {matched}/{len(sd)} TTT tensors')
+                    elif self.max_input_tokens:
+                        raise FileNotFoundError(f'Missing selected TTT weights: {ttt}')
                 else:
                     model = model.from_pretrained(
                         ckpt_path,
@@ -219,6 +238,8 @@ class DefaultTrainer():
     
     def _optimizer_step(self, accumulated_batches, accumulation_steps):
         """Normalize an accumulation window, check/clip gradients, then update."""
+        if self.max_input_tokens and self.pending_input_tokens <= 0:
+            raise RuntimeError('Token-budget update has no counted input tokens; refusing to step the optimizer')
         params = [p for group in self.optimizer.param_groups for p in group['params']
                   if p.grad is not None]
         if not params:
@@ -300,6 +321,14 @@ class DefaultTrainer():
         
         # model.to(self.device)
         for ix, data in enumerate(pbar):
+            # DataCollatorForSeq2Seq returns BatchEncoding (a Mapping), not dict.
+            # Reject uncountable budget batches before doing a costly forward.
+            batch_tokens = 0
+            if isinstance(data, Mapping) and 'input_ids' in data:
+                mask = data.get('attention_mask')
+                batch_tokens = int(mask.sum().item() if mask is not None else data['input_ids'].numel())
+            if self.max_input_tokens and batch_tokens <= 0:
+                raise ValueError('Token-budget batches require input_ids and a positive count of unmasked input tokens')
             loss, train_metrics = self.compute_loss(model, data, return_outputs=True)
             if torch.isnan(loss) or torch.isinf(loss):
                 if self.train_options.get('fail_on_nonfinite', False):
@@ -328,9 +357,7 @@ class DefaultTrainer():
                     self.step += 1
                     continue
             accumulated_batches += 1
-            if isinstance(data, dict) and 'input_ids' in data:
-                mask = data.get('attention_mask')
-                batch_tokens = int(mask.sum().item() if mask is not None else data['input_ids'].numel())
+            if isinstance(data, Mapping) and 'input_ids' in data:
                 self.pending_input_tokens += batch_tokens
                 if 'context_tasks' in data:
                     cell = f"{data['context_tasks'][0]}/{data['context_lengths'][0]}"
@@ -346,8 +373,10 @@ class DefaultTrainer():
             total_loss += raw_loss
             successful_batches += 1
             mean_loss = total_loss / successful_batches
-            desc = f"Training epoch {epoch} | loss_mean: {mean_loss:.3f} | loss_total: {raw_loss:.3f} | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
+            desc = f"Training epoch {epoch} | loss_mean: {mean_loss:.3f} | loss_total: {raw_loss:.3f} | lr: {self.optimizer.param_groups[0]['lr']:.3e}"
             desc += f' | gradient step: {self.grad_step}'
+            if self.max_input_tokens:
+                desc += f' | input_tokens: {self.input_tokens}/{self.max_input_tokens}'
             for k, v in train_metrics.items():
                 desc += f' | {k}: {v:.3f}'
             pbar.set_description(desc)
@@ -392,11 +421,30 @@ class DefaultTrainer():
         return model, early_stopping
 
     
+    def save_latest_checkpoint(self, model):
+        """Bounded weight snapshot; continuation uses a fresh optimizer."""
+        if self._last_saved_grad_step == self.grad_step:
+            return
+        save_path = self.save_path + '/last_ckpt'
+        save_checkpoint(model, self.tokenizer, save_path)
+        import json
+        from pathlib import Path
+        Path(save_path).mkdir(parents=True, exist_ok=True)
+        Path(save_path, 'training_progress.json').write_text(json.dumps(dict(
+            input_tokens=self.input_tokens, optimizer_steps=self.grad_step,
+            max_input_tokens=self.max_input_tokens, exposure=self.training_exposure,
+            optimizer_state_saved=False), indent=2) + '\n')
+        self._last_saved_grad_step = self.grad_step
+
     def eval_step(self, model: nn.Module, step: int = None, **kwargs: any) -> dict[any]:
         """
         Evaluation loop over one epoch
         """
         step = self.grad_step if step is None else step
+        # Preserve trained weights even when accuracy stays tied at zero or
+        # the allocation ends during lengthy generated validation.
+        if self.max_input_tokens and self.grad_step > 0:
+            self.save_latest_checkpoint(model)
         with torch.no_grad():
             self.eval_metrics = self.compute_eval_metrics(model, step=step, **kwargs)
             if self.metric_for_best_model not in self.eval_metrics:
@@ -483,11 +531,13 @@ class DefaultTrainer():
                     step_eval_metrics.setdefault(f'eval/{k}', []).append(v)
                 if data.get('context_tasks') == ['instruction'] and 'loss_ce' in eval_metrics:
                     step_eval_metrics.setdefault('eval/instruction_loss_ce', []).append(eval_metrics['loss_ce'])
+                elif data.get('context_tasks') and 'loss_ce' in eval_metrics:
+                    step_eval_metrics.setdefault('eval/synthetic_loss_ce', []).append(eval_metrics['loss_ce'])
                 
                 step_loss += loss
                 desc = f"Evaluating at step {step} | loss: {step_loss / (ix + 1):.3f}"
                 if self.optimizer is not None:
-                    desc += f" | lr: {self.optimizer.param_groups[0]['lr']:.5f}"
+                    desc += f" | lr: {self.optimizer.param_groups[0]['lr']:.3e}"
                 pbar.set_description(desc)
                 if ix == max_batches:
                     break
@@ -495,10 +545,14 @@ class DefaultTrainer():
             if self.train_options.get('generation_validation', False):
                 from Training.long_context import retrieval_validation
                 rows = dataloader.dataset.records
+                print(f'\n-> Generated retrieval validation: step={step}, input_tokens={self.input_tokens}',
+                      flush=True)
                 step_eval_metrics.update({k: [v] for k, v in retrieval_validation(
                     model, self.tokenizer, rows,
                     int(self.train_options.get('validation_per_cell', 4)),
-                    int(self.train_options.get('validation_max_new_tokens', 256))).items()})
+                    int(self.train_options.get('validation_max_new_tokens', 256)),
+                    samples_path=os.path.join(self.save_path, 'validation_retrieval_samples.jsonl'),
+                    step=step, input_tokens=self.input_tokens).items()})
             if 'accuracy' in str(self.metric_for_best_model) and self.metric_for_best_model not in step_eval_metrics:
                 raise KeyError('Requested accuracy was not computed; refusing to select on a loss fallback')
             # Average over batches
@@ -604,8 +658,9 @@ class FinetuneTrainer(DefaultTrainer):
             key = next((k for k in ('logits_to_keep', 'num_logits_to_keep') if k in parameters), None)
             if key is None:
                 raise ValueError('Model lacks suffix-only LM-head support')
-            outputs = model(**data, output_attentions=False, use_cache=False,
-                            **{key: supervised + 1})
+            with model_autocast(model):
+                outputs = model(**data, output_attentions=False, use_cache=False,
+                                **{key: supervised + 1})
             targets = labels[..., -supervised:].contiguous()
         else:
             outputs = model(**data, output_attentions=False)
@@ -614,7 +669,7 @@ class FinetuneTrainer(DefaultTrainer):
         # Flatten and compute cross-entropy loss
         outputs = outputs.view(-1, outputs.shape[-1])
         targets = targets.view(-1).to(outputs.device)
-        loss = self.criterion(outputs, targets)
+        loss = self.criterion(outputs.float(), targets)
         
         targets = targets.cpu()
         # 'loss_ce' so compute_eval_metrics also reports ppl_from_mean_ce: the

@@ -6,6 +6,8 @@ and do not prevent subsequent cases. Final test data never select checkpoints.
 import argparse
 from importlib import metadata
 import json
+import math
+from numbers import Real
 import os
 from pathlib import Path
 import subprocess
@@ -38,9 +40,10 @@ def ruler_scores(record, length):
     scores = {}
     for task in RULER_TASKS:
         candidates = [v for k, v in record['results'].items()
-                      if k.split('/')[0] == task and 'stderr' not in k
+                      if '/' in k and k.split('/')[0] == task and 'stderr' not in k
                       and k.split('/', 1)[1].split(',')[0] == str(length)]
-        if len(candidates) != 1 or not 0 <= candidates[0] <= 1:
+        if (len(candidates) != 1 or not isinstance(candidates[0], Real)
+                or not math.isfinite(candidates[0]) or not 0 <= candidates[0] <= 1):
             raise ValueError(f'Missing/invalid RULER metric {task} at {length}; never average -1 sentinels')
         scores[task] = candidates[0]
     return scores
@@ -77,7 +80,7 @@ def niah_worker(args):
             from eval import load_model, ttt_layers
             set_window_backend(True)  # same reference window backend as eval.py
             cfg = load_benchmark_config(args.cfg, args.ckpt, args.length + args.max_new_tokens)
-            model = load_model(args.ckpt, build_model_config(cfg), args.adapter)
+            model = load_model(args.ckpt, build_model_config(cfg), args.adapter, strict_ttt=True)
             mods = ttt_layers(model)
         from eval import ablate
         status['phase'] = 'generation'

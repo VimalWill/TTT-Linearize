@@ -132,6 +132,15 @@ def sliding_window_attention(
             'no incremental-decode path -- run generation with use_cache=False.'
         )
 
+    # Q_len <= window_size: every causal pair q_idx - kv_idx <= Q_len - 1 is
+    # already inside the window, so the mask is a no-op and plain causal SDPA is
+    # exact. This also keeps short sequences away from flex_attention, which
+    # builds a BlockMask per distinct length; enough distinct lengths exhaust
+    # Dynamo's recompile budget and fall back to an eager path that raised
+    # `CUDA error: an illegal memory access` at seq_len 78 during stage 1.
+    if Q_len <= window_size:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
+
     if _force_sdpa_window or q.device.type != 'cuda':
         return _sdpa_sliding_window(q, k, v, window_size, causal, scale)
 

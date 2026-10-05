@@ -2,6 +2,12 @@ import numpy as np
 import torch
 import torch.optim
 
+def model_autocast(model):
+    """Keep optimizer parameters in FP32 while computing with a BF16 backbone."""
+    device_type = model.device.type
+    enabled = device_type in ('cuda', 'cpu') and getattr(model, 'dtype', None) == torch.bfloat16
+    return torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=enabled)
+
 def get_optimizer_and_scheduler(model, config):
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=config.train.lr,

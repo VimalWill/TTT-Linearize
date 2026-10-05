@@ -87,15 +87,18 @@ def set_trainable_params(model, config):
         return model
     train_ttt = config.model.get('attn_varient', None) == 'ttt' or \
         config.model.get('attn_variant', None) == 'ttt'
+    long_context = config.get('data', {}).get('name') == 'long_context'
     for name, param in model.named_parameters():
         param.requires_grad = bool(
             'lora_' in name
             or (train_ttt and any(k in name for k in TTT_PARAM_KEYS))
         )
-        if param.requires_grad and 'ttt_reader_alignment.weight' in name:
+        if param.requires_grad and (long_context or 'ttt_reader_alignment.weight' in name):
             # Identity diagonals cannot accumulate AdamW steps of order 1e-4
             # in BF16. ReaderOutputAlignment casts only for its forward matmul,
             # so keep optimizer parameters/moments in FP32 in joint training too.
+            # Long-context training also needs FP32 gates, retention, norms,
+            # and initial memories: BF16 can round each small outer update away.
             param.data = param.data.float()
     return model
 
@@ -123,7 +126,7 @@ def continue_stage2(model, adapter):
     if not os.path.isfile(path):
         raise ValueError(f'Anchor continuation requires saved TTT weights: {path}')
     saved_count = len(torch.load(path, map_location='cpu', weights_only=True))
-    if load_ttt_params(model, adapter) != saved_count:
+    if load_ttt_params(model, adapter, strict=True) != saved_count:
         raise ValueError('Not all TTT weights matched the continuation model')
     return PeftModel.from_pretrained(model, adapter, is_trainable=True)
 
@@ -137,8 +140,9 @@ def train(config):
     alignment_only = config.train.get('reader_alignment_only', False)
     if alignment_only and stage != 'ttt_ar':
         raise ValueError('The alignment-only study uses autoregressive CE training')
-    if alignment_only and os.path.isdir(config.train.output_dir) and os.listdir(config.train.output_dir):
-        raise ValueError('Use a fresh output directory for the alignment study')
+    if (alignment_only or config.data.get('name') == 'long_context') and \
+            os.path.isdir(config.train.output_dir) and os.listdir(config.train.output_dir):
+        raise ValueError('Use a fresh output directory for this continuation run')
     trainer = DefaultTrainer if stage.endswith('_at') else FinetuneTrainer
     if stage not in ('liger_gla', 'ttt_at', 'ttt_ar'):
         raise NotImplementedError(stage)
@@ -151,6 +155,19 @@ def train(config):
         config=model_config,
         device_map=config.model.get('device_map', 'auto'),
     ).to(torch.bfloat16)
+
+    if config.data.get('name') == 'long_context':
+        # Promote before the overlay so continuation does not round the saved
+        # FP32 TTT parameters through BF16 on their way into the optimizer.
+        set_trainable_params(model, config)
+        backend = config.train.get('window_backend', 'sdpa')
+        if backend not in ('sdpa', 'flex'):
+            raise ValueError('window_backend must be sdpa or flex')
+        from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
+        from LinearTTT.model.LinearizeMistral.LinearizeMistral import use_sdpa_sliding_window as mistral_window
+        use_sdpa_sliding_window(backend == 'sdpa')
+        mistral_window(backend == 'sdpa')
+        print(f'Long-context window backend: {backend}; trainable parameters: FP32')
 
     if config.train.get('resume_adapter'):
         model = resume_stage2(model, config.train.resume_adapter)
@@ -204,7 +221,7 @@ def train(config):
     total_params = count_model_params(model, requires_grad=False)
     print(f"Model trainable params: {trainable_params}")
     print(f"Model total params: {total_params}")
-    print(f"trainable%: {trainable_params / total_params}")
+    print(f"trainable%: {100 * trainable_params / total_params:.4f}%")
 
     gradient_accumulation_steps = config.data.batch_size // config.data.micro_batch_size
 

@@ -287,14 +287,16 @@ def normalize_answer(text):
 
 
 def generate_answer(model, tokenizer, row, max_new_tokens=256):
+    from Training.utils import model_autocast
     ids = tokenizer.encode(row['prompt'], add_special_tokens=True)
     tensor = torch.tensor([ids], device=model.device)
     base = model.get_base_model() if hasattr(model, 'get_base_model') else model
     parameters = inspect.signature(base.forward).parameters
     kwargs = {name: 1 for name in ('logits_to_keep', 'num_logits_to_keep') if name in parameters}
-    with torch.no_grad():
+    with torch.no_grad(), model_autocast(model):
         sequence = model.generate(input_ids=tensor, attention_mask=torch.ones_like(tensor),
                                   max_new_tokens=max_new_tokens, do_sample=False, num_beams=1,
+                                  temperature=1.0, top_p=1.0,
                                   use_cache=True, pad_token_id=tokenizer.pad_token_id,
                                   eos_token_id=tokenizer.eos_token_id, **kwargs)
     if sequence.shape[1] < len(ids) or not torch.equal(sequence[0, :len(ids)], tensor[0]):
@@ -302,7 +304,8 @@ def generate_answer(model, tokenizer, row, max_new_tokens=256):
     return tokenizer.decode(sequence[0, len(ids):], skip_special_tokens=True).strip()
 
 
-def retrieval_validation(model, tokenizer, rows, per_cell=4, max_new_tokens=256):
+def retrieval_validation(model, tokenizer, rows, per_cell=4, max_new_tokens=256,
+                         samples_path=None, step=None, input_tokens=None):
     if per_cell < 1:
         raise ValueError('validation_per_cell must be positive')
     groups = defaultdict(list)
@@ -312,13 +315,34 @@ def retrieval_validation(model, tokenizer, rows, per_cell=4, max_new_tokens=256)
     if not groups:
         raise ValueError('No retrieval validation examples')
     cell_scores, lengths = [], defaultdict(list)
+    cell_recalls, length_recalls, samples = [], defaultdict(list), []
     for (task, length), examples in sorted(groups.items()):
-        results = [float(normalize_answer(generate_answer(model, tokenizer, row, max_new_tokens))
-                         == normalize_answer(row['answer'])) for row in examples[:per_cell]]
+        results, recalls = [], []
+        for row in examples[:per_cell]:
+            prediction = generate_answer(model, tokenizer, row, max_new_tokens)
+            normalized = normalize_answer(prediction)
+            exact = float(normalized == normalize_answer(row['answer']))
+            answers = row.get('answers', [row['answer']])
+            recall = sum(normalize_answer(a) in normalized for a in answers) / len(answers)
+            results.append(exact)
+            recalls.append(recall)
+            samples.append(dict(id=row.get('id'), step=step, input_tokens=input_tokens,
+                task=task, length_bucket=length, answer=row['answer'], answers=answers,
+                prediction=prediction, exact_match=exact, substring_recall=recall,
+                prompt_tokens=row.get('prompt_tokens'), needle_distances=row.get('needle_distances')))
         score = sum(results) / len(results)
-        print(f'validation retrieval {task} length={length}: {score:.3f}', flush=True)
+        recall = sum(recalls) / len(recalls)
+        print(f'validation retrieval {task} length={length}: {score:.3f} '
+              f'(substring recall={recall:.3f}, n={len(results)})', flush=True)
         cell_scores.append(score)
         lengths[length].append(score)
+        cell_recalls.append(recall)
+        length_recalls[length].append(recall)
+    if samples_path is not None:
+        write_jsonl(samples_path, samples)
     return {'eval/retrieval_accuracy': sum(cell_scores) / len(cell_scores),
+            'eval/retrieval_substring_recall': sum(cell_recalls) / len(cell_recalls),
             **{f'eval/retrieval_accuracy_{length}': sum(scores) / len(scores)
-               for length, scores in lengths.items()}}
+               for length, scores in lengths.items()},
+            **{f'eval/retrieval_substring_recall_{length}': sum(scores) / len(scores)
+               for length, scores in length_recalls.items()}}

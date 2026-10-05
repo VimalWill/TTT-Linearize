@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM
 from omegaconf import OmegaConf
 
 import LinearTTT  # noqa: F401
-from Training.train import build_model_config
+from Training.train import build_model_config, TTT_PARAM_KEYS
 from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
 from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
     use_sdpa_sliding_window as use_mistral_sdpa_sliding_window,
@@ -24,7 +24,7 @@ from LinearTTT.model.LinearizeMistral.LinearizeMistral import (
 _PEFT_PREFIX = re.compile(r'^base_model\.model\.')
 
 
-def load_ttt_params(model, adapter, verbose=True):
+def load_ttt_params(model, adapter, verbose=True, strict=False):
     """Overlay `adapter/ttt_params.pt` onto an *unwrapped* model.
 
     ttt_params.pt is written from a PeftModel, so its keys carry peft's wrapper
@@ -35,11 +35,18 @@ def load_ttt_params(model, adapter, verbose=True):
     """
     ttt = os.path.join(adapter, 'ttt_params.pt')
     if not os.path.exists(ttt):
+        if strict:
+            raise FileNotFoundError(f'Missing TTT checkpoint: {ttt}')
         if verbose:
             print('  NOTE: no ttt_params.pt -- stage-2 TTT weights were never saved')
         return 0
     sd = torch.load(ttt, map_location='cpu')
     sd = {_PEFT_PREFIX.sub('', k): v for k, v in sd.items()}
+    if strict:
+        expected = {n for n, _ in model.named_parameters() if any(k in n for k in TTT_PARAM_KEYS)}
+        missing = expected - sd.keys()
+        if missing:
+            raise ValueError(f'Incomplete TTT checkpoint: {len(missing)} missing tensors, e.g. {sorted(missing)[0]}')
     # Training accumulates small reader updates in FP32. The base model was
     # cast to BF16 before this overlay; promote BEFORE copying saved values,
     # otherwise continuation irreversibly rounds away those updates.
@@ -60,14 +67,14 @@ def load_ttt_params(model, adapter, verbose=True):
     return matched
 
 
-def load_model(path, model_config, adapter=None, verbose=True):
+def load_model(path, model_config, adapter=None, verbose=True, strict_ttt=False):
     """Full checkpoint, optionally with PEFT adapters and saved TTT params."""
     model = AutoModelForCausalLM.from_pretrained(
         path, config=model_config, device_map={'': 0}
     ).to(torch.bfloat16)
     if adapter:
         from peft import PeftModel
-        load_ttt_params(model, adapter, verbose=verbose)
+        load_ttt_params(model, adapter, verbose=verbose, strict=strict_ttt)
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
     return model.eval()
 
@@ -647,7 +654,8 @@ def main():
             cfg.model.window_size = new_w
             cfg.model.lact_chunk_size = new_c
         model_config = build_model_config(cfg)
-        model = load_model(args.ckpt, model_config, args.adapter)
+        model = load_model(args.ckpt, model_config, args.adapter,
+                           strict_ttt=config.get('data', {}).get('name') == 'long_context')
         mods = ttt_layers(model)
         if args.keep_frac is not None:
             shrink_memories(mods, args.keep_frac, args.keep_select, args.keep_seed)
