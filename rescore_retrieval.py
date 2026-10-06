@@ -21,6 +21,7 @@ import argparse
 import json
 import re
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -31,6 +32,21 @@ def normalize(text):
 
 def items(text):
     return {piece for piece in normalize(text).split(',') if piece}
+
+
+def closest(target, prediction):
+    """Best similarity between an answer item and any token in the output.
+
+    Exact-match scoring cannot tell "never retrieved" from "retrieved with one
+    character wrong", and both appear as 0.000. At step 100 the model emitted
+    label_2869797 for label_2869794 -- the right item, one digit off. Whether
+    the twelve zero cells are full of such near misses or of unrelated text
+    decides whether the memory is failing or only its precision is.
+    """
+    tokens = [t for t in re.split(r'[\s,]+', normalize(prediction)) if t]
+    if not tokens:
+        return 0.0
+    return max(SequenceMatcher(None, target, t).ratio() for t in tokens)
 
 
 def degenerate(prediction, diversity=0.2, dominance=0.6):
@@ -74,25 +90,36 @@ def main():
         cells[(r['task'], r['length_bucket'])].append(r)
 
     print(f'{"task":>14} {"len":>6} {"n":>3} {"exact":>7} {"set":>7} '
-          f'{"item recall":>12} {"degenerate":>11}')
+          f'{"item recall":>12} {"degenerate":>11} {"near miss":>10}')
+    print(f'{"":>14} {"":>6} {"":>3} {"":>7} {"":>7} {"":>12} {"":>11} '
+          f'{"(0-1, missed items only)":>10}')
     totals = defaultdict(list)
     for (task, length), group in sorted(cells.items()):
         exact = [float(normalize(r['prediction']) == normalize(r['answer'])) for r in group]
-        seteq, recall, bad = [], [], []
+        seteq, recall, bad, near = [], [], [], []
         for r in group:
             want = items(r['answer'])
             got = items(r['prediction'])
             seteq.append(float(want == got))
             recall.append(len(want & got) / len(want) if want else 0.0)
             bad.append(float(degenerate(r['prediction'])))
+            # Only items NOT recovered exactly: how close did the output get?
+            missed = want - got
+            near.append(sum(closest(w, r['prediction']) for w in missed) / len(missed)
+                        if missed else float('nan'))
         m = lambda v: sum(v) / len(v)
+        mn = [v for v in near if v == v]
         print(f'{task:>14} {length:>6} {len(group):>3} {m(exact):>7.3f} {m(seteq):>7.3f} '
-              f'{m(recall):>12.3f} {m(bad):>11.0%}')
-        for key, value in (('exact', exact), ('set', seteq), ('recall', recall), ('bad', bad)):
+              f'{m(recall):>12.3f} {m(bad):>11.0%} {(m(mn) if mn else float("nan")):>10.2f}')
+        for key, value in (('exact', exact), ('set', seteq), ('recall', recall),
+                           ('bad', bad), ('near', mn)):
             totals[key].extend(value)
     m = lambda v: sum(v) / len(v)
     print(f'\n{"OVERALL":>14} {"":>6} {len(totals["exact"]):>3} {m(totals["exact"]):>7.3f} '
-          f'{m(totals["set"]):>7.3f} {m(totals["recall"]):>12.3f} {m(totals["bad"]):>11.0%}')
+          f'{m(totals["set"]):>7.3f} {m(totals["recall"]):>12.3f} {m(totals["bad"]):>11.0%} '
+          f'{m(totals["near"]):>10.2f}')
+    print('\n  near miss near 1.0: the item was retrieved and corrupted, so the memory '
+          'holds it\n  near miss near 0.3: unrelated text, so the memory does not')
 
     if a.show:
         print('\nnear misses: the answer was partly recovered but scored zero exact')
