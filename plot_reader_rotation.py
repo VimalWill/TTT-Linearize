@@ -260,7 +260,11 @@ def main():
         actual[name] = dict(layer=layer, head=display, readout=x, stretched=p,
             aligned=y, positions=pos, position_fractions=pos_fraction, ids=ids,
             coordinates=coords, unit_coordinates=unit, staged_coordinates=staged,
-            metadata=meta, map_angle=meta['display_rotation_angle_degrees'], turns=turns)
+            metadata=meta, map_angle=meta['display_rotation_angle_degrees'], turns=turns,
+            # The panels draw ONE head, so they must quote that head's energy.
+            # The over-heads median belongs in the table, not under a scatter.
+            head_energy=next(i['median_energy_in_plane'] for i in meta['per_head']
+                             if i['head'] == display))
         print(f'{name}: plotting {len(x)} readouts from L{layer}, head {display}; '
               f'median plane energy over {meta["heads"]} heads '
               f'{meta["median_energy_in_plane_over_heads"]:.1%}')
@@ -290,9 +294,12 @@ def main():
             rays.append(direction)
             ax.annotate('', xy=direction, xytext=(0, 0),
                         arrowprops=dict(arrowstyle='-|>', color=shade, lw=2, alpha=.9))
-        turn = np.degrees(np.arctan2(np.cross(*rays), np.dot(*rays)))
+        # np.cross on 2-vectors is deprecated in numpy 2; the z-component is
+        # the only one a plane has, so write it out.
+        cross = rays[0][0] * rays[1][1] - rays[0][1] * rays[1][0]
+        turn = np.degrees(np.arctan2(cross, np.dot(*rays)))
         ax.set_title(f"{name}, layer {act['layer']} head {act['head']}\n"
-                     f"{act['turns'][act['layer']]['energy']:.0%} of readout energy "
+                     f"{act['head_energy']:.0%} of readout energy "
                      f"in this plane; mean direction turns {abs(turn):.0f} degrees")
         ax.set_xlabel('Plane coordinate 1 (unit-normalized)')
         ax.set_ylabel('Plane coordinate 2 (unit-normalized)')
@@ -339,8 +346,8 @@ def main():
             ax.set_title(title)
         axes[row, 0].set_ylabel(f"{name} · L{act['layer']} head {act['head']}\nPlane coordinate 2")
         axes[row, 1].set_xlabel(f"Token position color: early → late\n"
-            f"Median readout energy in this plane: "
-            f"{act['turns'][act['layer']]['energy']:.1%}")
+            f"Readout energy in this plane, this head: "
+            f"{act['head_energy']:.1%}")
     fig.suptitle('How the reader map moves a real readout', fontsize=17, y=1.01)
     fig.text(.5, .01, 'Each dot is one readout from a held-out document. All three panels use '
              'the same plane, and the last one is taken straight from the model.',
