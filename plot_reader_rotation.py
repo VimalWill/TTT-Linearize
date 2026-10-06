@@ -1,7 +1,7 @@
 """What rotation does chi_l actually apply, and is it more than noise?
 
-plot_reader_maps.py reports ||Q-I||_F, which has no units and no null. This
-script works in degrees and carries a control.
+An earlier version of this analysis reported ||Q-I||_F, which has no units
+and no null. This script works in degrees and carries a control.
 
 A real orthogonal Q has eigenvalues on the unit circle in conjugate pairs
 e^{+-i theta}: each pair is a plane of R^d that Q turns by theta. So the
