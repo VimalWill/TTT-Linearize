@@ -326,33 +326,55 @@ def main():
     save_figure(fig, out, 'reader_rotation')
     plt.close(fig)
 
-    fig, axes = plt.subplots(len(runs), 3, figsize=(13, 4.7 * len(runs)), squeeze=False)
-    cmap = plt.get_cmap('viridis')
-    for row, (name, act) in enumerate(actual.items()):
-        coords = act['staged_coordinates']
-        colors = cmap(act['position_fractions'])
-        extent = float(np.quantile(np.abs(np.concatenate(coords)), .995)) * 1.25
-        picks = np.linspace(0, len(coords[0]) - 1, min(8, len(coords[0]))).round().astype(int)
-        for col, (ax, points, title) in enumerate(zip(axes[row], coords,
-                ['Readout, as captured', 'After the stretch', 'After the full reader map'])):
-            setup_plane(ax, extent)
-            ax.scatter(points[:, 0], points[:, 1], c=colors, s=18, alpha=.7, linewidths=0)
-            for i in picks:
-                if col == 0:
-                    continue
-                before = coords[col - 1][i]
-                ax.annotate('', xy=points[i], xytext=before,
-                            arrowprops=dict(arrowstyle='->', color='#d97732', alpha=.4, lw=1))
-            ax.set_title(title)
-        axes[row, 0].set_ylabel(f"{name} · L{act['layer']} head {act['head']}\nPlane coordinate 2")
-        axes[row, 1].set_xlabel(f"Token position color: early → late\n"
-            f"Readout energy in this plane, this head: "
-            f"{act['head_energy']:.1%}")
-    fig.suptitle('How the reader map moves a real readout', fontsize=17, y=1.01)
-    fig.text(.5, .01, 'Each dot is one readout from a held-out document. All three panels use '
-             'the same plane, and the last one is taken straight from the model.',
-             ha='center', fontsize=9, color='.35')
-    fig.tight_layout(rect=(0, .045, 1, .98), h_pad=2.5)
+    # Stages figure, drawn to publication style: a serif face, limits fitted
+    # to the data rather than a fixed frame, the previous stage ghosted behind
+    # the current one so the motion is visible inside a single panel, and one
+    # shared colour bar instead of a legend per panel.
+    with plt.rc_context({'font.family': 'serif', 'mathtext.fontset': 'stix',
+                         'axes.spines.top': True, 'axes.spines.right': True,
+                         'axes.edgecolor': '.2', 'axes.linewidth': .8,
+                         'xtick.direction': 'out', 'ytick.direction': 'out',
+                         'font.size': 11}):
+        fig, axes = plt.subplots(len(runs), 3, figsize=(13.2, 3.5 * len(runs)),
+                                 squeeze=False, sharex='row', sharey='row')
+        cmap = plt.get_cmap('viridis')
+        titles = ['Readout', 'After stretch', 'After rotation']
+        for row, (name, act) in enumerate(actual.items()):
+            # Raw plane coordinates: with limits fitted to the data there is
+            # nothing to gain from rescaling, and the true spread stays visible.
+            coords = act['coordinates']
+            colors = cmap(act['position_fractions'])
+            allpts = np.concatenate(coords)
+            lo, hi = allpts.min(0), allpts.max(0)
+            pad = (hi - lo).max() * .08
+            picks = np.linspace(0, len(coords[0]) - 1, min(10, len(coords[0]))).round().astype(int)
+            for col, (ax, points, title) in enumerate(zip(axes[row], coords, titles)):
+                if col:
+                    before = coords[col - 1]
+                    ax.scatter(before[:, 0], before[:, 1], s=9, color='.82',
+                               linewidths=0, zorder=1)
+                    for i in picks:
+                        ax.annotate('', xy=points[i], xytext=before[i], zorder=2,
+                                    arrowprops=dict(arrowstyle='->', color='.45',
+                                                    lw=.7, shrinkA=0, shrinkB=0))
+                ax.scatter(points[:, 0], points[:, 1], c=colors, s=22, alpha=.85,
+                           linewidths=0, zorder=3)
+                ax.set_xlim(lo[0] - pad, hi[0] + pad)
+                ax.set_ylim(lo[1] - pad, hi[1] + pad)
+                ax.set_aspect('equal', adjustable='box')
+                if row == 0:
+                    ax.set_title(title, pad=9)
+            axes[row, 0].set_ylabel(f"{name}, layer {act['layer']} head {act['head']}\n"
+                                    f"Plane coordinate 2")
+        fig.supxlabel('Plane coordinate 1', y=.04)
+        bar = fig.colorbar(plt.cm.ScalarMappable(cmap=cmap), ax=axes, fraction=.02, pad=.015)
+        bar.set_ticks([0, 1]); bar.set_ticklabels(['early', 'late'])
+        bar.set_label('Token position', labelpad=8)
+        bar.outline.set_linewidth(.8)
+        energies = ', '.join(f"{n}: {a['head_energy']:.0%}" for n, a in actual.items())
+        fig.text(.5, -.02, 'Each dot is one readout from a held-out document; the previous '
+                 f'stage is ghosted in grey. Readout energy in this plane -- {energies}.',
+                 ha='center', fontsize=9.5, color='.35')
     save_figure(fig, out, 'reader_transform_stages')
     plt.close(fig)
     metadata = dict(actual_activations=True, synthetic_vectors=False,
