@@ -23,8 +23,8 @@ def read_jsonl(path):
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def write_jsonl(path, rows):
-    with Path(path).open('w') as stream:
+def write_jsonl(path, rows, append=False):
+    with Path(path).open('a' if append else 'w') as stream:
         for row in rows:
             stream.write(json.dumps(row, ensure_ascii=False) + '\n')
 
@@ -339,7 +339,10 @@ def retrieval_validation(model, tokenizer, rows, per_cell=4, max_new_tokens=256,
         cell_recalls.append(recall)
         length_recalls[length].append(recall)
     if samples_path is not None:
-        write_jsonl(samples_path, samples)
+        # Append: each eval truncated the file, so only the newest step
+        # survived and no trend across steps could ever be measured. The
+        # dataset writers in prepare_long_context still truncate.
+        write_jsonl(samples_path, samples, append=True)
     return {'eval/retrieval_accuracy': sum(cell_scores) / len(cell_scores),
             'eval/retrieval_substring_recall': sum(cell_recalls) / len(cell_recalls),
             **{f'eval/retrieval_accuracy_{length}': sum(scores) / len(scores)

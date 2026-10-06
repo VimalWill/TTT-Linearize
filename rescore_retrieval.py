@@ -83,6 +83,11 @@ def main():
     steps = sorted({r['step'] for r in rows if r.get('step') is not None})
     step = a.step if a.step is not None else (steps[-1] if steps else None)
     rows = [r for r in rows if r.get('step') == step]
+    if not rows:
+        raise SystemExit(
+            f'no samples at step {step}; this file holds {steps or "no steps"}. '
+            'Runs before the append fix truncated the file at every eval, so '
+            'only the newest step is present.')
     print(f'step {step} of {steps}; {len(rows)} samples\n')
 
     cells = defaultdict(list)
