@@ -217,10 +217,14 @@ def main():
         if layer not in available or layer not in runs[name]:
             raise ValueError(f'{name}: layer {layer} has no captured activation/map')
         meta = activation_metadata[name]['layers'][str(layer)]
-        x = data[f'readout_{layer}']
-        p = data[f'stretched_{layer}']
-        y = data[f'aligned_{layer}']
-        basis = data[f'basis_{layer}']
+        # Arrays are [samples, heads, dim] and bases [heads, dim, 2]. The
+        # scatter can only draw one plane, so it draws the display head; the
+        # table below summarises every head.
+        display = meta['display_head']
+        x = data[f'readout_{layer}'][:, display]
+        p = data[f'stretched_{layer}'][:, display]
+        y = data[f'aligned_{layer}'][:, display]
+        basis = data[f'basis_{layer}'][display]
         pos = data[f'token_position_{layer}']
         pos_fraction = data[f'position_fraction_{layer}']
         ids = data[f'example_id_{layer}']
@@ -237,27 +241,29 @@ def main():
         norms = [np.linalg.norm(v, axis=1, keepdims=True).clip(1e-30) for v in (x, p, y)]
         unit = [(v / n) @ basis for v, n in zip((x, p, y), norms)]
         staged = [(v / norms[0]) @ basis for v in (x, p, y)]
-        # The scatter shows one plane, so one layer, but the capture saves
-        # every reader. Summarise all of them -- the other layers' activation
-        # columns were reading nan purely because nothing looked at them.
+        # Every captured layer, summarised over heads. The capture already
+        # reduced each head over samples, so this is a spread across heads:
+        # the quantity that says whether one low head is a quiet reader or an
+        # unlucky draw.
         turns = {}
         for other in available:
             if other not in runs[name]:
                 continue
-            xo = torch.from_numpy(data[f'readout_{other}']).double()
-            yo = torch.from_numpy(data[f'aligned_{other}']).double()
-            cos = (xo * yo).sum(1) / (xo.norm(dim=1) * yo.norm(dim=1)).clamp(min=1e-30)
+            per_head = activation_metadata[name]['layers'][str(other)]['per_head']
+            t = np.array([i['median_turn_degrees'] for i in per_head])
+            e = np.array([i['median_energy_in_plane'] for i in per_head
+                          if i['has_plane']])
             turns[other] = dict(
-                turn=float(cos.clamp(-1, 1).arccos().rad2deg().median()),
-                energy=activation_metadata[name]['layers'][str(other)][
-                    'median_readout_energy_in_plane'],
-                head=activation_metadata[name]['layers'][str(other)]['head'])
-        actual[name] = dict(layer=layer, head=meta['head'], readout=x, stretched=p,
+                turn=float(np.median(t)), turn_iqr=np.percentile(t, [25, 75]),
+                energy=float(np.median(e)), energy_iqr=np.percentile(e, [25, 75]),
+                heads=len(t), planar=len(e))
+        actual[name] = dict(layer=layer, head=display, readout=x, stretched=p,
             aligned=y, positions=pos, position_fractions=pos_fraction, ids=ids,
             coordinates=coords, unit_coordinates=unit, staged_coordinates=staged,
-            metadata=meta, map_angle=meta['rotation_angle_degrees'], turns=turns)
-        print(f'{name}: plotting {len(x)} actual readouts from L{layer}, head {meta["head"]}; '
-              f'median plane energy {meta["median_readout_energy_in_plane"]:.1%}')
+            metadata=meta, map_angle=meta['display_rotation_angle_degrees'], turns=turns)
+        print(f'{name}: plotting {len(x)} readouts from L{layer}, head {display}; '
+              f'median plane energy over {meta["heads"]} heads '
+              f'{meta["median_energy_in_plane_over_heads"]:.1%}')
 
     plt.rcParams.update({'font.size': 10, 'axes.spines.top': False,
                          'axes.spines.right': False, 'pdf.fonttype': 42})
@@ -286,7 +292,7 @@ def main():
                         arrowprops=dict(arrowstyle='-|>', color=shade, lw=2, alpha=.9))
         turn = np.degrees(np.arctan2(np.cross(*rays), np.dot(*rays)))
         ax.set_title(f"{name}, layer {act['layer']} head {act['head']}\n"
-                     f"{act['metadata']['median_readout_energy_in_plane']:.0%} of readout energy "
+                     f"{act['turns'][act['layer']]['energy']:.0%} of readout energy "
                      f"in this plane; mean direction turns {abs(turn):.0f} degrees")
         ax.set_xlabel('Plane coordinate 1 (unit-normalized)')
         ax.set_ylabel('Plane coordinate 2 (unit-normalized)')
@@ -333,7 +339,8 @@ def main():
             ax.set_title(title)
         axes[row, 0].set_ylabel(f"{name} · L{act['layer']} head {act['head']}\nPlane coordinate 2")
         axes[row, 1].set_xlabel(f"Token position color: early → late\n"
-            f"Median activation energy in plane: {act['metadata']['median_readout_energy_in_plane']:.1%}")
+            f"Median readout energy in this plane: "
+            f"{act['turns'][act['layer']]['energy']:.1%}")
     fig.suptitle('How the reader map moves a real readout', fontsize=17, y=1.01)
     fig.text(.5, .01, 'Each dot is one readout from a held-out document. All three panels use '
              'the same plane, and the last one is taken straight from the model.',
@@ -348,20 +355,30 @@ def main():
                        'captured full reader outputs are used in the final stage.')
     (out / 'reader_activation_figure.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
-    print(f'\n{"run":>10} {"layer":>6} {"head":>5} {"median activation turn":>24} '
-          f'{"plane energy":>14} {"top-8":>9} {"null":>8} {"effective":>10} {"null":>7} {"ratio":>6}')
+    heads = {n: next(iter(a['turns'].values()))['heads'] for n, a in actual.items() if a['turns']}
+    print(f'\n  activation columns: median over heads [inter-quartile range], '
+          f'each head a median over samples')
+    print(f'{"run":>10} {"layer":>6} {"turn (deg)":>21} {"energy in plane":>23} '
+          f'{"top-8":>8} {"null":>7} {"effective":>10} {"null":>7} {"ratio":>6}')
     for name, per_layer in runs.items():
         for layer, st in per_layer.items():
             n, n0 = planes(st['ang']), planes(st['ang_null'])
-            captured = actual[name]['turns'].get(layer)
-            turn = captured['turn'] if captured else float('nan')
-            energy = captured['energy'] if captured else float('nan')
-            head = f"{captured['head']:>5}" if captured else '    -'
-            print(f'{name:>10} {layer:>6} {head} {turn:>22.2f}deg {energy:>13.1%} '
+            c = actual[name]['turns'].get(layer)
+            turn = (f"{c['turn']:6.1f} [{c['turn_iqr'][0]:4.1f},{c['turn_iqr'][1]:5.1f}]"
+                    if c else f'{"-":>19}')
+            energy = (f"{c['energy']:5.1%} [{c['energy_iqr'][0]:4.1%},{c['energy_iqr'][1]:5.1%}]"
+                      if c else f'{"-":>21}')
+            print(f'{name:>10} {layer:>6} {turn:>21} {energy:>23} '
                   f'{st["ang"][:, ::2][:, :8].mean():>8.2f} '
                   f'{st["ang_null"][:, ::2][:, :8].mean():>7.2f} '
                   f'{n:>10.1f} {n0:>7.1f} {n / n0:>6.2f}')
-    print(f'{"":>10} eff planes counts distinct planes, out of d/2')
+    print(f'{"":>10} eff planes counts distinct planes, out of d/2; '
+          f'heads per layer: {heads}')
+    for name, a in actual.items():
+        short = {l: c['heads'] - c['planar'] for l, c in a['turns'].items() if c['planar'] < c['heads']}
+        if short:
+            print(f'{"":>10} {name}: heads with no proper rotation plane (turn still '
+                  f'reported, plane energy omitted): {short}')
 
 
 if __name__ == '__main__':

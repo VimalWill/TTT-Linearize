@@ -58,18 +58,37 @@ def main():
     for layer, chi in maps.items():
         if selections and layer not in selections:
             continue
+        # Every head, not one. A single median-rotation head per layer made the
+        # layers incomparable (L1 head 25 against L29 head 23) and left a lone
+        # low number with no way to tell an unlucky head from a quiet reader.
         per_layer = {layer: dict(chi=chi, ang=angles(chi))}
-        chosen = select_example(per_layer, layer=layer,
-                                head=selections.get(layer))
-        metadata[str(layer)] = dict(head=chosen['head'],
-            rotation_angle_degrees=chosen['angle_degrees'],
-            stretch_energy_outside_plane=chosen['stretch_out_of_plane_energy_fraction'])
-        # Rebuild the selected plane basis from Q for projection of full readouts.
+        chosen = select_example(per_layer, layer=layer, head=selections.get(layer))
         from plot_reader_rotation import strongest_plane
-        q_head, _, _ = polar_factors(chi[chosen['head']])
-        basis, _ = strongest_plane(q_head)
-        bases[layer] = basis
-        metadata[str(layer)]['plane_basis'] = basis.tolist()
+        heads, dim = chi.shape[0], chi.shape[-1]
+        basis_stack = torch.zeros(heads, dim, 2, dtype=torch.float64)
+        head_info = []
+        for h in range(heads):
+            q_head, _, _ = polar_factors(chi[h])
+            # A reflection has no proper rotation plane. The turn between a
+            # readout and its image needs no plane, so such a head still
+            # reports a turn; only its plane energy is undefined.
+            try:
+                basis_h, q2 = strongest_plane(q_head)
+            except ValueError:
+                head_info.append(dict(head=h, has_plane=False,
+                                      rotation_angle_degrees=None))
+                continue
+            basis_stack[h] = basis_h
+            head_info.append(dict(head=h, has_plane=True,
+                rotation_angle_degrees=float(torch.atan2(q2[1, 0], q2[0, 0]).rad2deg())))
+        if not any(info['has_plane'] for info in head_info):
+            raise ValueError(f'Layer {layer}: no head has a proper rotation plane')
+        bases[layer] = basis_stack
+        metadata[str(layer)] = dict(display_head=chosen['head'], heads=heads,
+            heads_with_plane=sum(info['has_plane'] for info in head_info),
+            per_head=head_info,
+            display_rotation_angle_degrees=chosen['angle_degrees'],
+            display_stretch_energy_outside_plane=chosen['stretch_out_of_plane_energy_fraction'])
         readouts[layer], aligneds[layer], positions[layer] = [], [], []
         position_fractions[layer], example_ids[layer] = [], []
 
@@ -102,21 +121,20 @@ def main():
     for layer in bases:
         if layer >= len(mods):
             raise ValueError(f'Layer {layer} outside model with {len(mods)} TTT layers')
-        active[layer] = dict(head=metadata[str(layer)]['head'], seen=0)
+        active[layer] = dict(seen=0)
         def capture(module, inputs, output, layer=layer):
             x = inputs[0].detach()
             y = output.detach()
             heads = module.weight.shape[0]
-            head = active[layer]['head']
             if x.shape[0] % heads:
                 raise ValueError('Reader activation batch dimension is not divisible by head count')
-            x = x.reshape(-1, heads, x.shape[1], x.shape[2])[:, head]
-            y = y.reshape(-1, heads, y.shape[1], y.shape[2])[:, head]
+            x = x.reshape(-1, heads, x.shape[1], x.shape[2])[0]      # [heads, tokens, dim]
+            y = y.reshape(-1, heads, y.shape[1], y.shape[2])[0]
             n = x.shape[1]
             take = min(args.positions_per_prompt, n)
             idx = torch.linspace(0, n - 1, take, device=x.device).round().long().unique()
-            readouts[layer].append(x[0, idx].float().cpu())
-            aligneds[layer].append(y[0, idx].float().cpu())
+            readouts[layer].append(x[:, idx].permute(1, 0, 2).float().cpu())
+            aligneds[layer].append(y[:, idx].permute(1, 0, 2).float().cpu())
             positions[layer].append(idx.cpu())
             position_fractions[layer].append((idx.float() / max(1, n - 1)).cpu())
             active[layer]['seen'] += 1
@@ -214,21 +232,34 @@ def main():
 
     arrays = {}
     for layer in bases:
-        x = torch.cat(readouts[layer]).double()
+        x = torch.cat(readouts[layer]).double()               # [samples, heads, dim]
         y_actual = torch.cat(aligneds[layer]).double()
-        q, p, _ = polar_factors(maps[layer][metadata[str(layer)]['head']])
-        y_stretch = x @ p.T
-        # Reader module's output is the definitive actual activation; compare
-        # it against the factorized map to ensure the plotted stages match.
-        expected = x @ maps[layer][metadata[str(layer)]['head']].double().T
+        chi = maps[layer].double()                            # [heads, dim, dim]
+        basis = bases[layer]                                  # [heads, dim, 2]
+        stretch = torch.stack([polar_factors(chi[h])[1] for h in range(chi.shape[0])])
+        y_stretch = torch.einsum('nhd,hed->nhe', x, stretch)
+        # The module's own output is the definitive activation. Checking it
+        # against the factorisation catches a convention slip in one number.
+        expected = torch.einsum('nhd,hed->nhe', x, chi)
         error = float((y_actual - expected).norm() / expected.norm().clamp(min=1e-30))
-        basis = bases[layer].double()
-        energy = x.square().sum(1).clamp(min=1e-30)
+        energy = x.square().sum(-1).clamp(min=1e-30)                       # [samples, heads]
+        in_plane = torch.einsum('nhd,hdk->nhk', x, basis).square().sum(-1) / energy
+        cos = ((x * y_actual).sum(-1)
+               / (x.norm(dim=-1) * y_actual.norm(dim=-1)).clamp(min=1e-30))
+        turn = cos.clamp(-1, 1).arccos().rad2deg()                         # [samples, heads]
+        for info in metadata[str(layer)]['per_head']:
+            h = info['head']
+            info['median_turn_degrees'] = float(turn[:, h].median())
+            info['median_energy_in_plane'] = (
+                float(in_plane[:, h].median()) if info['has_plane'] else None)
+        planar = [i['median_energy_in_plane'] for i in metadata[str(layer)]['per_head']
+                  if i['has_plane']]
         metadata[str(layer)].update(
             samples=int(x.shape[0]), prompts=count,
             actual_reader_relative_reconstruction_error=error,
-            median_readout_energy_in_plane=float(((x @ basis).square().sum(1) / energy).median()),
-            mean_readout_energy_in_plane=float(((x @ basis).square().sum(1) / energy).mean()))
+            median_turn_over_heads=float(np.median(
+                [i['median_turn_degrees'] for i in metadata[str(layer)]['per_head']])),
+            median_energy_in_plane_over_heads=float(np.median(planar)))
         arrays[f'readout_{layer}'] = x.float().numpy()
         arrays[f'stretched_{layer}'] = y_stretch.float().numpy()
         arrays[f'aligned_{layer}'] = y_actual.float().numpy()
@@ -247,9 +278,11 @@ def main():
         positions_per_prompt=args.positions_per_prompt, layers=metadata)
     output.with_suffix('.json').write_text(json.dumps(manifest, indent=2) + '\n')
     for layer, info in metadata.items():
-        print(f"layer {layer} head {info['head']}: {info['samples']} real readouts; "
-              f"median plane energy {info['median_readout_energy_in_plane']:.1%}; "
-              f"relative map reconstruction error {info['actual_reader_relative_reconstruction_error']:.2e}")
+        print(f"layer {layer}: {info['samples']} readouts x {info['heads']} heads "
+              f"({info['heads_with_plane']} with a rotation plane); "
+              f"median turn {info['median_turn_over_heads']:.1f} deg; "
+              f"median plane energy {info['median_energy_in_plane_over_heads']:.1%}; "
+              f"reconstruction error {info['actual_reader_relative_reconstruction_error']:.2e}")
     print(f'Wrote actual activations to {output} and {output.with_suffix(".json")}')
 
 
