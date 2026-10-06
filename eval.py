@@ -47,11 +47,11 @@ def load_ttt_params(model, adapter, verbose=True, strict=False):
         missing = expected - sd.keys()
         if missing:
             raise ValueError(f'Incomplete TTT checkpoint: {len(missing)} missing tensors, e.g. {sorted(missing)[0]}')
-    # Training accumulates small reader updates in FP32. The base model was
-    # cast to BF16 before this overlay; promote BEFORE copying saved values,
-    # otherwise continuation irreversibly rounds away those updates.
+    # Long-context training keeps all trainable TTT parameters in FP32, not
+    # just reader maps. Restore their saved precision BEFORE copying values;
+    # copying into the BF16 base first irreversibly rounds small updates away.
     for name, param in model.named_parameters():
-        if name.endswith('ttt_reader_alignment.weight') and name in sd:
+        if name in sd and any(key in name for key in TTT_PARAM_KEYS):
             param.data = param.data.to(dtype=sd[name].dtype)
     unexpected = model.load_state_dict(sd, strict=False).unexpected_keys
     matched = len(sd) - len(unexpected)
