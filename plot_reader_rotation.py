@@ -5,30 +5,37 @@ script works in degrees and carries a control.
 
 A real orthogonal Q has eigenvalues on the unit circle in conjugate pairs
 e^{+-i theta}: each pair is a plane of R^d that Q turns by theta. So the
-rotation IS a list of angles, and the three panels are that list.
+rotation has a spectrum of plane angles. The main figure plots paired, actual
+held-out reader inputs and outputs in a selected invariant plane, alongside the
+distinct-plane angle profiles. A second figure shows original -> stretch ->
+rotate on those same real activations, projected onto that plane.
 
 The control matters. For chi = I + E with E small, Q ~= I + skew(E) and
 P ~= I + sym(E), and for iid E the two have nearly equal norm
 (||sym||^2/||skew||^2 = 1 + 2/(d-1) = 1.016 at d=128). So "the orthogonal and
 symmetric parts are comparable" is what ANY small perturbation gives, and a
-figure showing it establishes nothing. Every panel here therefore overlays a
-null: per head, a Gaussian E rescaled to that head's measured ||chi - I||_F,
-pushed through the same polar decomposition. Learned curves that sit on the
-null are noise; separation is structure.
+figure showing it alone does not distinguish learned structure from noise.
+The angle profile therefore overlays a null: per head, a Gaussian E rescaled to that head's measured ||chi - I||_F,
+pushed through the same polar decomposition. Separation indicates structure
+relative to this particular null; overlap does not establish that a map is noise.
+
+The activation panels use captured pre-alignment reader activations from held-out
+prompts, paired with the actual module outputs. No synthetic vectors are used.
 
     python plot_reader_rotation.py \
       --ckpt NAME=/path/to/stage2/best_ckpt [--ckpt NAME2=...] \
       --out-dir /path/to/figures
 """
 import argparse
+import json
 import re
 from pathlib import Path
 
 import torch
+from analyze_reader_maps import polar_factors
 
 PREFIX = re.compile(r'^base_model\.model\.')
 KEY = re.compile(r'layers\.(\d+)\..*ttt_reader_alignment\.weight$')
-PROBES = 256
 SEED = 0
 
 
@@ -69,7 +76,11 @@ def angles(chi):
     rotation planes listed twice over. The duplication is uniform and both the
     learned maps and the null go through this function, so the shapes compare.
     """
-    lam = torch.linalg.eigvals(orthogonal_factor(chi))
+    q = orthogonal_factor(chi)
+    if q.shape[-1] % 2 or (torch.linalg.det(q) < 0).any():
+        raise ValueError('Distinct-plane profiles require even-dimensional proper rotations; '
+                         'reflection heads must be analyzed separately')
+    lam = torch.linalg.eigvals(q)
     return lam.angle().abs().rad2deg().sort(dim=1, descending=True).values
 
 
@@ -82,23 +93,73 @@ def planes(ang):
     rather than against d/2, since finite samples never reach the ceiling.
     """
     half = ang[:, ::2]                                   # drop the conjugate copy
-    return (half.sum(1) ** 2 / half.pow(2).sum(1)).mean()
+    return (half.sum(1) ** 2 / half.pow(2).sum(1).clamp(min=1e-30)).mean()
 
 
-def probe_angles(chi, generator):
-    """Angle between an isotropic unit probe v and its image chi v, in degrees.
+def strongest_plane(q):
+    """An orthonormal basis B for a strongest invariant rotation plane of Q."""
+    q = q.double()
+    if q.shape[0] < 2 or torch.linalg.det(q) < 0:
+        raise ValueError('A rotation plane requires a proper rotation of dimension >= 2')
+    lam, vectors = torch.linalg.eig(q)
+    # A pair of -1 eigenvalues is a 180-degree plane, stronger than any
+    # complex pair. For an orthogonal matrix that eigenspace is real.
+    if ((lam.real < -1 + 1e-12) & (lam.imag.abs() < 1e-9)).sum() >= 2:
+        _, eigenvectors = torch.linalg.eigh((q + q.T) / 2)
+        basis = eigenvectors[:, :2]
+    elif (lam.imag > 1e-9).any():
+        scores = torch.where(lam.imag > 1e-9, lam.angle(), -torch.ones_like(lam.real))
+        v = vectors[:, scores.argmax()]
+        basis, _ = torch.linalg.qr(torch.stack((v.real, v.imag), dim=1))
+    else:  # Identity: any plane is invariant.
+        basis = torch.eye(q.shape[0], dtype=q.dtype)[:, :2]
+    reduced = basis.T @ q @ basis
+    if torch.atan2(reduced[1, 0], reduced[0, 0]) < 0:
+        basis[:, 1] *= -1
+        reduced = basis.T @ q @ basis
+    if not torch.allclose(q @ basis, basis @ reduced, atol=1e-7, rtol=1e-7):
+        raise ValueError('Could not extract an invariant plane')
+    return basis, reduced
 
-    chi acts on readouts, not on basis vectors, so this is the quantity a
-    downstream o_proj sees. Isotropic probes are a stand-in for the real
-    readout distribution, which is not in the checkpoint -- they say how far a
-    TYPICAL direction moves, not how far the directions that matter move.
-    """
-    h, d, _ = chi.shape
-    v = torch.randn(h, d, PROBES, dtype=chi.dtype, generator=generator)
-    v = v / v.norm(dim=1, keepdim=True)
-    u = chi @ v
-    cos = (v * u).sum(dim=1) / u.norm(dim=1).clamp(min=1e-30)
-    return cos.clamp(-1, 1).arccos().rad2deg()
+
+def select_example(per_layer, layer=None, head=None):
+    """Default: most-rotated layer, median head by its strongest plane angle."""
+    if layer is None:
+        layer = max(per_layer, key=lambda l: float(per_layer[l]['ang'][:, 0].mean()))
+    if layer not in per_layer:
+        raise ValueError(f'Example layer {layer} has no reader map')
+    st = per_layer[layer]
+    if head is None:
+        head = int(st['ang'][:, 0].argsort()[st['ang'].shape[0] // 2])
+    if head < 0 or head >= st['chi'].shape[0]:
+        raise ValueError(f'Example head {head} is out of range')
+    chi = st['chi'][head]
+    q, p, _ = polar_factors(chi)
+    basis, q2 = strongest_plane(q)
+    p2 = basis.T @ p @ basis
+    # Stretch can send a vector outside Q's invariant plane. The displayed
+    # stages are exact orthogonal projections, not a claim of a closed 2D map.
+    pb = p @ basis
+    leakage = float((pb - basis @ p2).square().sum() / pb.square().sum().clamp(min=1e-30))
+    angle = float(torch.atan2(q2[1, 0], q2[0, 0]).rad2deg())
+    return dict(layer=layer, head=head, angle_degrees=angle, q2=q2, p2=p2,
+                stretch_out_of_plane_energy_fraction=leakage)
+
+
+def setup_plane(ax, radius=1.3):
+    ax.set_aspect('equal')
+    ax.set_xlim(-radius, radius)
+    ax.set_ylim(-radius, radius)
+    ax.axhline(0, color='.88', lw=.8, zorder=0)
+    ax.axvline(0, color='.88', lw=.8, zorder=0)
+    ax.set_xlabel('Plane coordinate 1')
+    ax.set_ylabel('Plane coordinate 2')
+
+
+def save_figure(fig, out, stem):
+    for ext in ('png', 'pdf'):
+        fig.savefig(out / f'{stem}.{ext}', dpi=200, bbox_inches='tight')
+    print(f'wrote {out}/{stem}.png and .pdf')
 
 
 def main():
@@ -111,6 +172,10 @@ def main():
     ap.add_argument('--ckpt', action='append', required=True,
                     metavar='NAME=PATH', help='repeatable; NAME labels the series')
     ap.add_argument('--out-dir', required=True)
+    ap.add_argument('--activations', action='append', required=True, metavar='NAME=FILE',
+                    help='real captured readouts .npz; repeat once per --ckpt run')
+    ap.add_argument('--activation-layer', type=int,
+                    help='layer shown; default picks strongest selected captured layer per run')
     a = ap.parse_args()
 
     g = torch.Generator().manual_seed(SEED)
@@ -122,93 +187,145 @@ def main():
         per_layer = {}
         for layer, chi in load(path).items():
             null = matched_null(chi, g)
-            per_layer[layer] = dict(
-                eig=torch.linalg.eigvals(orthogonal_factor(chi)),
-                ang=angles(chi), ang_null=angles(null),
-                probe=probe_angles(chi, g), probe_null=probe_angles(null, g))
+            per_layer[layer] = dict(chi=chi, ang=angles(chi), ang_null=angles(null))
         runs[name] = per_layer
         print(f'{name}: layers {sorted(per_layer)}')
 
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     layers = sorted({l for v in runs.values() for l in v})
     colour = dict(zip(layers, plt.cm.viridis(np.linspace(0.1, 0.85, len(layers)))))
-    style = dict(zip(runs, ['-', '--', ':']))
-    marker = dict(zip(runs, ['o', '^', 's']))
+    activation_files = {}
+    activation_metadata = {}
+    for spec in a.activations:
+        if '=' not in spec:
+            raise SystemExit(f'--activations wants NAME=FILE, got {spec}')
+        name, filename = spec.split('=', 1)
+        if name in activation_files:
+            raise SystemExit(f'duplicate activation data for {name}')
+        activation_files[name] = np.load(filename)
+        activation_metadata[name] = json.loads(Path(filename).with_suffix('.json').read_text())
+    if set(activation_files) != set(runs):
+        raise SystemExit(f'Activation names {sorted(activation_files)} must match checkpoint names {sorted(runs)}')
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
+    actual = {}
+    for name, data in activation_files.items():
+        available = sorted(int(k.split('_', 1)[1]) for k in data.files if k.startswith('readout_'))
+        if not available:
+            raise ValueError(f'{name}: no captured readout activations')
+        layer = a.activation_layer if a.activation_layer is not None else max(
+            available, key=lambda l: float(runs[name][l]['ang'][:, 0].mean()))
+        if layer not in available or layer not in runs[name]:
+            raise ValueError(f'{name}: layer {layer} has no captured activation/map')
+        meta = activation_metadata[name]['layers'][str(layer)]
+        x = data[f'readout_{layer}']
+        p = data[f'stretched_{layer}']
+        y = data[f'aligned_{layer}']
+        basis = data[f'basis_{layer}']
+        pos = data[f'token_position_{layer}']
+        pos_fraction = data[f'position_fraction_{layer}']
+        ids = data[f'example_id_{layer}']
+        coords = [v @ basis for v in (x, p, y)]
+        actual[name] = dict(layer=layer, head=meta['head'], readout=x, stretched=p,
+            aligned=y, positions=pos, position_fractions=pos_fraction, ids=ids,
+            coordinates=coords, metadata=meta,
+            map_angle=meta['rotation_angle_degrees'])
+        print(f'{name}: plotting {len(x)} actual readouts from L{layer}, head {meta["head"]}; '
+              f'median plane energy {meta["median_readout_energy_in_plane"]:.1%}')
 
-    # (a) the literal picture: where Q sends the unit circle. One run, so the
-    # panel reads as a figure rather than a pile; the rest is in (b) and (c).
-    ax = axes[0]
-    first = next(iter(runs))
-    t = np.linspace(0, 2 * np.pi, 400)
-    ax.plot(np.cos(t), np.sin(t), color='0.75', lw=0.8, zorder=0)
-    for layer, st in runs[first].items():
-        lam = st['eig'].flatten().numpy()
-        ax.scatter(lam.real, lam.imag, s=3, color=colour[layer], alpha=0.25,
-                   edgecolors='none', label=f'L{layer}')
-    ax.scatter([1], [0], s=30, marker='x', color='k', zorder=3, label='identity')
-    ax.set_aspect('equal'); ax.set_xlim(-1.15, 1.15); ax.set_ylim(-1.15, 1.15)
-    ax.set_xlabel(r'Re $\lambda(Q)$'); ax.set_ylabel(r'Im $\lambda(Q)$')
-    ax.set_title(f'(a) rotation planes of $Q$ ({first})')
-    leg = ax.legend(fontsize=7, loc='upper left', framealpha=0.85)
-    for h in leg.legend_handles:
-        h.set_alpha(1.0)
+    plt.rcParams.update({'font.size': 10, 'axes.spines.top': False,
+                         'axes.spines.right': False, 'pdf.fonttype': 42})
+    fig, axes = plt.subplots(len(runs), 2, figsize=(13, 4.8 * len(runs)), squeeze=False,
+                             gridspec_kw={'width_ratios': [1, 1.5]})
+    for row, (name, per_layer) in enumerate(runs.items()):
+        act = actual[name]
+        ax = axes[row, 0]
+        original, mapped = act['coordinates'][0], act['coordinates'][2]
+        extent = max(.2, float(np.quantile(np.abs(np.concatenate((original, mapped))), .995)) * 1.2)
+        setup_plane(ax, extent)
+        ax.scatter(original[:, 0], original[:, 1], s=15, color='.55', alpha=.45,
+                   label='Actual readout x', zorder=2)
+        ax.scatter(mapped[:, 0], mapped[:, 1], s=18, color='#147d92', alpha=.72,
+                   label='Actual reader output $\\chi x$', zorder=3)
+        idx = np.linspace(0, len(original) - 1, min(10, len(original))).round().astype(int)
+        for i in idx:
+            ax.annotate('', xy=mapped[i], xytext=original[i],
+                        arrowprops=dict(arrowstyle='->', color='#d97732', alpha=.45, lw=1))
+        ax.set_title(f"{name}: actual held-out readouts, L{act['layer']} head {act['head']}\n"
+                     f"Median readout energy in plane: {act['metadata']['median_readout_energy_in_plane']:.1%}")
+        ax.legend(fontsize=8, loc='best')
 
-    # (b) the control. Learned angle profile against the matched null: if the
-    # learned curve is steeper the rotation is concentrated in a few planes,
-    # if it lies on the null the "rotation" is an artefact of displacement.
-    ax = axes[1]
-    for name, per_layer in runs.items():
+        ax = axes[row, 1]
         for layer, st in per_layer.items():
-            x = np.arange(1, st['ang'].shape[1] + 1)
-            ax.plot(x, st['ang'].mean(0).numpy(), style[name], color=colour[layer], lw=1.4,
-                    label=f'{name} L{layer}' if len(runs) > 1 else f'L{layer}')
-            ax.plot(x, st['ang_null'].mean(0).numpy(), style[name], color=colour[layer],
-                    lw=1.0, alpha=0.35)
-    ax.set_xlabel('eigen-direction (sorted; conjugates twice)')
-    ax.set_ylabel(r'rotation angle $|\arg\lambda|$ (deg)')
-    ax.set_title('(b) angle profile vs matched null (faint)')
-    ax.legend(fontsize=7, ncol=2)
+            ang, null = st['ang'][:, ::2], st['ang_null'][:, ::2]
+            xaxis = np.arange(1, ang.shape[1] + 1)
+            ax.plot(xaxis, ang.mean(0).numpy(), color=colour[layer], lw=2, label=f'L{layer}')
+            ax.plot(xaxis, null.mean(0).numpy(), '--', color=colour[layer], lw=1.2, alpha=.4)
+        ax.set_xlabel('Distinct rotation plane (ranked within each head)')
+        ax.set_ylabel('Mean rotation angle across heads (degrees)')
+        ax.set_title(f'{name}: checkpoint geometry vs displacement-matched null')
+        ax.grid(axis='y', alpha=.15)
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(plt.Line2D([], [], ls='--', color='.5', alpha=.5))
+        ax.legend(handles, labels + ['Matched Gaussian null'], fontsize=9)
+    fig.suptitle('Reader maps acting on held-out model activations', fontsize=17, y=1.01)
+    fig.text(.5, .01, 'Points are real pre-alignment readouts and the corresponding module outputs, '
+             'projected onto the selected invariant plane of Q.',
+             ha='center', fontsize=9, color='.35')
+    fig.tight_layout(rect=(0, .045, 1, .98), h_pad=2.5)
+    save_figure(fig, out, 'reader_rotation')
+    plt.close(fig)
 
-    # (c) what a readout actually experiences, learned vs null, per layer.
-    ax = axes[2]
-    pos, ticks = [], []
-    for i, layer in enumerate(layers):
-        for j, (name, per_layer) in enumerate(runs.items()):
-            if layer not in per_layer:
-                continue
-            st = per_layer[layer]
-            x = i + (j - (len(runs) - 1) / 2) * 0.26
-            med = st['probe'].median().item()
-            lo, hi = np.percentile(st['probe'].numpy(), [25, 75])
-            ax.plot([x, x], [lo, hi], color=colour[layer], lw=2.4, solid_capstyle='butt')
-            ax.scatter([x], [med], s=34, marker=marker[name], color=colour[layer],
-                       edgecolors='k', linewidths=0.5, zorder=3)
-            ax.scatter([x], [st['probe_null'].median().item()], s=22, marker='_',
-                       color='0.35', zorder=4)
-        pos.append(i); ticks.append(f'L{layer}')
-    ax.set_xticks(pos); ax.set_xticklabels(ticks)
-    ax.set_xlabel('follower layer (equal spacing; the gap L1->L29 is not to scale)')
-    ax.set_ylabel(r'$\angle(v, \chi v)$, isotropic probes (deg)')
-    ax.set_title('(c) angle a typical readout is turned through')
-    handles = [plt.Line2D([], [], ls='', marker=marker[n], color='0.3', label=n) for n in runs]
-    handles.append(plt.Line2D([], [], ls='', marker='_', color='0.35', label='matched null'))
-    ax.legend(handles=handles, fontsize=7, loc='upper left')
+    fig, axes = plt.subplots(len(runs), 3, figsize=(13, 4.7 * len(runs)), squeeze=False)
+    cmap = plt.get_cmap('viridis')
+    for row, (name, act) in enumerate(actual.items()):
+        coords = act['coordinates']
+        colors = cmap(act['position_fractions'])
+        extent = max(.2, float(np.quantile(np.abs(np.concatenate(coords)), .995)) * 1.2)
+        picks = np.linspace(0, len(coords[0]) - 1, min(8, len(coords[0]))).round().astype(int)
+        for col, (ax, points, title) in enumerate(zip(axes[row], coords,
+                ['Captured readout x', 'Stretch P x', 'Actual reader output $\\chi x$'])):
+            setup_plane(ax, extent)
+            ax.scatter(points[:, 0], points[:, 1], c=colors, s=18, alpha=.7, linewidths=0)
+            for i in picks:
+                if col == 0:
+                    continue
+                before = coords[col - 1][i]
+                ax.annotate('', xy=points[i], xytext=before,
+                            arrowprops=dict(arrowstyle='->', color='#d97732', alpha=.4, lw=1))
+            ax.set_title(title)
+        axes[row, 0].set_ylabel(f"{name} · L{act['layer']} head {act['head']}\nPlane coordinate 2")
+        axes[row, 1].set_xlabel(f"Token position color: early → late\n"
+            f"Median activation energy in plane: {act['metadata']['median_readout_energy_in_plane']:.1%}")
+    fig.suptitle('Original → stretch → rotate on real activations', fontsize=17, y=1.01)
+    fig.text(.5, .01, 'Each dot is a captured readout from a held-out prompt. '
+             'All panels show projections onto the same selected Q-plane; '
+             'the reader output is captured directly from the model.',
+             ha='center', fontsize=9, color='.35')
+    fig.tight_layout(rect=(0, .045, 1, .98), h_pad=2.5)
+    save_figure(fig, out, 'reader_transform_stages')
+    plt.close(fig)
+    metadata = dict(actual_activations=True, synthetic_vectors=False,
+        activation_runs={name: activation_metadata[name] for name in activation_metadata},
+        selected_layers={name: act['layer'] for name, act in actual.items()},
+        interpretation='Projection onto the strongest invariant plane of Q; '
+                       'captured full reader outputs are used in the final stage.')
+    (out / 'reader_activation_figure.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
-    fig.tight_layout()
-    for ext in ('png', 'pdf'):
-        fig.savefig(out / f'reader_rotation.{ext}', dpi=200, bbox_inches='tight')
-    print(f'wrote {out}/reader_rotation.png and .pdf')
-
-    print(f'\n{"run":>10} {"layer":>6} {"median probe angle":>20} {"null":>8} '
-          f'{"top-8 planes":>14} {"null":>8} {"eff planes":>11} {"null":>7} {"ratio":>6}')
+    print(f'\n{"run":>10} {"layer":>6} {"median activation turn":>24} {"plane energy":>14} {"top-8":>9} {"null":>8} {"effective":>10} {"null":>7} {"ratio":>6}')
     for name, per_layer in runs.items():
         for layer, st in per_layer.items():
             n, n0 = planes(st['ang']), planes(st['ang_null'])
-            print(f'{name:>10} {layer:>6} {st["probe"].median():>19.2f}deg '
-                  f'{st["probe_null"].median():>7.2f} '
-                  f'{st["ang"][:, :8].mean():>13.2f}deg {st["ang_null"][:, :8].mean():>7.2f} '
+            if layer == actual[name]['layer']:
+                x = actual[name]['readout']
+                y = actual[name]['aligned']
+                cosine = (x * y).sum(1) / (x.norm(dim=1) * y.norm(dim=1)).clip(min=1e-30)
+                turn = float(torch.acos(torch.from_numpy(cosine).clamp(-1, 1)).rad2deg().median())
+                energy = actual[name]['metadata']['median_readout_energy_in_plane']
+            else:
+                turn, energy = float('nan'), float('nan')
+            print(f'{name:>10} {layer:>6} {turn:>22.2f}deg {energy:>13.1%} '
+                  f'{st["ang"][:, ::2][:, :8].mean():>8.2f} '
+                  f'{st["ang_null"][:, ::2][:, :8].mean():>7.2f} '
                   f'{n:>10.1f} {n0:>7.1f} {n / n0:>6.2f}')
     print(f'{"":>10} eff planes counts distinct planes, out of d/2')
 

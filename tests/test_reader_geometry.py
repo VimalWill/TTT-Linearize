@@ -4,9 +4,46 @@ from types import SimpleNamespace
 import torch
 
 from analyze_reader_maps import apply_reader_component, polar_factors
+from plot_reader_rotation import angles, planes, select_example, strongest_plane
 
 
 class ReaderGeometryTests(unittest.TestCase):
+    def test_invariant_plane_and_projected_stages_with_leakage(self):
+        # Embed a 60-degree plane in a rotated four-dimensional coordinate frame.
+        q = torch.eye(4, dtype=torch.float64)
+        q[:2, :2] = torch.tensor([[.5, -3 ** .5 / 2], [3 ** .5 / 2, .5]])
+        q, _, _ = polar_factors(q)  # remove construction's float32 rounding
+        frame, _ = torch.linalg.qr(torch.randn(4, 4, dtype=torch.float64,
+                                  generator=torch.Generator().manual_seed(42)))
+        q = frame @ q @ frame.T
+        basis, reduced = strongest_plane(q)
+        torch.testing.assert_close(basis.T @ basis, torch.eye(2, dtype=torch.float64))
+        torch.testing.assert_close(q @ basis, basis @ reduced)
+        self.assertAlmostEqual(torch.atan2(reduced[1, 0], reduced[0, 0]).rad2deg().item(),
+                               60., places=5)
+        p = torch.diag(torch.tensor([.5, 1., 2., 3.], dtype=torch.float64))
+        projected = basis.T @ p @ basis
+        torch.testing.assert_close(basis.T @ q @ p @ basis, reduced @ projected)
+        self.assertGreater((p @ basis - basis @ projected).norm().item(), .01)
+
+    def test_identity_and_half_turn_planes(self):
+        for q in (torch.eye(4, dtype=torch.float64),
+                  torch.diag(torch.tensor([-1., -1., 1., 1.], dtype=torch.float64))):
+            basis, reduced = strongest_plane(q)
+            torch.testing.assert_close(q @ basis, basis @ reduced)
+        self.assertEqual(planes(angles(torch.eye(4).unsqueeze(0))).item(), 0.)
+        with self.assertRaisesRegex(ValueError, 'reflection'):
+            angles(torch.diag(torch.tensor([-1., 1.])).unsqueeze(0))
+
+    def test_example_selection_and_projection(self):
+        chi = torch.tensor([[[0., -1.], [2., 0.]]], dtype=torch.float64)
+        example = select_example({31: dict(chi=chi, ang=angles(chi))})
+        self.assertEqual((example['layer'], example['head']), (31, 0))
+        self.assertAlmostEqual(example['angle_degrees'], 90.)
+        self.assertAlmostEqual(example['stretch_out_of_plane_energy_fraction'], 0.)
+        with self.assertRaisesRegex(ValueError, 'out of range'):
+            select_example({31: dict(chi=chi, ang=angles(chi))}, head=-1)
+
     def test_recovers_noncommuting_rotation_and_stretch(self):
         q = torch.tensor([[0., -1.], [1., 0.]], dtype=torch.float64)
         p = torch.tensor([[2., .5], [.5, 1.]], dtype=torch.float64)
