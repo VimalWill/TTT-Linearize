@@ -256,9 +256,9 @@ def main():
         circle = np.linspace(0, 2 * np.pi, 400)
         ax.plot(np.cos(circle), np.sin(circle), color='.8', lw=.9, zorder=1)
         ax.scatter(original[:, 0], original[:, 1], s=15, color='.55', alpha=.45,
-                   label='Actual readout x', zorder=2)
+                   label='Readout, before the map', zorder=2)
         ax.scatter(mapped[:, 0], mapped[:, 1], s=18, color='#147d92', alpha=.72,
-                   label='Actual reader output $\\chi x$', zorder=3)
+                   label='After the reader map', zorder=3)
         # Circular mean of each cloud, drawn to the unit circle. The angle the
         # two rays subtend IS the median turn quoted in the title, so the
         # reader can measure the claim off the picture.
@@ -270,9 +270,9 @@ def main():
             ax.annotate('', xy=direction, xytext=(0, 0),
                         arrowprops=dict(arrowstyle='-|>', color=shade, lw=2, alpha=.9))
         turn = np.degrees(np.arctan2(np.cross(*rays), np.dot(*rays)))
-        ax.set_title(f"{name}: actual held-out readouts, L{act['layer']} head {act['head']}\n"
-                     f"{act['metadata']['median_readout_energy_in_plane']:.1%} of readout energy "
-                     f"in plane; mean direction turns {abs(turn):.0f}$\\degree$")
+        ax.set_title(f"{name}, layer {act['layer']} head {act['head']}\n"
+                     f"{act['metadata']['median_readout_energy_in_plane']:.0%} of readout energy "
+                     f"in this plane; mean direction turns {abs(turn):.0f} degrees")
         ax.set_xlabel('Plane coordinate 1 (unit-normalized)')
         ax.set_ylabel('Plane coordinate 2 (unit-normalized)')
         ax.legend(fontsize=8, loc='upper left')
@@ -285,14 +285,14 @@ def main():
             ax.plot(xaxis, null.mean(0).numpy(), '--', color=colour[layer], lw=1.2, alpha=.4)
         ax.set_xlabel('Distinct rotation plane (ranked within each head)')
         ax.set_ylabel('Mean rotation angle across heads (degrees)')
-        ax.set_title(f'{name}: checkpoint geometry vs displacement-matched null')
+        ax.set_title(f'{name}: learned turn per plane, against chance (dashed)')
         ax.grid(axis='y', alpha=.15)
         handles, labels = ax.get_legend_handles_labels()
         handles.append(plt.Line2D([], [], ls='--', color='.5', alpha=.5))
-        ax.legend(handles, labels + ['Matched Gaussian null'], fontsize=9)
+        ax.legend(handles, labels + ['Chance, same total change'], fontsize=9)
     fig.suptitle('Reader maps acting on held-out model activations', fontsize=17, y=1.01)
-    fig.text(.5, .01, 'Points are real pre-alignment readouts and the corresponding module outputs, '
-             'projected onto the selected invariant plane of Q.',
+    fig.text(.5, .01, 'Each dot is one readout from a held-out document, before and after the '
+             'reader map, shown in the plane the map turns hardest.',
              ha='center', fontsize=9, color='.35')
     fig.tight_layout(rect=(0, .045, 1, .98), h_pad=2.5)
     save_figure(fig, out, 'reader_rotation')
@@ -306,7 +306,7 @@ def main():
         extent = float(np.quantile(np.abs(np.concatenate(coords)), .995)) * 1.25
         picks = np.linspace(0, len(coords[0]) - 1, min(8, len(coords[0]))).round().astype(int)
         for col, (ax, points, title) in enumerate(zip(axes[row], coords,
-                ['Captured readout x', 'Stretch P x', 'Actual reader output $\\chi x$'])):
+                ['Readout, as captured', 'After the stretch', 'After the full reader map'])):
             setup_plane(ax, extent)
             ax.scatter(points[:, 0], points[:, 1], c=colors, s=18, alpha=.7, linewidths=0)
             for i in picks:
@@ -319,10 +319,9 @@ def main():
         axes[row, 0].set_ylabel(f"{name} · L{act['layer']} head {act['head']}\nPlane coordinate 2")
         axes[row, 1].set_xlabel(f"Token position color: early → late\n"
             f"Median activation energy in plane: {act['metadata']['median_readout_energy_in_plane']:.1%}")
-    fig.suptitle('Original → stretch → rotate on real activations', fontsize=17, y=1.01)
-    fig.text(.5, .01, 'Each dot is a captured readout from a held-out prompt. '
-             'All panels show projections onto the same selected Q-plane; '
-             'the reader output is captured directly from the model.',
+    fig.suptitle('How the reader map moves a real readout', fontsize=17, y=1.01)
+    fig.text(.5, .01, 'Each dot is one readout from a held-out document. All three panels use '
+             'the same plane, and the last one is taken straight from the model.',
              ha='center', fontsize=9, color='.35')
     fig.tight_layout(rect=(0, .045, 1, .98), h_pad=2.5)
     save_figure(fig, out, 'reader_transform_stages')
