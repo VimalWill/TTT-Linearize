@@ -225,10 +225,22 @@ def main():
         pos_fraction = data[f'position_fraction_{layer}']
         ids = data[f'example_id_{layer}']
         coords = [v @ basis for v in (x, p, y)]
+        # Raw coordinates are ~0.03 long, so a scatter of them is a smudge and
+        # the rotation reads as a shear inside it. Two rescalings fix that
+        # without touching the geometry:
+        #   unit  -- each vector by its OWN norm, so radius is the square root
+        #            of that vector's plane energy and the only thing left to
+        #            see is the angle. This is the rotation panel.
+        #   staged-- all three stages by the ORIGINAL norm, so the stretch
+        #            stays visible as a change in radius. This is the stages
+        #            figure, where losing the stretch would defeat the point.
+        norms = [np.linalg.norm(v, axis=1, keepdims=True).clip(1e-30) for v in (x, p, y)]
+        unit = [(v / n) @ basis for v, n in zip((x, p, y), norms)]
+        staged = [(v / norms[0]) @ basis for v in (x, p, y)]
         actual[name] = dict(layer=layer, head=meta['head'], readout=x, stretched=p,
             aligned=y, positions=pos, position_fractions=pos_fraction, ids=ids,
-            coordinates=coords, metadata=meta,
-            map_angle=meta['rotation_angle_degrees'])
+            coordinates=coords, unit_coordinates=unit, staged_coordinates=staged,
+            metadata=meta, map_angle=meta['rotation_angle_degrees'])
         print(f'{name}: plotting {len(x)} actual readouts from L{layer}, head {meta["head"]}; '
               f'median plane energy {meta["median_readout_energy_in_plane"]:.1%}')
 
@@ -239,20 +251,31 @@ def main():
     for row, (name, per_layer) in enumerate(runs.items()):
         act = actual[name]
         ax = axes[row, 0]
-        original, mapped = act['coordinates'][0], act['coordinates'][2]
-        extent = max(.2, float(np.quantile(np.abs(np.concatenate((original, mapped))), .995)) * 1.2)
-        setup_plane(ax, extent)
+        original, mapped = act['unit_coordinates'][0], act['unit_coordinates'][2]
+        setup_plane(ax, 1.15)
+        circle = np.linspace(0, 2 * np.pi, 400)
+        ax.plot(np.cos(circle), np.sin(circle), color='.8', lw=.9, zorder=1)
         ax.scatter(original[:, 0], original[:, 1], s=15, color='.55', alpha=.45,
                    label='Actual readout x', zorder=2)
         ax.scatter(mapped[:, 0], mapped[:, 1], s=18, color='#147d92', alpha=.72,
                    label='Actual reader output $\\chi x$', zorder=3)
-        idx = np.linspace(0, len(original) - 1, min(10, len(original))).round().astype(int)
-        for i in idx:
-            ax.annotate('', xy=mapped[i], xytext=original[i],
-                        arrowprops=dict(arrowstyle='->', color='#d97732', alpha=.45, lw=1))
+        # Circular mean of each cloud, drawn to the unit circle. The angle the
+        # two rays subtend IS the median turn quoted in the title, so the
+        # reader can measure the claim off the picture.
+        rays = []
+        for points, shade in ((original, '.35'), (mapped, '#0d5c6b')):
+            direction = (points / np.linalg.norm(points, axis=1, keepdims=True).clip(1e-30)).mean(0)
+            direction = direction / max(np.linalg.norm(direction), 1e-30)
+            rays.append(direction)
+            ax.annotate('', xy=direction, xytext=(0, 0),
+                        arrowprops=dict(arrowstyle='-|>', color=shade, lw=2, alpha=.9))
+        turn = np.degrees(np.arctan2(np.cross(*rays), np.dot(*rays)))
         ax.set_title(f"{name}: actual held-out readouts, L{act['layer']} head {act['head']}\n"
-                     f"Median readout energy in plane: {act['metadata']['median_readout_energy_in_plane']:.1%}")
-        ax.legend(fontsize=8, loc='best')
+                     f"{act['metadata']['median_readout_energy_in_plane']:.1%} of readout energy "
+                     f"in plane; mean direction turns {abs(turn):.0f}$\\degree$")
+        ax.set_xlabel('Plane coordinate 1 (unit-normalized)')
+        ax.set_ylabel('Plane coordinate 2 (unit-normalized)')
+        ax.legend(fontsize=8, loc='upper left')
 
         ax = axes[row, 1]
         for layer, st in per_layer.items():
@@ -278,9 +301,9 @@ def main():
     fig, axes = plt.subplots(len(runs), 3, figsize=(13, 4.7 * len(runs)), squeeze=False)
     cmap = plt.get_cmap('viridis')
     for row, (name, act) in enumerate(actual.items()):
-        coords = act['coordinates']
+        coords = act['staged_coordinates']
         colors = cmap(act['position_fractions'])
-        extent = max(.2, float(np.quantile(np.abs(np.concatenate(coords)), .995)) * 1.2)
+        extent = float(np.quantile(np.abs(np.concatenate(coords)), .995)) * 1.25
         picks = np.linspace(0, len(coords[0]) - 1, min(8, len(coords[0]))).round().astype(int)
         for col, (ax, points, title) in enumerate(zip(axes[row], coords,
                 ['Captured readout x', 'Stretch P x', 'Actual reader output $\\chi x$'])):
