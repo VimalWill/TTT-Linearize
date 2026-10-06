@@ -58,13 +58,22 @@ def main():
     parser.add_argument('--min-distance', type=int, default=768)
     parser.add_argument('--max-new-tokens', type=int, default=64)
     args = parser.parse_args()
+    for name in ('data_dir', 'ckpt', 'adapter', 'cfg', 'base', 'out_dir'):
+        if not getattr(args, name).strip():
+            hint = (' Set LONG_CONTEXT_DATA to the prepared-data directory used by training.'
+                    if name == 'data_dir' else '')
+            parser.error(f'--{name.replace("_", "-")} is empty; check your shell variables.' + hint)
+    data = Path(args.data_dir).expanduser()
+    for filename in ('validation.jsonl', 'manifest.json'):
+        if not (data / filename).is_file():
+            parser.error(f'Missing {data / filename}; --data-dir must be the prepared-data '
+                         'directory used by training, containing validation.jsonl and manifest.json.')
     if min(args.lengths + [args.per_cell, args.min_distance, args.max_new_tokens]) < 1:
         parser.error('Lengths, counts, and distances must be positive')
     args.lengths = sorted(set(args.lengths))
     output = Path(args.out_dir)
     if output.exists() and any(output.iterdir()):
         parser.error('--out-dir must be new or empty')
-    data = Path(args.data_dir)
     rows = [json.loads(line) for line in (data / 'validation.jsonl').read_text().splitlines() if line.strip()]
     selected = select_rows(rows, args.lengths, args.per_cell, args.min_distance)
     if any(row.get('split') != 'validation' for row in selected):

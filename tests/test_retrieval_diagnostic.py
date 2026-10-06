@@ -1,5 +1,9 @@
 """CPU-only checks that the diagnostic preserves targets and excludes near needles."""
 import unittest
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
 from diagnose_retrieval import select_rows, short_control
 
@@ -14,6 +18,20 @@ def example(task='single_number', distance=1000):
 
 
 class RetrievalDiagnosticTests(unittest.TestCase):
+    def test_invalid_data_paths_fail_clearly_before_model_imports(self):
+        script = Path(__file__).resolve().parents[1] / 'diagnose_retrieval.py'
+        with tempfile.TemporaryDirectory() as directory:
+            for data, expected in (('', '--data-dir is empty'),
+                                   (directory, 'validation.jsonl')):
+                result = subprocess.run([sys.executable, str(script), '--data-dir', data,
+                                         '--ckpt', 'source', '--adapter', 'last_ckpt',
+                                         '--out-dir', str(Path(directory) / 'output')],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertFalse((Path(directory) / 'output').exists())
+
     def test_short_controls_preserve_fact_and_question_for_both_tasks(self):
         for task in ('single_number', 'single_uuid'):
             row = example(task)
