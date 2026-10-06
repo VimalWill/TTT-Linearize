@@ -30,7 +30,9 @@ export TTT_ADAPTER="${ANCHOR_F_ADAPTER:-}"
 export TTT_CKPT_DIR="$LONG_CONTEXT_OUTPUT/anchor_f"
 "$PYTHON_BIN" run.py --cfg Configs/ttt_ar_llama_long_context_anchor_f_reduced.yml \
   2>&1 | tee "$LONG_CONTEXT_OUTPUT/train_anchor_f.log"
-F_AFTER="$LONG_CONTEXT_OUTPUT/anchor_f/ttt_ar_llama_long_context_anchor_f_reduced/best_ckpt"
+# Exact-match ties can leave best_ckpt at step zero. Evaluate the completed
+# token-budget continuation, saved before the trainer restores its best model.
+F_AFTER="$LONG_CONTEXT_OUTPUT/anchor_f/ttt_ar_llama_long_context_anchor_f_reduced/last_ckpt"
 test -f "$F_AFTER/ttt_params.pt"
 "$PYTHON_BIN" prepare_long_context.py --niah-from "$LONG_CONTEXT_DATA" \
   --out-dir "$LONG_CONTEXT_OUTPUT/niah_data" --tokenizer "$BASE_TOKENIZER" \

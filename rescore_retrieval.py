@@ -34,6 +34,11 @@ def items(text):
     return {piece for piece in normalize(text).split(',') if piece}
 
 
+def mean_or_nan(values):
+    """An empty diagnostic population is not applicable, not a zero score."""
+    return sum(values) / len(values) if values else float('nan')
+
+
 def closest(target, prediction):
     """Best similarity between an answer item and any token in the output.
 
@@ -112,19 +117,20 @@ def main():
             missed = want - got
             near.append(sum(closest(w, r['prediction']) for w in missed) / len(missed)
                         if missed else float('nan'))
-        m = lambda v: sum(v) / len(v)
+        m = mean_or_nan
         mn = [v for v in near if v == v]
         print(f'{task:>14} {length:>6} {len(group):>3} {m(exact):>7.3f} {m(seteq):>7.3f} '
               f'{m(recall):>12.3f} {m(bad):>11.0%} {(m(mn) if mn else float("nan")):>10.2f}')
         for key, value in (('exact', exact), ('set', seteq), ('recall', recall),
                            ('bad', bad), ('near', mn)):
             totals[key].extend(value)
-    m = lambda v: sum(v) / len(v)
+    m = mean_or_nan
     print(f'\n{"OVERALL":>14} {"":>6} {len(totals["exact"]):>3} {m(totals["exact"]):>7.3f} '
           f'{m(totals["set"]):>7.3f} {m(totals["recall"]):>12.3f} {m(totals["bad"]):>11.0%} '
           f'{m(totals["near"]):>10.2f}')
-    print('\n  near miss near 1.0: the item was retrieved and corrupted, so the memory '
-          'holds it\n  near miss near 0.3: unrelated text, so the memory does not')
+    print('\n  near miss measures string similarity for missed items; nan means no '
+          'missed items.\n  Similarity alone does not establish whether the memory '
+          'retained the answer.')
 
     if a.show:
         print('\nnear misses: the answer was partly recovered but scored zero exact')
