@@ -57,7 +57,13 @@ train:
   # apart from "not learned yet" -- which is exactly the question the run
   # exists to answer.
   validation_per_cell: 16
-  validation_max_new_tokens: 256
+  # 128, not 256. Generation stops on EOS, so this cap only binds on collapsed
+  # decodes -- and those ran the full budget in the previous run. At 16 per
+  # cell that is 224 generations per eval; measured decode is ~34 ms/step, so
+  # 256 costs ~33 min per eval and roughly 5 of the run's 10 hours. The
+  # longest answer is an aggregation list of ~8 labels, about 80 tokens, so
+  # 128 leaves headroom while halving the worst case.
+  validation_max_new_tokens: 128
   # NOT retrieval_accuracy. That scorer demands the generation equal the answer
   # exactly after whitespace folding, over 256 greedy tokens with no stop, so
   # it stayed 0.000 for the whole previous run. best_val_metric starts at -inf
