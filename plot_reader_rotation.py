@@ -316,10 +316,12 @@ def main():
         for layer, st in per_layer.items():
             n, n0 = planes(st['ang']), planes(st['ang_null'])
             if layer == actual[name]['layer']:
-                x = actual[name]['readout']
-                y = actual[name]['aligned']
-                cosine = (x * y).sum(1) / (x.norm(dim=1) * y.norm(dim=1)).clip(min=1e-30)
-                turn = float(torch.acos(torch.from_numpy(cosine).clamp(-1, 1)).rad2deg().median())
+                # np.load gives ndarrays, which have no .norm; go through torch
+                # so the turn is computed the same way as the probe angles.
+                x = torch.from_numpy(actual[name]['readout']).double()
+                y = torch.from_numpy(actual[name]['aligned']).double()
+                cosine = (x * y).sum(1) / (x.norm(dim=1) * y.norm(dim=1)).clamp(min=1e-30)
+                turn = float(cosine.clamp(-1, 1).arccos().rad2deg().median())
                 energy = actual[name]['metadata']['median_readout_energy_in_plane']
             else:
                 turn, energy = float('nan'), float('nan')
