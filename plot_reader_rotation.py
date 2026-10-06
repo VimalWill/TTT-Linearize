@@ -237,10 +237,25 @@ def main():
         norms = [np.linalg.norm(v, axis=1, keepdims=True).clip(1e-30) for v in (x, p, y)]
         unit = [(v / n) @ basis for v, n in zip((x, p, y), norms)]
         staged = [(v / norms[0]) @ basis for v in (x, p, y)]
+        # The scatter shows one plane, so one layer, but the capture saves
+        # every reader. Summarise all of them -- the other layers' activation
+        # columns were reading nan purely because nothing looked at them.
+        turns = {}
+        for other in available:
+            if other not in runs[name]:
+                continue
+            xo = torch.from_numpy(data[f'readout_{other}']).double()
+            yo = torch.from_numpy(data[f'aligned_{other}']).double()
+            cos = (xo * yo).sum(1) / (xo.norm(dim=1) * yo.norm(dim=1)).clamp(min=1e-30)
+            turns[other] = dict(
+                turn=float(cos.clamp(-1, 1).arccos().rad2deg().median()),
+                energy=activation_metadata[name]['layers'][str(other)][
+                    'median_readout_energy_in_plane'],
+                head=activation_metadata[name]['layers'][str(other)]['head'])
         actual[name] = dict(layer=layer, head=meta['head'], readout=x, stretched=p,
             aligned=y, positions=pos, position_fractions=pos_fraction, ids=ids,
             coordinates=coords, unit_coordinates=unit, staged_coordinates=staged,
-            metadata=meta, map_angle=meta['rotation_angle_degrees'])
+            metadata=meta, map_angle=meta['rotation_angle_degrees'], turns=turns)
         print(f'{name}: plotting {len(x)} actual readouts from L{layer}, head {meta["head"]}; '
               f'median plane energy {meta["median_readout_energy_in_plane"]:.1%}')
 
@@ -333,21 +348,16 @@ def main():
                        'captured full reader outputs are used in the final stage.')
     (out / 'reader_activation_figure.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
-    print(f'\n{"run":>10} {"layer":>6} {"median activation turn":>24} {"plane energy":>14} {"top-8":>9} {"null":>8} {"effective":>10} {"null":>7} {"ratio":>6}')
+    print(f'\n{"run":>10} {"layer":>6} {"head":>5} {"median activation turn":>24} '
+          f'{"plane energy":>14} {"top-8":>9} {"null":>8} {"effective":>10} {"null":>7} {"ratio":>6}')
     for name, per_layer in runs.items():
         for layer, st in per_layer.items():
             n, n0 = planes(st['ang']), planes(st['ang_null'])
-            if layer == actual[name]['layer']:
-                # np.load gives ndarrays, which have no .norm; go through torch
-                # so the turn is computed the same way as the probe angles.
-                x = torch.from_numpy(actual[name]['readout']).double()
-                y = torch.from_numpy(actual[name]['aligned']).double()
-                cosine = (x * y).sum(1) / (x.norm(dim=1) * y.norm(dim=1)).clamp(min=1e-30)
-                turn = float(cosine.clamp(-1, 1).arccos().rad2deg().median())
-                energy = actual[name]['metadata']['median_readout_energy_in_plane']
-            else:
-                turn, energy = float('nan'), float('nan')
-            print(f'{name:>10} {layer:>6} {turn:>22.2f}deg {energy:>13.1%} '
+            captured = actual[name]['turns'].get(layer)
+            turn = captured['turn'] if captured else float('nan')
+            energy = captured['energy'] if captured else float('nan')
+            head = f"{captured['head']:>5}" if captured else '    -'
+            print(f'{name:>10} {layer:>6} {head} {turn:>22.2f}deg {energy:>13.1%} '
                   f'{st["ang"][:, ::2][:, :8].mean():>8.2f} '
                   f'{st["ang_null"][:, ::2][:, :8].mean():>7.2f} '
                   f'{n:>10.1f} {n0:>7.1f} {n / n0:>6.2f}')
