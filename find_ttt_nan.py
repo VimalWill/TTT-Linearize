@@ -31,6 +31,9 @@ def main():
     ap.add_argument('--lengths', type=int, nargs='+',
                     default=[512, 1024, 2048, 3072, 4096, 6144, 8192])
     ap.add_argument('--max-length', type=int, default=8192)
+    ap.add_argument('--window-backend', choices=('sdpa', 'flex'), default='sdpa',
+                    help='the configs train with flex; forcing sdpa here would '
+                         'otherwise leave it unclear which path diverges')
     a = ap.parse_args()
 
     config = OmegaConf.load(a.cfg)
@@ -43,7 +46,8 @@ def main():
     container.pop('data', None)
     config = OmegaConf.create(OmegaConf.to_container(
         OmegaConf.create(container), resolve=True))
-    set_window_backend(True)
+    set_window_backend(a.window_backend == 'sdpa')
+    print(f'window backend: {a.window_backend}')
     model = load_model(a.ckpt, build_model_config(config), a.adapter, strict_ttt=True)
     model.eval()
     mods = ttt_layers(model)
