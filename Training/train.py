@@ -19,6 +19,15 @@ from Training.trainer import DefaultTrainer, FinetuneTrainer
 from Training.utils import get_optimizer_and_scheduler, count_model_params
 
 
+# Datasets whose runs continue from a trained stage-2 checkpoint. They need
+# the trainable parameters promoted to FP32 before the BF16 overlay, an
+# explicit window backend, and a fresh output directory. Keying these on the
+# literal 'long_context' silently skipped all three for any new dataset.
+# The answer-only loss check in trainer.py is deliberately NOT keyed on this:
+# it requires one contiguous supervised suffix, and reactive_passkey
+# supervises every assistant turn.
+CONTINUATION_DATASETS = ('long_context', 'reactive_passkey')
+
 # Parameters belonging to the test-time-training branch. These have no
 # counterpart in the pretrained checkpoint, so unlike the Liger recipe they must
 # actually be trained -- LoRA on q/k/v alone leaves them at their random init.
@@ -87,7 +96,7 @@ def set_trainable_params(model, config):
         return model
     train_ttt = config.model.get('attn_varient', None) == 'ttt' or \
         config.model.get('attn_variant', None) == 'ttt'
-    long_context = config.get('data', {}).get('name') == 'long_context'
+    long_context = config.get('data', {}).get('name') in CONTINUATION_DATASETS
     for name, param in model.named_parameters():
         param.requires_grad = bool(
             'lora_' in name
@@ -140,7 +149,7 @@ def train(config):
     alignment_only = config.train.get('reader_alignment_only', False)
     if alignment_only and stage != 'ttt_ar':
         raise ValueError('The alignment-only study uses autoregressive CE training')
-    if (alignment_only or config.data.get('name') == 'long_context') and \
+    if (alignment_only or config.data.get('name') in CONTINUATION_DATASETS) and \
             os.path.isdir(config.train.output_dir) and os.listdir(config.train.output_dir):
         raise ValueError('Use a fresh output directory for this continuation run')
     trainer = DefaultTrainer if stage.endswith('_at') else FinetuneTrainer
@@ -156,7 +165,7 @@ def train(config):
         device_map=config.model.get('device_map', 'auto'),
     ).to(torch.bfloat16)
 
-    if config.data.get('name') == 'long_context':
+    if config.data.get('name') in CONTINUATION_DATASETS:
         # Promote before the overlay so continuation does not round the saved
         # FP32 TTT parameters through BF16 on their way into the optimizer.
         set_trainable_params(model, config)

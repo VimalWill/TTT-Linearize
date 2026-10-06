@@ -41,7 +41,7 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
         num_ttt_heads=None,       # None -> num_attention_heads (no k/v duplication under GQA)
         ttt_inter_multi=1.0,      # SwiGLU fast-weight hidden expansion
         lact_chunk_size=512,      # tokens per fast-weight update
-        window_size=512,          # sliding-window attention span; must be >= lact_chunk_size
+        window_size=512,          # scalar or one span per layer; each >= lact_chunk_size
         ttt_base_lr=1e-2,         # base inner-loop learning rate
         # 'dot' = LaCT Eq. 7 (Hebbian) with Eq. 8's fixed-norm renorm.
         # 'l2'  = Atlas Eq. 9 regression with Eq. 32's retention gate instead.
@@ -120,6 +120,14 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
         """Also called at model construction after harness config overrides."""
         if not isinstance(self.lact_chunk_size, int) or self.lact_chunk_size < 1:
             raise ValueError('lact_chunk_size must be a positive integer')
+        windows = self.window_size
+        if isinstance(windows, (list, tuple)):
+            if len(windows) != self.num_hidden_layers:
+                raise ValueError('window_size must contain one value per layer')
+        else:
+            windows = [windows]
+        if any(type(w) is not int or w < self.lact_chunk_size for w in windows):
+            raise ValueError('Every window_size must be an integer >= lact_chunk_size')
         groups = self.ttt_share_groups or []
         active = (set(range(self.num_hidden_layers)) if self.ttt_layer_indices is None
                   else set(self.ttt_layer_indices))
@@ -186,3 +194,11 @@ class LigerMistralGLAConfig(MistralConfig, PretrainedConfig):
                     raise ValueError('ttt_inter_multi must match within each shared group')
         if self.ttt_reader_alignment != 'none' and not any(len(g) > 1 for g in groups):
             raise ValueError('Reader alignment requires at least one shared-memory reader')
+
+    def window_size_for_layer(self, layer_idx):
+        """Resolve the same per-layer span for prefill and decode caches."""
+        if isinstance(self.window_size, (list, tuple)):
+            if type(layer_idx) is not int or not 0 <= layer_idx < self.num_hidden_layers:
+                raise ValueError('Per-layer window_size requires a valid layer_idx')
+            return self.window_size[layer_idx]
+        return self.window_size

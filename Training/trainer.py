@@ -663,7 +663,10 @@ class FinetuneTrainer(DefaultTrainer):
                                 **{key: supervised + 1})
             targets = labels[..., -supervised:].contiguous()
         else:
-            outputs = model(**data, output_attentions=False)
+            # Multi-turn answer masks need full logits, but FP32 trainable
+            # parameters still need autocast with the BF16 backbone.
+            with model_autocast(model):
+                outputs = model(**data, output_attentions=False, use_cache=False)
             targets = labels[..., 1:].contiguous()
         outputs = outputs.get('logits')[..., :-1, :].contiguous()
         # Flatten and compute cross-entropy loss

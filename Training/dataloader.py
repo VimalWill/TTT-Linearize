@@ -61,6 +61,9 @@ def load_data(config):
     ignore_kwargs = ['concat_data', 'chunk_size', 'pose_kwargs']
     data_path = config.data.path
     data_name = config.data.get("name", "alpaca_cleand")
+    if data_name == 'reactive_passkey':
+        from Training.reactive_passkey import load_reactive_data
+        return load_reactive_data(config, tokenizer)
     if data_name == 'long_context':
         from Training.long_context import load_context_data
         return load_context_data(config, tokenizer)

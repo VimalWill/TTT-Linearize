@@ -237,7 +237,7 @@ class LinearTTTAttention(nn.Module):
             )
 
         self.lact_chunk_size = getattr(config, 'lact_chunk_size', 512)
-        self.window_size = getattr(config, 'window_size', self.lact_chunk_size)
+        self.window_size = config.window_size_for_layer(layer_idx)
         if self.window_size < self.lact_chunk_size:
             raise ValueError(
                 f'window_size ({self.window_size}) must be >= lact_chunk_size ({self.lact_chunk_size}); '
