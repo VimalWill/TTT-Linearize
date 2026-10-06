@@ -1,5 +1,6 @@
-# Anchor-I passkey: 3 TTT-hybrid layers share state, then one 4K SWA layer.
-# Set TTT_INIT to the Anchor-I full checkpoint before launching.
+# Stage 2 -- hybrid3 passkey: three TTT layers share one memory at 512-token
+# SWA, then one SWA-only layer at 4096, repeated eight times. Topology must
+# match ttt_at_hybrid3_swa4k.yml, whose checkpoint is TTT_INIT.
 # Full conversations for training; held-out first-turn retrieval for validation.
 # to-8k describes the source's first query, not the full conversation under
 # our tokenizer. Allow 16K total tokens and reject oversized rows intact.
@@ -17,7 +18,7 @@ data:
   seed: 42
 model:
   name: ttt_ar
-  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_anchor_gate/best_ckpt}
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_hybrid3_swa4k/best_ckpt}
   max_length: 16384
   attn_varient: ttt
   lact_chunk_size: 512
@@ -46,8 +47,11 @@ model:
 train:
   optim: adamw_torch
   lr: 0.0001
-  epochs: 1
-  max_steps: 400
+  # 942 eligible conversations at batch 8 is ~118 optimizer steps per epoch,
+  # so epochs 1 made max_steps unreachable: the anchor run stopped near 100
+  # with the LR still at peak, since the schedule was sized for 400.
+  epochs: 4
+  max_steps: 300
   max_grad_norm: 1.0
   gradient_checkpointing: True
   metric_for_best_model: eval/loss
