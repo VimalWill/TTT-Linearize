@@ -36,7 +36,13 @@ def main():
     config = OmegaConf.load(a.cfg)
     config.model.pretrained_model_name_or_path = a.ckpt
     config.model.max_length = max(int(config.model.max_length), a.max_length)
-    config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+    # Inspecting the model needs no training data, but data.path is an env
+    # interpolation in the long-context configs and resolving the whole tree
+    # fails on it. build_model_config reads config.model only.
+    container = OmegaConf.to_container(config, resolve=False)
+    container.pop('data', None)
+    config = OmegaConf.create(OmegaConf.to_container(
+        OmegaConf.create(container), resolve=True))
     set_window_backend(True)
     model = load_model(a.ckpt, build_model_config(config), a.adapter, strict_ttt=True)
     model.eval()
