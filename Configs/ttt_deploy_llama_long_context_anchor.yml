@@ -11,6 +11,20 @@ model:
   lact_chunk_size: 512
   window_size: 512
   ttt_inner_loss: l2
+  # The inner loop diverges without these. They are not cosmetic defaults:
+  # ttt_use_muon defaults to False (LinearizeLlama.py:246), fw_init_gain to 0.5
+  # (:283) and ttt_base_lr to 1e-2 (:341), and an l2 inner loss REQUIRES Muon --
+  # its Newton-Schulz step is what bounds each update's spectral norm. Without
+  # it the fast weights grow geometrically per chunk: measured finite at one
+  # inner update, non-finite in 6 layers at three (seq 2048) and in 31 of 32 at
+  # 8192, which renders generation as '!!!!!!' and every retrieval score zero.
+  # These values match Configs/ttt_ar_unified_longalpaca.yml, whose checkpoint
+  # stays finite to 8192 under the same test.
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0
+  fw_init_gain: 1.0
+  ttt_use_momentum: True
+  ttt_use_muon: True
   ttt_gate: sigmoid
   ttt_scale_init_bias: -3.0
   ttt_layer_indices: [0, 1, 28, 29, 30, 31]
