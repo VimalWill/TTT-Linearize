@@ -67,9 +67,18 @@ train:
   max_grad_norm: 1.0
   gradient_checkpointing: true
   generation_validation: true
-  validation_per_cell: 4
+  # 16, not 4. At n=4 a cell that is truly 20% correct shows 0/4 about 41% of
+  # the time, so the twelve all-zero cells of the first run could not be told
+  # apart from "not learned yet" -- which is exactly the question the run
+  # exists to answer.
+  validation_per_cell: 16
   validation_max_new_tokens: 256
-  metric_for_best_model: eval/retrieval_accuracy
+  # NOT retrieval_accuracy. That scorer demands the generation equal the answer
+  # exactly after whitespace folding, over 256 greedy tokens with no stop, so
+  # it stayed 0.000 for the whole previous run. best_val_metric starts at -inf
+  # and improvement is strict, so step 0 saved and nothing ever beat it: the
+  # "best" checkpoint was the untrained model. Substring recall moves.
+  metric_for_best_model: eval/retrieval_substring_recall
   greater_is_better: true
   eval_steps: 50   # 20M tokens is ~420 optimizer updates, so 100 would give
                    # only four validations of the retrieval accuracy that
