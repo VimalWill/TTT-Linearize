@@ -75,6 +75,18 @@ def load_model(path, model_config, adapter=None, verbose=True, strict_ttt=False)
     if adapter:
         from peft import PeftModel
         load_ttt_params(model, adapter, verbose=verbose, strict=strict_ttt)
+        # load_ttt_params promotes parameters to the dtype they were SAVED in,
+        # so a checkpoint trained under the continuation recipe arrives with
+        # FP32 TTT weights. Training tolerates that because every forward runs
+        # inside model_autocast; eval calls the model directly, and an FP32
+        # momentum_proj against BF16 hidden states raises
+        # 'mat1 and mat2 must have the same dtype'. Inference has no small
+        # updates to preserve, so bring them back to the base dtype.
+        promoted = sum(1 for _, q in model.named_parameters() if q.dtype != torch.bfloat16)
+        if promoted:
+            model = model.to(torch.bfloat16)
+            if verbose:
+                print(f'  cast {promoted} FP32 parameters back to BF16 for inference')
         model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
     return model.eval()
 
