@@ -11,16 +11,52 @@ already left its trajectory by the time they run. `link_shared_memories`
 walks the built model and wires that up.
 """
 import os
+import sys
+import types
 
+import torch.nn as nn
+
+from LinearTTT.mad.attention import SDPAAttention
 from LinearTTT.mad.ttt_block import TTTBlock
 
 _CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ttt.yml')
 
 
-def register_ttt(name='ttt', shorthand='T'):
-    """Insert the TTT block into MAD's layer registry. Idempotent."""
+def stub_flash_attn():
+    """Let `import mad` succeed on a machine without flash-attn.
+
+    mad/model/layers/__init__.py does `from flash_attn.modules.mha import MHA`
+    at import time, so the registry is unreachable without it -- and
+    flash-attn has no aarch64 wheels, so it cannot be installed on the GH200
+    nodes at all. The stub only has to be subclassable, because
+    register_ttt() replaces every attention entry with SDPAAttention before
+    anything is constructed.
+    """
+    if 'flash_attn' in sys.modules:
+        return False
+    for name in ('flash_attn', 'flash_attn.modules', 'flash_attn.modules.mha'):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        sys.modules[name] = module
+    sys.modules['flash_attn.modules.mha'].MHA = nn.Module
+    return True
+
+
+def register_ttt(name='ttt', shorthand='T', replace_attention=True):
+    """Insert the TTT block into MAD's layer registry. Idempotent.
+
+    Also swaps MAD's flash-attn Attention for the SDPA one by default. The
+    two are mathematically the same attention; only the kernel differs, and
+    MAD's models are two blocks at sequence lengths up to 1280, where the
+    kernel choice is not worth a dependency that will not install.
+    """
+    stub_flash_attn()
     from mad.registry import layer_registry
     layer_registry[name] = {'module': TTTBlock, 'cfg': _CFG, 'shorthand': shorthand}
+    if replace_attention:
+        for key, entry in layer_registry.items():
+            if 'attention' in key and 'linear' not in key:
+                entry['module'] = SDPAAttention
     return layer_registry
 
 
