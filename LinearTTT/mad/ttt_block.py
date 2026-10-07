@@ -37,15 +37,23 @@ class TTTBlock(nn.Module):
     """[b, n, d] -> [b, n, d].
 
     Args mirror the yml keys so a MAD sweep and a Llama config describe the
-    same memory: `dim` is the residual width, `heads` splits it into memories
-    of `dim // heads`, `inter_multi` scales the SwiGLU hidden width, and
-    `chunk_size` is how many tokens a single inner update sees.
+    same memory: `dim` is the residual width, `num_heads` splits it into
+    memories of `dim // num_heads`, `inter_multi` scales the SwiGLU hidden
+    width, and `chunk_size` is how many tokens one inner update sees.
+
+    The total fixed state is num_heads * (2 * d_h * head_dim + head_dim * d_h),
+    which `state_dim()` reports -- MAD normalises architectures to a common
+    total state dimension, so that number is what a comparison must match.
     """
 
-    def __init__(self, dim, heads=4, inter_multi=1.0, chunk_size=64,
+    def __init__(self, dim, num_heads=4, inter_multi=1.0, chunk_size=64,
                  base_lr=0.018, retention_init_bias=4.0, scale_init_bias=-3.0,
-                 init_gain=1.0, use_muon=True, use_momentum=True):
+                 init_gain=1.0, use_muon=True, use_momentum=True, **kwargs):
+        # **kwargs absorbs the keys MAD puts in every layer config -- max_length
+        # among them -- which this block does not need. LanguageModel calls
+        # layer(**layer_cfg), so an unexpected key would otherwise be fatal.
         super().__init__()
+        heads = num_heads
         if dim % heads:
             raise ValueError('dim must divide evenly into heads')
         self.dim, self.heads = dim, heads
@@ -146,3 +154,15 @@ class TTTBlock(nn.Module):
             momentum=momentum, retention=retention, return_trajectory=True,
         )
         return out[0], out[-1]
+
+    def state_dim(self):
+        """Total fixed state: the elements of w0, w1 and w2 across heads.
+
+        MAD normalises architectures to a common total state dimension (4096
+        in the paper) so that a ranking is not just a state-size ranking. A
+        reader adds nothing -- it borrows its writer's memory, which is the
+        whole point of sharing.
+        """
+        if self._share_src is not None:
+            return 0
+        return sum(w.numel() for w in (self.w0, self.w1, self.w2))

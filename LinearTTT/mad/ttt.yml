@@ -1,0 +1,16 @@
+# MAD layer config for the TTT memory. `dim` and `max_length` are overwritten
+# per sweep by mad.configs; the rest describe the memory and mirror the yml
+# keys used by the Llama configs, so a MAD run and a linearization run
+# describe the same block.
+dim: 128
+max_length: 1280
+num_heads: 4
+inter_multi: 1.0
+chunk_size: 64        # one inner update per 64 tokens
+base_lr: 0.018
+retention_init_bias: 4.0
+scale_init_bias: -3.0
+init_gain: 1.0
+use_muon: true        # required for the l2 inner loss; without it the fast
+                      # weights grow geometrically across chunks
+use_momentum: true
