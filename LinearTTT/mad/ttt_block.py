@@ -11,10 +11,9 @@ the rest:
   kept     q/k/v projections, the silu + scale/offset + l2 feature map, the
            per-token inner learning rate, momentum, Atlas retention, Muon, the
            sigmoid output gate, cross-block memory sharing
-  dropped  rotary (MAD tasks are position-agnostic and its own blocks have no
-           RoPE), the KV cache and decode path (MAD scores a single forward),
-           the sliding-window attention branch -- a striped topology gets its
-           locality from MAD's own attention blocks instead
+  dropped  rotary, the KV cache and decode path (MAD scores a single forward),
+           the sliding-window attention branch. TTTHybridBlock adds a fused
+           SWA branch, including optional rotary embeddings, to this primitive.
 
 Sharing follows the deployed architecture: one writer fits the memory, the
 others read the trajectory it leaves, never the converged state, so a reader
@@ -89,6 +88,11 @@ class TTTBlock(nn.Module):
         nn.init.constant_(self.gate_proj.bias, scale_init_bias)
         nn.init.zeros_(self.retention_proj[0].weight)
         nn.init.constant_(self.retention_proj[0].bias, retention_init_bias)
+        # MAD's LanguageModel respects this marker when resetting biases.
+        self.gate_proj._ttt_preserve_init = True
+        self.retention_proj[0]._ttt_preserve_init = True
+        self.gate_proj.bias._no_reinit = True
+        self.retention_proj[0].bias._no_reinit = True
 
         self._share_src = None   # set by share_with(); a reader holds its writer
 
@@ -100,11 +104,20 @@ class TTTBlock(nn.Module):
         """
         if writer is self:
             raise ValueError('A block cannot share with itself')
+        if writer._share_src is not None:
+            raise ValueError('Share directly with a writer, not another reader')
+        if (self.heads != writer.heads or self.chunk_size != writer.chunk_size
+                or any(getattr(self, name).shape != getattr(writer, name).shape
+                       for name in ('w0', 'w1', 'w2'))):
+            raise ValueError('Shared blocks must have matching heads, fast-weight shapes and chunk size')
+        # Alias actual Parameter objects so model.parameters() and optimizers
+        # count one set, just as the deployed model does.
+        self.w0, self.w1, self.w2 = writer.w0, writer.w1, writer.w2
         self._share_src = [writer]            # list, to stay out of _modules
         return self
 
-    def _features(self, x):
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
+    def _features(self, x, projected=None):
+        q, k, v = self.qkv(x).chunk(3, dim=-1) if projected is None else projected
         q, k, v = F.silu(q), F.silu(k), F.silu(v)
         q = q * self.qk_scale[0] + self.qk_offset[0]
         k = k * self.qk_scale[1] + self.qk_offset[1]
@@ -120,12 +133,11 @@ class TTTBlock(nn.Module):
         momentum = shape(self.momentum_proj) if self.use_momentum else None
         return lr0, lr1, lr2, momentum, shape(self.retention_proj)
 
-    def forward(self, x, **_):
+    def _memory_output(self, x, projected=None):
         b = x.shape[0]
-        q, k, v = self._features(x)
-        lr0, lr1, lr2, momentum, retention = self._coefficients(x)
-
+        q, k, v = self._features(x, projected)
         if self._share_src is None:
+            lr0, lr1, lr2, momentum, retention = self._coefficients(x)
             readout, self._trajectory = self._write(
                 q, k, v, lr0, lr1, lr2, momentum, retention)
         else:
@@ -139,7 +151,10 @@ class TTTBlock(nn.Module):
 
         readout = self.norm(readout)
         readout = rearrange(readout, '(b h) n d -> b n (h d)', b=b)
-        return self.out(readout * torch.sigmoid(self.gate_proj(x)))
+        return readout * torch.sigmoid(self.gate_proj(x))
+
+    def forward(self, x, **_):
+        return self.out(self._memory_output(x))
 
     def _write(self, q, k, v, lr0, lr1, lr2, momentum, retention):
         # The operator fits one memory per (batch element, head), so the
@@ -158,10 +173,8 @@ class TTTBlock(nn.Module):
     def state_dim(self):
         """Total fixed state: the elements of w0, w1 and w2 across heads.
 
-        MAD normalises architectures to a common total state dimension (4096
-        in the paper) so that a ranking is not just a state-size ranking. A
-        reader adds nothing -- it borrows its writer's memory, which is the
-        whole point of sharing.
+        This counts fast weights only, without normalizing the architecture
+        or including momentum/KV buffers. A reader adds no fast-weight state.
         """
         if self._share_src is not None:
             return 0

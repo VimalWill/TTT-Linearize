@@ -18,8 +18,16 @@ import torch.nn as nn
 
 from LinearTTT.mad.attention import SDPAAttention
 from LinearTTT.mad.ttt_block import TTTBlock
+from LinearTTT.mad.hybrid import TTTHybridBlock
 
 _CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ttt.yml')
+
+
+class PreserveTTTInitialization:
+    """Keep intentional gate/retention weights and biases during MAD init."""
+    def _init_weights(self, module, *args, **kwargs):
+        if not getattr(module, '_ttt_preserve_init', False):
+            super()._init_weights(module, *args, **kwargs)
 
 
 def stub_flash_attn():
@@ -51,8 +59,18 @@ def register_ttt(name='ttt', shorthand='T', replace_attention=True):
     kernel choice is not worth a dependency that will not install.
     """
     stub_flash_attn()
-    from mad.registry import layer_registry
+    from mad.registry import layer_registry, model_registry
     layer_registry[name] = {'module': TTTBlock, 'cfg': _CFG, 'shorthand': shorthand}
+    layer_registry['ttt-hybrid'] = {
+        'module': TTTHybridBlock,
+        'cfg': os.path.join(os.path.dirname(_CFG), 'hybrid.yml'), 'shorthand': 'TH'}
+    for key, model_cls in model_registry.items():
+        if not issubclass(model_cls, PreserveTTTInitialization):
+            class_name = 'TTTCompatible' + model_cls.__name__
+            compatible = type(class_name, (PreserveTTTInitialization, model_cls),
+                              {'__module__': __name__})
+            globals()[class_name] = compatible
+            model_registry[key] = compatible
     if replace_attention:
         for key, entry in layer_registry.items():
             if 'attention' in key and 'linear' not in key:
@@ -96,9 +114,9 @@ def link_shared_memories(model, groups):
 
 
 def total_state_dim(model):
-    """Total fixed state across the stack -- the quantity MAD normalises.
+    """Fast-weight elements only; excludes momentum, KV caches and trajectories.
 
-    The paper holds architectures to a common total state dimension (4096) so
-    a comparison is not confounded by state size. Readers contribute nothing.
+    Reports the actual count, without automatically normalizing architectures.
+    Readers contribute nothing. Report model parameters separately as well.
     """
     return sum(b.state_dim() for b in ttt_blocks(model))

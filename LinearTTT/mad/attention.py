@@ -67,13 +67,13 @@ class SDPAAttention(nn.Module):
         rot = rot * cos + _rotate_half(rot) * sin
         return torch.cat((rot, keep), dim=-1)
 
-    def _mask(self, n, device):
+    def _mask(self, n, device, window=None):
         """None when plain causal SDPA already expresses the constraint.
 
         window_size is flash-attn's (left, right): a query attends to keys
         from i-left to i+right, and -1 means unbounded on that side.
         """
-        left, right = self.window
+        left, right = self.window if window is None else window
         unbounded = left < 0 and (right < 0 or self.causal)
         if unbounded:
             return None
@@ -88,15 +88,16 @@ class SDPAAttention(nn.Module):
             allowed &= delta >= -right
         return allowed
 
-    def forward(self, x, **_):
-        b, n, _ = x.shape
-        qkv = self.Wqkv(x).view(b, n, 3, self.n_heads, self.head_dim)
-        q, k, v = (t.transpose(1, 2) for t in qkv.unbind(dim=2))  # [b, h, n, d]
+    def attention_output(self, projected, window=None):
+        """Attend using already projected q/k/v; return before out_proj."""
+        b, n, _ = projected[0].shape
+        q, k, v = (t.view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+                   for t in projected)
 
-        positions = torch.arange(n, device=x.device)
+        positions = torch.arange(n, device=q.device)
         q, k = self._apply_rotary(q, positions), self._apply_rotary(k, positions)
 
-        mask = self._mask(n, x.device)
+        mask = self._mask(n, q.device, window)
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None if mask is None else mask[None, None],
@@ -104,4 +105,7 @@ class SDPAAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
             scale=self.scale,
         )
-        return self.out_proj(out.transpose(1, 2).reshape(b, n, self.dim))
+        return out.transpose(1, 2).reshape(b, n, self.dim)
+
+    def forward(self, x, **_):
+        return self.out_proj(self.attention_output(self.Wqkv(x).chunk(3, dim=-1)))

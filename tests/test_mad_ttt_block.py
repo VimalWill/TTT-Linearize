@@ -32,13 +32,13 @@ class MADTTTBlockTests(unittest.TestCase):
         self.x = torch.randn(2, 96, 32)
 
     def test_output_shape_and_finiteness(self):
-        block = TTTBlock(dim=32, heads=4, chunk_size=16)
+        block = TTTBlock(dim=32, num_heads=4, chunk_size=16)
         out = block(self.x)
         self.assertEqual(out.shape, self.x.shape)
         self.assertTrue(torch.isfinite(out).all())
 
     def test_writer_is_causal(self):
-        block = TTTBlock(dim=32, heads=4, chunk_size=16)
+        block = TTTBlock(dim=32, num_heads=4, chunk_size=16)
         for cut in (17, 48, 80):
             drift = perturbed_prefix_matches(block, self.x, cut)
             self.assertLess(drift, 1e-5, f'writer leaked position {cut}')
@@ -50,29 +50,30 @@ class MADTTTBlockTests(unittest.TestCase):
         layer leaks the future. This is the check that failed before the
         trajectory fix.
         """
-        writer = TTTBlock(dim=32, heads=4, chunk_size=16)
-        reader = TTTBlock(dim=32, heads=4, chunk_size=16).share_with(writer)
+        writer = TTTBlock(dim=32, num_heads=4, chunk_size=16)
+        reader = TTTBlock(dim=32, num_heads=4, chunk_size=16).share_with(writer)
         for cut in (17, 48, 80):
             drift = perturbed_prefix_matches(reader, self.x, cut, run_first=writer)
             self.assertLess(drift, 1e-5, f'reader leaked position {cut}')
 
     def test_reader_without_writer_raises(self):
-        writer = TTTBlock(dim=32, heads=4, chunk_size=16)
-        reader = TTTBlock(dim=32, heads=4, chunk_size=16).share_with(writer)
+        writer = TTTBlock(dim=32, num_heads=4, chunk_size=16)
+        reader = TTTBlock(dim=32, num_heads=4, chunk_size=16).share_with(writer)
         with self.assertRaises(RuntimeError):
             reader(self.x)
 
     def test_reader_keeps_private_parameters(self):
         """Only the fast weights are shared -- that is what makes state cheap."""
-        writer = TTTBlock(dim=32, heads=4, chunk_size=16)
-        reader = TTTBlock(dim=32, heads=4, chunk_size=16).share_with(writer)
-        shared = {id(p) for p in (writer.w0, writer.w1, writer.w2)}
-        for name in ('w0', 'w1', 'w2', 'qkv', 'out', 'gate_proj'):
-            self.assertNotIn(id(getattr(reader, name)), shared)
+        writer = TTTBlock(dim=32, num_heads=4, chunk_size=16)
+        reader = TTTBlock(dim=32, num_heads=4, chunk_size=16).share_with(writer)
+        for name in ('w0', 'w1', 'w2'):
+            self.assertIs(getattr(reader, name), getattr(writer, name))
+        for name in ('qkv', 'out', 'gate_proj'):
+            self.assertIsNot(getattr(reader, name), getattr(writer, name))
         self.assertNotIn(reader, writer.children())
 
     def test_fast_weights_receive_gradient(self):
-        block = TTTBlock(dim=32, heads=4, chunk_size=16)
+        block = TTTBlock(dim=32, num_heads=4, chunk_size=16)
         block(self.x).square().mean().backward()
         for name in ('w0', 'w1', 'w2'):
             grad = getattr(block, name).grad
@@ -81,10 +82,10 @@ class MADTTTBlockTests(unittest.TestCase):
 
     def test_dim_must_divide_into_heads(self):
         with self.assertRaises(ValueError):
-            TTTBlock(dim=30, heads=4)
+            TTTBlock(dim=30, num_heads=4)
 
     def test_block_cannot_share_with_itself(self):
-        block = TTTBlock(dim=32, heads=4)
+        block = TTTBlock(dim=32, num_heads=4)
         with self.assertRaises(ValueError):
             block.share_with(block)
 

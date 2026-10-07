@@ -1,0 +1,14 @@
+# Fused MAD sequence mixer; use three consecutive hybrid slots per shared group.
+dim: 128
+max_length: 1280
+num_heads: 4
+inter_multi: 1.0
+chunk_size: 64
+window_size: 512
+rotary_emb_dim: 0
+base_lr: 0.018
+retention_init_bias: 4.0
+scale_init_bias: -3.0
+init_gain: 1.0
+use_muon: true
+use_momentum: true
