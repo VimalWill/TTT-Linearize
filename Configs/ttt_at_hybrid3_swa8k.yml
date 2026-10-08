@@ -1,0 +1,74 @@
+# 8192 WIDE LAYERS. Identical to the swa4k pair except the eight SWA-only
+# layers double their window. hybrid3 at 4096 scored 0.92 on NIAH at 4K and
+# 0.55 at 8K, with the cliff landing exactly where the context stops fitting
+# the window -- against a teacher that loses 1.8 points over the same step.
+# This moves the window past 8K while keeping every layer bounded, so the
+# cache stays constant in sequence length: 24*512 + 8*8192 = 77,824 tokens
+# against 45,056, and against a teacher whose cache grows without limit.
+# For a full-attention variant instead, set those eight entries to the
+# sequence length (16384) -- one edit, no code.
+# Stage 1 -- hybrid3: eight repeats of [3 TTT layers sharing one memory at
+# 512-token SWA, then one SWA-only layer at 8192]. The 3:1 ratio follows Kimi
+# Linear, with two deliberate departures: their every-fourth layer is full
+# MLA attention, here it is a bounded 8192 window so the cache stays constant
+# in sequence length; and their recurrent layers each hold private state,
+# here three layers share one. Eight memories instead of 32.
+#
+# Gate must be sigmoid from stage 1: silu-trained gates go negative, and
+# sigmoid(negative) is positive, so switching mid-pipeline flips the sign of
+# the TTT contribution. Share groups, windows and gate MUST match stage 2
+# (ttt_ar_hybrid3_swa4k_passkey.yml) or the checkpoint will not load.
+data:
+  name: "longalpaca"
+  path: "Yukang/LongAlpaca-12k"
+  num_train_docs: 12000
+  num_val_docs: 100
+  batch_size: 8
+  micro_batch_size: 1
+  val_set_size: 200
+  short_mix_path: "yahma/alpaca-cleaned"
+  short_mix_docs: 4000        # unpacked, ~100-400 tokens each
+model:
+  name: 'ttt_at'
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,meta-llama/Llama-3.1-8B}
+  max_length: 8192
+  attn_varient: "ttt"
+  lact_chunk_size: 512
+  # Every fourth layer (3, 7, ... 31) carries no memory and sees 8192 tokens.
+  window_size: [512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192,
+                512, 512, 512, 8192]
+  ttt_inner_loss: 'l2'
+  ttt_base_lr: 0.018
+  ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
+  ttt_layer_indices: [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26, 28, 29, 30]
+  ttt_share_groups: [[0, 1, 2], [4, 5, 6], [8, 9, 10], [12, 13, 14], [16, 17, 18], [20, 21, 22], [24, 25, 26], [28, 29, 30]]
+  ttt_reader_alignment: linear
+  ttt_gate: 'sigmoid'
+  ttt_scale_init_bias: -3.0   # sigmoid -> 0.047, matching silu(0.1)=0.052
+  fw_init_gain: 1.0              # gain 2.0 diverged by chunk 2
+  ttt_use_momentum: True
+  ttt_use_muon: True
+  add_eos_token: False
+  device_map: 'auto'
+train:
+  optim: 'adamw_torch'
+  lr: 0.0002   # matches ttt_at_anchor_gate. 0.01 (the lolcats_at reference)
+               # was measured to diverge here: MSE 30.3 -> 9.5 while CE went
+               # 6.83 -> 9.51.
+  epochs: 1
+  max_steps: 500   # same budget as ttt_at_anchor_gate, so the hybrid3 vs
+                   # anchor comparison is not confounded by training length.
+  max_grad_norm: 1.0
+  mse_factor: 1000
+  lm_loss_weight: 1.0
+  metric_for_best_model: 'eval/loss_ce'
+  gradient_checkpointing: True
+  eval_steps: 25
+  save_steps: 100000   # periodic saves off; best_ckpt is written on eval improvement
+  output_dir: ${oc.env:TTT_CKPT_DIR,checkpoints}
