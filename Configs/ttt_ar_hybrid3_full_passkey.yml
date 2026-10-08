@@ -1,5 +1,19 @@
+# FULL-ATTENTION VARIANT. Identical to the swa4k pair except the eight
+# SWA-only layers go to 16384 -- the model's max_length -- so they attend to
+# the whole sequence. 25% full attention, matching HALO's ratio and half of
+# Lizard's 50%.
+#
+# Why: hybrid3 at 4096 scored 0.92 on NIAH at 4K and 0.55 at 8K, the cliff
+# landing exactly where the context stops fitting the window, against a
+# teacher that loses 1.8 points over the same step.
+#
+# What it costs: below 16K these layers are unbounded, so the cache is no
+# longer constant there. It still is beyond 16K -- 24*512 + 8*16384 =
+# 143,360 tokens whatever the length, against a teacher at 262,144 for 8K
+# and 1,048,576 for 32K. So the efficiency claim survives, weaker and
+# length-dependent rather than flat.
 # Stage 2 -- hybrid3 passkey: three TTT layers share one memory at 512-token
-# SWA, then one SWA-only layer at 4096, repeated eight times. Topology must
+# SWA, then one SWA-only layer at 16384, repeated eight times. Topology must
 # match ttt_at_hybrid3_swa4k.yml, whose checkpoint is TTT_INIT.
 # Full conversations for training; held-out first-turn retrieval for validation.
 # to-8k describes the source's first query, not the full conversation under
@@ -18,31 +32,19 @@ data:
   seed: 42
 model:
   name: ttt_ar
-  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_hybrid3_swa4k/best_ckpt}
+  pretrained_model_name_or_path: ${oc.env:TTT_INIT,${oc.env:TTT_CKPT_DIR,checkpoints}/ttt_at_hybrid3_full/best_ckpt}
   max_length: 16384
   attn_varient: ttt
   lact_chunk_size: 512
-  # EVAL ONLY. Identical to ttt_ar_hybrid3_swa4k_passkey except the eight
-  # wide layers go 4096 -> 8192. The checkpoint was TRAINED at 4096, so this
-  # is a deliberate train/test mismatch: it asks whether the 4K->8K needle
-  # cliff (0.92 -> 0.55) is set by the window rather than by the memory.
-  #
-  # If 8K recovers, the window is the binding constraint and the fix is a
-  # wider one, which costs 24*512 + 8*8192 = 77,824 cache tokens against
-  # 45,056 -- 1.7x, and still constant in sequence length.
-  # If it does not recover, the memory is the constraint and widening will
-  # not save it.
-  #
-  # The narrow layers stay at 512: raising every layer would make this full
-  # attention at 8K context and measure nothing.
-  window_size: [512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192]
+  # Eight repeats: three shared TTT+512-SWA layers, then one 16384-SWA layer.
+  window_size: [512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384]
   ttt_inner_loss: l2
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0

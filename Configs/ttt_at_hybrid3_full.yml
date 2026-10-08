@@ -1,16 +1,21 @@
-# 8192 WIDE LAYERS. Identical to the swa4k pair except the eight SWA-only
-# layers double their window. hybrid3 at 4096 scored 0.92 on NIAH at 4K and
-# 0.55 at 8K, with the cliff landing exactly where the context stops fitting
-# the window -- against a teacher that loses 1.8 points over the same step.
-# This moves the window past 8K while keeping every layer bounded, so the
-# cache stays constant in sequence length: 24*512 + 8*8192 = 77,824 tokens
-# against 45,056, and against a teacher whose cache grows without limit.
-# For a full-attention variant instead, set those eight entries to the
-# sequence length (16384) -- one edit, no code.
+# FULL-ATTENTION VARIANT. Identical to the swa4k pair except the eight
+# SWA-only layers go to 16384 -- the model's max_length -- so they attend to
+# the whole sequence. 25% full attention, matching HALO's ratio and half of
+# Lizard's 50%.
+#
+# Why: hybrid3 at 4096 scored 0.92 on NIAH at 4K and 0.55 at 8K, the cliff
+# landing exactly where the context stops fitting the window, against a
+# teacher that loses 1.8 points over the same step.
+#
+# What it costs: below 16K these layers are unbounded, so the cache is no
+# longer constant there. It still is beyond 16K -- 24*512 + 8*16384 =
+# 143,360 tokens whatever the length, against a teacher at 262,144 for 8K
+# and 1,048,576 for 32K. So the efficiency claim survives, weaker and
+# length-dependent rather than flat.
 # Stage 1 -- hybrid3: eight repeats of [3 TTT layers sharing one memory at
-# 512-token SWA, then one SWA-only layer at 8192]. The 3:1 ratio follows Kimi
+# 512-token SWA, then one SWA-only layer at 16384]. The 3:1 ratio follows Kimi
 # Linear, with two deliberate departures: their every-fourth layer is full
-# MLA attention, here it is a bounded 8192 window so the cache stays constant
+# MLA attention, here it is a bounded 16384 window so the cache stays constant
 # in sequence length; and their recurrent layers each hold private state,
 # here three layers share one. Eight memories instead of 32.
 #
@@ -34,15 +39,15 @@ model:
   max_length: 8192
   attn_varient: "ttt"
   lact_chunk_size: 512
-  # Every fourth layer (3, 7, ... 31) carries no memory and sees 8192 tokens.
-  window_size: [512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192,
-                512, 512, 512, 8192]
+  # Every fourth layer (3, 7, ... 31) carries no memory and sees 16384 tokens.
+  window_size: [512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384,
+                512, 512, 512, 16384]
   ttt_inner_loss: 'l2'
   ttt_base_lr: 0.018
   ttt_retention_init_bias: 4.0   # sigmoid(4.0)=0.982; 0.982^16 = 0.75 retained
