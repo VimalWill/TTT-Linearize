@@ -125,6 +125,34 @@ def prepare_conversations(source, tokenizer, max_tokens, num_val=100,
     return train, validation
 
 
+
+def mix_repetition_rows(train, validation, config, tokenizer):
+    """Add approximately the requested example fraction, keeping source splits."""
+    from Training.synthetic_niah import SyntheticNIAH, TRAIN_TEMPLATES, VALIDATION_TEMPLATES
+    fraction = float(config.data.get('synthetic_fraction', 0))
+    if not 0 < fraction < 1:
+        raise ValueError('synthetic_fraction must be between zero and one')
+    lengths = [int(x) for x in config.data.get('synthetic_lengths', [4096, 8192, 16384])]
+    if not lengths or min(lengths) < 128 or max(lengths) > int(config.model.max_length):
+        raise ValueError('Invalid synthetic_lengths for model.max_length')
+    seed = int(config.data.get('seed', 42))
+    mixed = []
+    for rows, split, templates, offset in (
+            (train, 'train', TRAIN_TEMPLATES, 0),
+            (validation, 'validation', VALIDATION_TEMPLATES, 10000)):
+        count = max(1, round(len(rows) * fraction / (1 - fraction)))
+        synthetic = SyntheticNIAH(tokenizer, seed + offset, templates).dataset(count, lengths, split)
+        encoded = [dict(tokenize_conversation(row, tokenizer, first_turn=split != 'train'),
+                        _retrieval_source='passkey') for row in rows]
+        encoded += [dict((k, row[k]) for k in ('input_ids', 'attention_mask', 'labels'))
+                    | {'_retrieval_source': 'repetition'} for row in synthetic]
+        random.Random(seed + offset).shuffle(encoded)
+        print(f'-> {split}: {len(rows)} passkey + {count} repetition examples '
+              f'({count / len(encoded):.1%}); synthetic lengths {lengths}')
+        mixed.append(encoded)
+    return mixed
+
+
 def load_reactive_data(config, tokenizer):
     from datasets import Dataset, load_dataset
     from torch.utils.data import DataLoader
@@ -144,8 +172,20 @@ def load_reactive_data(config, tokenizer):
     collate = DataCollatorForSeq2Seq(tokenizer, label_pad_token_id=-100,
                                     return_tensors='pt')
     loaders = {}
+    mixed = None
+    if float(config.data.get('synthetic_fraction', 0)) != 0:
+        mixed = dict(zip(('train', 'validation'),
+                         mix_repetition_rows(train, validation, config, tokenizer)))
+
+    def collate_sources(features):
+        sources = [f['_retrieval_source'] for f in features]
+        batch = collate([{k: v for k, v in f.items() if k != '_retrieval_source'}
+                         for f in features])
+        batch['retrieval_sources'] = sources
+        return batch
+
     for split, rows in (('train', train), ('validation', validation), ('test', validation)):
-        dataset = Dataset.from_list([tokenize_conversation(
+        dataset = Dataset.from_list(mixed[split] if mixed and split != 'test' else [tokenize_conversation(
             row, tokenizer, first_turn=split != 'train', include_label=split != 'test')
             for row in rows])
         dataset.tokenizer, dataset.metric = tokenizer, None
@@ -153,5 +193,6 @@ def load_reactive_data(config, tokenizer):
         # of validation, not an independent benchmark split.
         dataset.records = rows
         loaders[split] = DataLoader(dataset, batch_size=1, shuffle=split == 'train',
-                                     collate_fn=collate, num_workers=0, pin_memory=True)
+                                     collate_fn=collate_sources if mixed and split != 'test' else collate,
+                                     num_workers=0, pin_memory=True)
     return loaders

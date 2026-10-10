@@ -534,6 +534,10 @@ class DefaultTrainer():
                 elif data.get('context_tasks') and 'loss_ce' in eval_metrics:
                     step_eval_metrics.setdefault('eval/synthetic_loss_ce', []).append(eval_metrics['loss_ce'])
                 
+                if data.get('retrieval_sources') and 'loss_ce' in eval_metrics:
+                    source = data['retrieval_sources'][0]  # micro_batch_size=1
+                    step_eval_metrics.setdefault(f'eval/{source}_loss_ce', []).append(eval_metrics['loss_ce'])
+
                 step_loss += loss
                 desc = f"Evaluating at step {step} | loss: {step_loss / (ix + 1):.3f}"
                 if self.optimizer is not None:

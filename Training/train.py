@@ -26,7 +26,7 @@ from Training.utils import get_optimizer_and_scheduler, count_model_params
 # The answer-only loss check in trainer.py is deliberately NOT keyed on this:
 # it requires one contiguous supervised suffix, and reactive_passkey
 # supervises every assistant turn.
-CONTINUATION_DATASETS = ('long_context', 'reactive_passkey')
+CONTINUATION_DATASETS = ('long_context', 'reactive_passkey', 'synthetic_niah')
 
 # Parameters belonging to the test-time-training branch. These have no
 # counterpart in the pretrained checkpoint, so unlike the Liger recipe they must
