@@ -1,8 +1,16 @@
-"""Compare TTT readouts across layers on aligned query positions.
+"""Compare linear-attention readouts across layers on aligned query positions.
 
 Reports debiased linear CKA, a shuffled-token control, and signed cosine.
-History effect holds each observed query/gate fixed and subtracts the initial
-memory's readout. This is an observational analysis, not proof of redundancy.
+
+Two backends share the analysis and differ only in how readouts are collected.
+--arch ttt reads this repo's LinearTTTAttention and adds an `initial` reference
+(the learned memory initialization read with the SAME observed queries/gates)
+so `history_effect` isolates what fitting contributed. --arch lolcats reads a
+LoLCATs checkpoint from third_party/Liger, whose state starts at zero and has
+no such reference; it reports `linear_only` instead -- the same attention op
+rerun with the sliding-window term switched off, which is the closest analogue
+to a memory-only readout. This is an observational analysis, not proof of
+redundancy.
 """
 import argparse
 import csv
@@ -36,7 +44,7 @@ def initial_readout(layer, projected_queries, output_dtype):
 
 
 @torch.no_grad()
-def collect_readouts(model, mods, ids, positions):
+def collect_ttt_readouts(model, mods, ids, positions):
     """Read-only hooks. Returns layer -> component -> [sampled queries, hidden]."""
     if ids.ndim != 2 or ids.shape[0] != 1 or positions.ndim != 1 or not len(positions):
         raise ValueError('Expected one sequence and a nonempty query-position vector')
@@ -86,6 +94,105 @@ def collect_readouts(model, mods, ids, positions):
                 layer.q_proj.register_forward_hook(save(layer.layer_idx, 'query')),
                 layer.ttt_norm.register_forward_hook(save(layer.layer_idx, 'normalized')),
                 layer.ttt_scale_proj.register_forward_hook(save(layer.layer_idx, 'gate')),
+                layer.register_forward_hook(finish)])
+        model(input_ids=ids.to(next(model.parameters()).device), use_cache=False)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    missing = {m.layer_idx for m in mods} - set(result)
+    if missing:
+        raise RuntimeError(f'Readout hooks did not run at layers {sorted(missing)}')
+    return result
+
+
+TTT_COMPONENTS = ('current', 'initial', 'history_effect')
+LOLCATS_COMPONENTS = ('current', 'linear_only')
+
+
+def lolcats_import():
+    """Put third_party/Liger on the path and register Lolcats* with Auto*."""
+    import sys
+    root = Path(__file__).resolve().parent / 'third_party' / 'Liger'
+    if not (root / 'lolcats' / 'models' / 'lolcats' / 'modeling_lolcats.py').exists():
+        raise FileNotFoundError(f'LoLCATs source not found under {root}')
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        import lolcats.models.lolcats  # noqa: F401  -- registers the config/model
+        from lolcats.models.lolcats.modeling_lolcats import (  # noqa: F401
+            LinearAttention, hybrid_attention_quadratic)
+    except ModuleNotFoundError as error:
+        # modeling_lolcats pulls RMSNorm and the feature maps from fla; it is a
+        # hard dependency of their module, not of this probe.
+        raise ModuleNotFoundError(
+            f"LoLCATs needs '{error.name}' (pip install flash-linear-attention)") from error
+    return LinearAttention, hybrid_attention_quadratic
+
+
+def lolcats_layers(model):
+    LinearAttention, _ = lolcats_import()
+    base = getattr(model, 'model', model)
+    base = getattr(base, 'model', base)
+    mods = [l.self_attn for l in base.layers if isinstance(l.self_attn, LinearAttention)]
+    if not mods:
+        raise RuntimeError('No LinearAttention layers found; is this a LoLCATs checkpoint?')
+    return mods
+
+
+@torch.no_grad()
+def collect_lolcats_readouts(model, mods, ids, positions):
+    """Read-only hooks on LoLCATs attention. layer -> component -> [queries, hidden].
+
+    LolcatsAttention fuses a sliding-window softmax term and a linear term
+    inside hybrid_attention_quadratic and divides by their COMBINED denominator,
+    so the linear contribution is never materialized on its own. `linear_only`
+    reruns that same op with window_factor set to zero, which drops both the
+    softmax numerator and its share of the denominator and leaves the linear
+    readout normalized by its own mass -- comparing the raw numerator instead
+    would measure the denominator's scale, which differs across layers.
+    """
+    _, hybrid_attention_quadratic = lolcats_import()
+    if ids.ndim != 2 or ids.shape[0] != 1 or positions.ndim != 1 or not len(positions):
+        raise ValueError('Expected one sequence and a nonempty query-position vector')
+    if positions.min() < 0 or positions.max() >= ids.shape[1]:
+        raise ValueError('Query positions outside the sequence')
+    if any(m.training for m in mods):
+        raise ValueError('Use the model in eval mode')
+    hooks, pending, result = [], {}, {}
+
+    def capture(layer):
+        def hook(module, args, kwargs):
+            pending[layer.layer_idx] = (
+                (args[0] if args else kwargs['hidden_states']).detach(),
+                kwargs.get('attention_mask', args[1] if len(args) > 1 else None),
+                kwargs.get('position_ids', args[2] if len(args) > 2 else None))
+        return hook
+
+    def finish(layer, inputs, output):
+        hidden, attention_mask, position_ids = pending.pop(layer.layer_idx)
+        y = output[0] if isinstance(output, tuple) else output
+        index = positions.to(y.device)
+        current = y.detach().index_select(1, index)[0].float()
+        # past_key_value=None keeps this a plain prefill recompute: no cache is
+        # read or written, so the hooked forward's own state is untouched.
+        q, k, v, _ = layer._process_qkv(hidden, attention_mask, position_ids, None)
+        f_q, f_k = layer.feature_map_q(q), layer.feature_map_k(k)
+        window_factors = torch.zeros_like(layer.window_factors)
+        linear_factors = (1 - torch.sigmoid(layer.window_factors)
+                          if layer.affine_attention_factors else 1)
+        linear, _ = hybrid_attention_quadratic(q, k, f_q, f_k, v, window_factors,
+                                               linear_factors, window_size=layer.window_size)
+        b, _, length, _ = linear.shape
+        linear = linear.transpose(1, 2).contiguous().view(b, length, layer.hidden_size)
+        linear = layer.o_proj(linear.to(layer.o_proj.weight.dtype))
+        result[layer.layer_idx] = {
+            'current': current.cpu(),
+            'linear_only': linear.index_select(1, index)[0].float().cpu()}
+
+    try:
+        for layer in mods:
+            hooks.extend([
+                layer.register_forward_pre_hook(capture(layer), with_kwargs=True),
                 layer.register_forward_hook(finish)])
         model(input_ids=ids.to(next(model.parameters()).device), use_cache=False)
     finally:
@@ -179,13 +286,13 @@ def aggregate_pairs(rows):
     return result
 
 
-def plot_similarity(summary, out):
+def plot_similarity(summary, out, components):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import numpy as np
     for corpus, slice_name in sorted({(r['corpus'], r['slice']) for r in summary}):
-        for component in ('current', 'initial', 'history_effect'):
+        for component in components:
             rows = [r for r in summary if r['corpus'] == corpus and r['slice'] == slice_name
                     and r['component'] == component]
             if not rows:
@@ -212,7 +319,11 @@ def plot_similarity(summary, out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--cfg', required=True); ap.add_argument('--ckpt', required=True)
+    ap.add_argument('--arch', choices=['ttt', 'lolcats'], default='ttt',
+                    help="'ttt' reads this repo's LinearTTTAttention; 'lolcats' reads a "
+                         'LoLCATs checkpoint via third_party/Liger (no --cfg needed)')
+    ap.add_argument('--cfg', help='required for --arch ttt; ignored for lolcats')
+    ap.add_argument('--ckpt', required=True)
     ap.add_argument('--adapter'); ap.add_argument('--base', default='meta-llama/Llama-3.1-8B')
     ap.add_argument('--tokens-file', help='reuse exact corpus tokens from previous probes')
     ap.add_argument('--corpora', nargs='+', choices=['pg19', 'wikitext'], default=['pg19', 'wikitext'])
@@ -220,7 +331,7 @@ def main():
     ap.add_argument('--seq-len', type=int, default=8192); ap.add_argument('--seqs', type=int, default=8)
     ap.add_argument('--samples', type=int, default=128, help='max query positions per slice per sequence')
     ap.add_argument('--slices', nargs='+', choices=['cross_window', 'other'], default=['cross_window', 'other'])
-    ap.add_argument('--layers', nargs='+', type=int, help='default: all TTT layers, including readers')
+    ap.add_argument('--layers', nargs='+', type=int, help='default: all linear-attention layers')
     ap.add_argument('--seed', type=int, default=42); ap.add_argument('--shuffles', type=int, default=5)
     ap.add_argument('--analysis-device', choices=['cpu', 'cuda'], default='cuda')
     ap.add_argument('--save-features', action='store_true'); ap.add_argument('--no-plots', action='store_true')
@@ -228,21 +339,29 @@ def main():
     args = ap.parse_args()
     if args.samples < 4 or args.seqs < 1 or args.seq_len < 5 or args.shuffles < 1:
         ap.error('Need samples >= 4, positive sequence count, length >= 5, and shuffles >= 1')
+    if args.arch == 'ttt' and not args.cfg:
+        ap.error('--cfg is required for --arch ttt')
     if not torch.cuda.is_available():
         ap.error('The checkpoint loader requires CUDA')
-    from omegaconf import OmegaConf
     from transformers import AutoTokenizer
-    from Training.train import build_model_config
-    from eval import ar_masks, load_model, ttt_layers
+    from eval import ar_masks
     from diag_rank import checkpoint_files, load_corpora, validate_tokens
-    from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
 
-    config = OmegaConf.create(OmegaConf.to_container(OmegaConf.load(args.cfg), resolve=True))
-    config.model.pretrained_model_name_or_path = args.ckpt
-    config.model.max_length = args.seq_len
-    model_config = build_model_config(config)
-    if model_config.ttt_inner_loss != 'l2':
-        ap.error('Use an l2 checkpoint')
+    if args.arch == 'ttt':
+        from omegaconf import OmegaConf
+        from Training.train import build_model_config
+        config = OmegaConf.create(OmegaConf.to_container(OmegaConf.load(args.cfg), resolve=True))
+        config.model.pretrained_model_name_or_path = args.ckpt
+        config.model.max_length = args.seq_len
+        model_config = build_model_config(config)
+        if model_config.ttt_inner_loss != 'l2':
+            ap.error('Use an l2 checkpoint')
+        components = TTT_COMPONENTS
+    else:
+        from transformers import AutoConfig
+        lolcats_import()
+        model_config = AutoConfig.from_pretrained(args.ckpt)
+        components = LOLCATS_COMPONENTS
     if args.tokens_file:
         saved = torch.load(args.tokens_file, map_location='cpu', weights_only=True)
         if saved['tokenizer'] != args.base:
@@ -258,20 +377,40 @@ def main():
     metadata = {'complete': False, 'arguments': vars(args), 'sources': sources,
                 'model_config': model_config.to_dict(), 'checkpoint_files': identity,
                 'token_hashes': {name: hashlib.sha256(ids.numpy().tobytes()).hexdigest() for name, ids in corpora.items()},
-                'definitions': {'current': 'actual gated/projected TTT readout',
-                    'initial': 'learned initial weights read with the SAME observed queries/gates',
-                    'history_effect': 'current - initial; conditional readout effect, not a whole-model intervention',
+                'definitions': dict({
                     'cross_window': 'repeated-bigram targets with source beyond the local window',
                     'other': 'non-repeated-bigram targets after the first chunk'},
+                    **({'current': 'actual gated/projected TTT readout',
+                        'initial': 'learned initial weights read with the SAME observed queries/gates',
+                        'history_effect': 'current - initial; conditional readout effect, not a whole-model intervention'}
+                       if args.arch == 'ttt' else
+                       {'current': 'LoLCATs attention output after o_proj (window + linear, jointly normalized)',
+                        'linear_only': 'same op with window_factor=0: the linear branch normalized by its own mass'})),
+                'arch': args.arch,
                 'similarity_reference': 'https://proceedings.mlr.press/v97/kornblith19a.html',
                 'limitations': 'Similarity is not mutual information, state identity, or proof of causal redundancy.'}
     source_root = Path(__file__).resolve().parent
+    hashed = ['diag_similarity.py', 'diag_rank.py', 'eval.py']
+    hashed.append('LinearTTT/model/LinearizeLlama/LinearizeLlama.py' if args.arch == 'ttt'
+                  else 'third_party/Liger/lolcats/models/lolcats/modeling_lolcats.py')
     metadata['code_hashes'] = {name: hashlib.sha256((source_root / name).read_bytes()).hexdigest()
-                             for name in ('diag_similarity.py', 'diag_rank.py', 'eval.py',
-                                          'LinearTTT/model/LinearizeLlama/LinearizeLlama.py')}
-    model = load_model(args.ckpt, model_config, args.adapter)
-    model.requires_grad_(False); use_sdpa_sliding_window(True)
-    mods = ttt_layers(model)
+                               for name in hashed}
+    if args.arch == 'ttt':
+        from eval import load_model, ttt_layers
+        from LinearTTT.model.LinearizeLlama.LinearizeLlama import use_sdpa_sliding_window
+        model = load_model(args.ckpt, model_config, args.adapter)
+        use_sdpa_sliding_window(True)
+        mods = ttt_layers(model)
+        collect = collect_ttt_readouts
+    else:
+        from transformers import AutoModelForCausalLM
+        if args.adapter:
+            ap.error('--adapter is not supported for --arch lolcats')
+        model = AutoModelForCausalLM.from_pretrained(
+            args.ckpt, config=model_config, torch_dtype=torch.bfloat16, device_map={'': 0}).eval()
+        mods = lolcats_layers(model)
+        collect = collect_lolcats_readouts
+    model.requires_grad_(False)
     if args.layers is not None:
         wanted = set(args.layers)
         if wanted - {m.layer_idx for m in mods}:
@@ -279,15 +418,29 @@ def main():
         mods = [m for m in mods if m.layer_idx in wanted]
     layers = [m.layer_idx for m in mods]
     metadata['layers'] = layers
-    metadata['shared_groups'] = model_config.ttt_share_groups
+    # Slice boundaries: TTT applies-then-updates per chunk, so same-chunk hits
+    # are a structural control and ar_masks needs the chunk size. LoLCATs has
+    # no chunking -- only its sliding window separates attention from state.
+    if args.arch == 'ttt':
+        window_size, chunk_size = model_config.window_size, model_config.lact_chunk_size
+        metadata['shared_groups'] = model_config.ttt_share_groups
+    else:
+        window_size, chunk_size = mods[0].window_size, None
+        metadata['shared_groups'] = None
+    metadata['window_size'], metadata['chunk_size'] = window_size, chunk_size
+    metadata['components'] = list(components)
+    # query_positions needs history before a query counts; without chunking the
+    # sliding window is the floor.
+    position_floor = chunk_size or window_size
     metadata['torch_version'] = str(torch.__version__)
     (out / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
     rows, selections, magnitudes = [], [], []
     for corpus, sequences in corpora.items():
         for sequence, ids in enumerate(sequences):
-            masks = ar_masks(ids, [model_config.window_size, float('inf')], model_config.lact_chunk_size)
-            names = {'cross_window': f'ar_x{model_config.window_size}+', 'other': 'other'}
-            chosen = {name: query_positions(masks[names[name]], model_config.lact_chunk_size,
+            masks = ar_masks(ids, [window_size, float('inf')], chunk_size)
+            prefix = 'ar_x' if chunk_size else 'ar_'
+            names = {'cross_window': f'{prefix}{window_size}+', 'other': 'other'}
+            chosen = {name: query_positions(masks[names[name]], position_floor,
                                             args.samples, args.seed + sequence) for name in dict.fromkeys(args.slices)}
             selections.append({'corpus': corpus, 'sequence': sequence,
                                'positions': {k: v.tolist() for k, v in chosen.items()}})
@@ -298,12 +451,12 @@ def main():
             positions = torch.cat(list(chosen.values())).unique(sorted=True)
             print(f'{corpus} {sequence + 1}/{len(sequences)}: '
                   + ', '.join(f'{k}={len(v)}' for k, v in chosen.items()), flush=True)
-            features = collect_readouts(model.model, mods, ids.unsqueeze(0), positions)
+            features = collect(model.model, mods, ids.unsqueeze(0), positions)
             if args.save_features:
                 torch.save({'positions': positions, 'features': features}, out / f'{corpus}_{sequence}_features.pt')
             for name, selected in chosen.items():
                 indices = torch.searchsorted(positions, selected)
-                for component in ('current', 'initial', 'history_effect'):
+                for component in components:
                     x = torch.stack([features[layer][component][indices] for layer in layers])
                     measurements = pairwise_similarity(x, args.analysis_device, args.seed + sequence, args.shuffles)
                     for i, layer in enumerate(layers):
@@ -330,7 +483,7 @@ def main():
     for filename, payload in (('summary.json', summary), ('selections.json', selections), ('magnitudes.json', magnitudes)):
         (out / filename).write_text(json.dumps(payload, indent=2, allow_nan=False) + '\n')
     if not args.no_plots:
-        plot_similarity(summary, out)
+        plot_similarity(summary, out, components)
     if identity != {name: checkpoint_files(path) for name, path in (('ckpt', args.ckpt), ('adapter', args.adapter))}:
         raise RuntimeError('Checkpoint changed during the probe; use fixed checkpoints')
     metadata['complete'] = True
